@@ -10,6 +10,16 @@ from cigr_d_mvp1.io_utils import ensure_dir, load_json, write_json, write_jsonl
 from cigr_d_mvp1.kg import KnowledgeGraph
 
 from .cards import RelationCard
+from .debug import (
+    graph_debug_stats,
+    is_metadata_relation,
+    pair_text,
+    parse_metadata_patterns,
+    prediction_result,
+    short_diagnosis,
+    type_text,
+    write_debug_artifacts,
+)
 from .evidence import CONDITIONS, EvidenceCondition, RenderContext, render_example, render_type_summary
 from .metrics import compute_metrics
 from .oracle import CardGenerator, PairClassifier, make_client
@@ -24,11 +34,63 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 def main() -> None:
     args = parse_args()
+    metadata_patterns = parse_metadata_patterns(args.metadata_relation_patterns)
     output_dir = ensure_dir(args.output)
+
+    log_stage(1, 6, f"Loading KG from {args.kb}")
     graph = KnowledgeGraph(load_json(args.kb))
+    stats = graph_debug_stats(graph)
+    log_line(f"Entities: {stats['entities']}")
+    log_line(f"Concepts: {stats['concepts']}")
+    log_line(f"Relations: {stats['relations']}")
+    log_line(f"Triples: {stats['triples']}")
+
+    log_stage(2, 6, "Building primitive inventory")
     primitives = inventory_primitives(graph, min_examples=args.min_examples)
+    before_filter = len(primitives)
+    if args.exclude_metadata_relations:
+        primitives = [
+            primitive for primitive in primitives
+            if not is_metadata_relation(primitive.relation_id, metadata_patterns)
+        ]
     primitives = primitives[: args.max_primitives] if args.max_primitives else primitives
     context = RenderContext.from_primitives(primitives)
+    log_line(f"Found {len(primitives)} relation+direction primitives")
+    if args.exclude_metadata_relations:
+        log_line(f"Excluded metadata-looking primitives: {before_filter - len(primitives)}")
+    if primitives:
+        example = primitives[0]
+        log_line(f'Example: {example.primitive_id} | relation="{example.relation_id}" | direction={example.direction}')
+
+    log_stage(3, 6, "Sampling examples")
+    primitive_samples: dict[str, PrimitiveSamples] = {}
+    sample_rows: list[dict[str, Any]] = []
+    for primitive in primitives:
+        samples = sample_for_primitive(
+            graph=graph,
+            target=primitive,
+            primitives=primitives,
+            train_positives=args.train_positives,
+            heldout_positives=args.heldout_positives,
+            train_negatives=args.train_negatives,
+            heldout_negatives=args.heldout_negatives,
+            random_negatives=args.random_negatives,
+            seed=args.seed,
+        )
+        primitive_samples[primitive.primitive_id] = samples
+        sample_rows.append(sample_summary(primitive, samples))
+        if args.verbose:
+            log_line(
+                f"Primitive {primitive.primitive_id}: "
+                f"{len(samples.positive_train)} train positives, "
+                f"{len(samples.positive_heldout)} heldout positives"
+            )
+            log_line(
+                f"Hard negatives: {len(samples.hard_negative_train)} train, "
+                f"{len(samples.hard_negative_heldout)} heldout"
+            )
+            log_line(f"Random negatives: {len(samples.random_negative_heldout)} heldout")
+
     client = make_client(
         backend=args.oracle_backend,
         model=args.model,
@@ -42,24 +104,16 @@ def main() -> None:
 
     card_rows: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
-    sample_rows: list[dict[str, Any]] = []
     condition_ids = split_csv(args.conditions)
     variants = split_csv(args.card_variants)
+    card_jobs: list[tuple[Primitive, PrimitiveSamples, EvidenceCondition, str, RelationCard]] = []
 
+    log_stage(4, 6, "Generating relation cards")
     for primitive in primitives:
-        samples = sample_for_primitive(
-            graph=graph,
-            target=primitive,
-            primitives=primitives,
-            train_positives=args.train_positives,
-            heldout_positives=args.heldout_positives,
-            train_negatives=args.train_negatives,
-            heldout_negatives=args.heldout_negatives,
-            random_negatives=args.random_negatives,
-            seed=args.seed,
-        )
-        sample_rows.append(sample_summary(primitive, samples))
+        samples = primitive_samples[primitive.primitive_id]
         if not samples.positive_train or not samples.positive_heldout:
+            if args.verbose:
+                log_line(f"Skipping {primitive.primitive_id}: missing train or heldout positives")
             continue
         for condition_id in condition_ids:
             condition = CONDITIONS[condition_id]
@@ -76,39 +130,74 @@ def main() -> None:
                 card_json = card.to_json()
                 card_json["condition_id"] = condition_id
                 card_rows.append(card_json)
-                for validation in validation_examples(graph, context, condition, samples):
-                    prediction = validator.classify(
-                        card=card,
-                        pair=validation["pair"],
-                        expected_label=validation["expected_label"],
-                    )
-                    prediction_rows.append(
-                        {
-                            "primitive_id": primitive.primitive_id,
-                            "relation_id": primitive.relation_id,
-                            "direction": primitive.direction,
-                            "condition_id": condition_id,
-                            "card_variant": variant,
-                            "category": validation["category"],
-                            "expected_label": validation["expected_label"],
-                            "pair": validation["pair"],
-                            "predicted_satisfies": prediction.satisfies,
-                            "predicted_direction_correct": prediction.direction_correct,
-                            "confidence": prediction.confidence,
-                            "prompt_tokens": prediction.prompt_tokens_estimate,
-                            "completion_tokens": prediction.completion_tokens_estimate,
-                            "latency_seconds": prediction.latency_seconds,
-                            "raw_output": prediction.raw_output if args.save_raw_outputs else "",
-                        }
-                    )
+                card_jobs.append((primitive, samples, condition, variant, card))
+                if args.verbose:
+                    visible_relation = context.relation_display(primitive.relation_id, condition)
+                    log_line(f"Condition: {condition_id} | Variant: {variant}")
+                    log_line(f"Primitive: {primitive.primitive_id} | relation={visible_relation} | direction={primitive.direction}")
+                    log_line(f"Card description: {card.description}")
+                    log_line(f"Confidence: {card.confidence:.3f}")
 
+    log_line(f"Generated {len(card_rows)} cards")
+
+    log_stage(5, 6, "Validating cards")
+    validation_print_counts: dict[str, int] = {}
+    for primitive, samples, condition, variant, card in card_jobs:
+        for validation in validation_examples(graph, context, condition, samples):
+            prediction = validator.classify(
+                card=card,
+                pair=validation["pair"],
+                expected_label=validation["expected_label"],
+            )
+            row = {
+                "primitive_id": primitive.primitive_id,
+                "relation_id": primitive.relation_id,
+                "direction": primitive.direction,
+                "condition_id": condition.condition_id,
+                "card_variant": variant,
+                "category": validation["category"],
+                "expected_label": validation["expected_label"],
+                "pair": validation["pair"],
+                "predicted_satisfies": prediction.satisfies,
+                "predicted_direction_correct": prediction.direction_correct,
+                "confidence": prediction.confidence,
+                "prompt_tokens": prediction.prompt_tokens_estimate,
+                "completion_tokens": prediction.completion_tokens_estimate,
+                "latency_seconds": prediction.latency_seconds,
+                "result": "",
+                "diagnosis": "",
+                "raw_output": prediction.raw_output if args.save_raw_outputs else "",
+            }
+            row["result"] = prediction_result(row)
+            row["diagnosis"] = short_diagnosis(row)
+            prediction_rows.append(row)
+            count = validation_print_counts.get(primitive.primitive_id, 0)
+            if args.verbose and count < args.debug_examples_per_primitive:
+                log_line(f"Pair: {pair_text(validation['pair'])}")
+                log_line(f"Types: {type_text(validation['pair'])}")
+                log_line(f"Expected: {str(validation['expected_label']).upper()}")
+                log_line(f"Predicted: {str(prediction.satisfies).upper()}")
+                log_line(f"Category: {validation['category']}")
+                log_line(f"Result: {row['result']}")
+                validation_print_counts[primitive.primitive_id] = count + 1
+    log_line(f"Validated {len(prediction_rows)} pairs")
+
+    log_stage(6, 6, "Writing reports")
     metrics = compute_metrics(card_rows, prediction_rows)
+    debug_data = write_debug_artifacts(
+        output_dir=output_dir,
+        cards=card_rows,
+        predictions=prediction_rows,
+        metrics=metrics,
+        metadata_patterns=metadata_patterns,
+    )
     summary = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "args": vars(args),
         "n_primitives_inventoried": len(primitives),
         "n_cards": len(card_rows),
         "n_validation_predictions": len(prediction_rows),
+        "n_primitive_metric_rows": len(debug_data["primitive_metrics"]),
         "metrics": metrics,
         "notes": [
             "Mock backend is for smoke tests only, not valid experimental evidence.",
@@ -120,6 +209,18 @@ def main() -> None:
     write_jsonl(output_dir / "primitive_samples.jsonl", sample_rows)
     write_json(output_dir / "metrics.json", summary)
     write_report(output_dir / "report.md", summary)
+    for filename in [
+        "relation_cards.jsonl",
+        "validation_predictions.jsonl",
+        "primitive_samples.jsonl",
+        "metrics.json",
+        "report.md",
+        "examples_summary.json",
+        "primitive_metrics.jsonl",
+        "debug_examples.md",
+        "debug_report.html",
+    ]:
+        log_line(filename)
     print(f"Wrote RC-MEX MVP1 outputs to {output_dir}")
 
 
@@ -268,6 +369,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openai-api-key", default=None)
     parser.add_argument("--oracle-command", default=None)
     parser.add_argument("--save-raw-outputs", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Print primitive-level debug progress.")
+    parser.add_argument(
+        "--debug-examples-per-primitive",
+        type=int,
+        default=3,
+        help="Number of validation examples to print per primitive when --verbose is enabled.",
+    )
+    parser.add_argument(
+        "--exclude-metadata-relations",
+        action="store_true",
+        help="Skip metadata-looking primitives such as external IDs, URLs, and source relations.",
+    )
+    parser.add_argument(
+        "--metadata-relation-patterns",
+        default=None,
+        help="Comma-separated regex patterns used to label or exclude metadata-looking relations.",
+    )
     args = parser.parse_args()
     if args.model is None:
         args.model = DEFAULT_OPENAI_MODEL if args.oracle_backend == "openai" else DEFAULT_LOCAL_MODEL
@@ -282,6 +400,14 @@ def parse_args() -> argparse.Namespace:
 
 def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def log_stage(index: int, total: int, message: str) -> None:
+    print(f"[{index}/{total}] {message}", flush=True)
+
+
+def log_line(message: str) -> None:
+    print(f"      {message}", flush=True)
 
 
 def write_report(path: Path, summary: dict[str, Any]) -> None:
