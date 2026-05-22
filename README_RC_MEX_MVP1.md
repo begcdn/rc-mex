@@ -132,6 +132,10 @@ validation_predictions.jsonl
 primitive_samples.jsonl
 metrics.json
 report.md
+examples_summary.json
+primitive_metrics.jsonl
+debug_examples.md
+debug_report.html
 ```
 
 Validation is pair classification:
@@ -141,3 +145,27 @@ Given a frozen card and ordered pair (h,t), does the pair satisfy the card predi
 ```
 
 It reports positive accuracy, hard-negative rejection, random-negative rejection, swapped-direction rejection, F1, direction accuracy, opaque rate, and cost estimates.
+
+Open `debug_report.html` after a run to inspect primitives, card descriptions, examples, false positives, false negatives, direction errors, and automatic diagnosis labels.
+
+For more terminal detail during a run:
+
+```bash
+python3 -m rc_mex.run_mvp1 \
+  --kb data/kqa_pro/kb.json \
+  --output runs/rc_mex_mvp1_debug \
+  --max-primitives 2 \
+  --model llama3:8b-instruct \
+  --verbose \
+  --debug-examples-per-primitive 3
+```
+
+To skip metadata-looking relations such as external IDs, URLs, and source/provenance relations:
+
+```bash
+python3 -m rc_mex.run_mvp1 \
+  --kb data/kqa_pro/kb.json \
+  --output runs/rc_mex_mvp1_no_metadata \
+  --max-primitives 20 \
+  --exclude-metadata-relations
+```
