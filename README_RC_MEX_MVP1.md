@@ -21,7 +21,37 @@ cd "/Users/ziad/Documents/New project"
 python3 -m cigr_d_mvp1.download_kqa_pro --output data/kqa_pro --files kb.json
 ```
 
-## Smoke run
+## Default local-model run
+
+The default oracle backend is Ollama with `llama3:8b-instruct`.
+
+If your installed Ollama tag has a different name, pass it with `--model`.
+
+```bash
+ollama serve
+```
+
+Then:
+
+```bash
+python3 -m rc_mex.run_mvp1 \
+  --kb data/kqa_pro/kb.json \
+  --output runs/rc_mex_mvp1_ollama_20 \
+  --max-primitives 20
+```
+
+Equivalent explicit form:
+
+```bash
+python3 -m rc_mex.run_mvp1 \
+  --kb data/kqa_pro/kb.json \
+  --output runs/rc_mex_mvp1_ollama_20 \
+  --max-primitives 20 \
+  --oracle-backend ollama \
+  --model llama3:8b-instruct
+```
+
+## Mock smoke run
 
 The mock backend is only for pipeline testing. It is not experimental evidence.
 
@@ -32,8 +62,6 @@ python3 -m rc_mex.run_mvp1 \
   --max-primitives 20 \
   --oracle-backend mock
 ```
-
-## Real local-model run
 
 ## OpenAI API run
 
@@ -60,24 +88,6 @@ python3 -m rc_mex.run_mvp1 \
   --max-primitives 20 \
   --oracle-backend openai \
   --model gpt-4o-mini
-```
-
-With Ollama:
-
-```bash
-ollama pull llama3.1
-ollama serve
-```
-
-Then:
-
-```bash
-python3 -m rc_mex.run_mvp1 \
-  --kb data/kqa_pro/kb.json \
-  --output runs/rc_mex_mvp1_ollama_20 \
-  --max-primitives 20 \
-  --oracle-backend ollama \
-  --model llama3.1
 ```
 
 With an OpenAI-compatible local server:
