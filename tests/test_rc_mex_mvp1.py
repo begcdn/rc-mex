@@ -7,6 +7,10 @@ from pathlib import Path
 
 from cigr_d_mvp1.io_utils import load_json, write_json
 
+from rc_mex.debug import (
+    compute_primitive_metrics,
+    is_metadata_relation,
+)
 from rc_mex.evidence import CONDITIONS, RenderContext, render_example
 from rc_mex.oracle import OPENAI_API_BASE_URL, make_client, parse_bool, parse_confidence
 from rc_mex.run_mvp1 import DEFAULT_OPENAI_MODEL
@@ -148,6 +152,9 @@ class RCMexMVP1Tests(unittest.TestCase):
                     "mock",
                     "--conditions",
                     "A,B1,B2,B3,C",
+                    "--verbose",
+                    "--debug-examples-per-primitive",
+                    "2",
                 ]
                 run_main()
             finally:
@@ -155,6 +162,14 @@ class RCMexMVP1Tests(unittest.TestCase):
             self.assertTrue((out / "relation_cards.jsonl").exists())
             self.assertTrue((out / "validation_predictions.jsonl").exists())
             self.assertTrue((out / "metrics.json").exists())
+            self.assertTrue((out / "debug_examples.md").exists())
+            self.assertTrue((out / "debug_report.html").exists())
+            self.assertTrue((out / "examples_summary.json").exists())
+            self.assertTrue((out / "primitive_metrics.jsonl").exists())
+            html = (out / "debug_report.html").read_text(encoding="utf-8")
+            self.assertIn("Summary Dashboard", html)
+            self.assertIn("Primitive Browser", html)
+            self.assertIn("Most Important Failures", html)
             metrics = load_json(out / "metrics.json")
             self.assertGreater(metrics["n_cards"], 0)
 
@@ -177,6 +192,54 @@ class RCMexMVP1Tests(unittest.TestCase):
         self.assertFalse(parse_bool("false"))
         self.assertFalse(parse_bool("no"))
         self.assertTrue(parse_bool("true"))
+
+    def test_metadata_relation_detection_and_diagnosis(self):
+        self.assertTrue(is_metadata_relation("Wikidata property"))
+        self.assertTrue(is_metadata_relation("external ID"))
+        self.assertFalse(is_metadata_relation("directed"))
+        cards = [
+            {
+                "primitive_id": "P00001",
+                "relation_id": "Wikidata property",
+                "direction": "backward",
+                "condition_id": "A",
+                "card_variant": "contrastive_hard",
+                "confidence": 0.5,
+                "opaque_reason": "",
+            }
+        ]
+        predictions = [
+            {
+                "primitive_id": "P00001",
+                "relation_id": "Wikidata property",
+                "direction": "backward",
+                "condition_id": "A",
+                "card_variant": "contrastive_hard",
+                "category": "positive",
+                "expected_label": True,
+                "predicted_satisfies": False,
+                "predicted_direction_correct": False,
+                "confidence": 0.9,
+                "pair": {"head": "A", "tail": "B", "head_types": [], "tail_types": []},
+            },
+            {
+                "primitive_id": "P00001",
+                "relation_id": "Wikidata property",
+                "direction": "backward",
+                "condition_id": "A",
+                "card_variant": "contrastive_hard",
+                "category": "hard_negative",
+                "expected_label": False,
+                "predicted_satisfies": True,
+                "predicted_direction_correct": True,
+                "confidence": 0.9,
+                "pair": {"head": "C", "tail": "D", "head_types": [], "tail_types": []},
+            },
+        ]
+        rows = compute_primitive_metrics(cards, predictions, ["wikidata property"])
+        self.assertIn("metadata_relation", rows[0]["diagnosis"])
+        self.assertIn("possibly_opaque", rows[0]["diagnosis"])
+        self.assertIn("hard_negatives_not_helping", rows[0]["diagnosis"])
 
 
 if __name__ == "__main__":
