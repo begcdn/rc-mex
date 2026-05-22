@@ -1,0 +1,3 @@
+# The MVP runners use only the Python standard library by default.
+# Optional if you want the OpenAI SDK for separate scripts/notebooks later:
+# openai>=2.0.0
