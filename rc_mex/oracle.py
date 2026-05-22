@@ -112,9 +112,9 @@ class PairClassifier:
             data = parse_json_object(last_output)
             if data and "satisfies" in data:
                 return PairPrediction(
-                    satisfies=bool(data.get("satisfies")),
-                    direction_correct=bool(data.get("direction_correct", data.get("satisfies"))),
-                    confidence=float(data.get("confidence", 0.0) or 0.0),
+                    satisfies=parse_bool(data.get("satisfies")),
+                    direction_correct=parse_bool(data.get("direction_correct", data.get("satisfies"))),
+                    confidence=parse_confidence(data.get("confidence")),
                     raw_output=last_output,
                     prompt_tokens_estimate=estimate_tokens(prompt),
                     completion_tokens_estimate=estimate_tokens(last_output),
@@ -160,7 +160,8 @@ def build_card_generation_prompt(payload: dict[str, Any]) -> str:
         "You are creating a reusable semantic card for one knowledge-graph primitive.\n"
         "Infer the shortest binary predicate p(x,y) that is true for positives and false for hard negatives.\n"
         "Use only the relation display, examples, and type evidence shown. If evidence is incoherent, mark opaque=true.\n"
-        "Return only JSON with keys: predicate_description, argument_1_role, argument_2_role, domain, range, direction, confidence, opaque, opaque_reason.\n\n"
+        "Return only JSON with keys: predicate_description, argument_1_role, argument_2_role, domain, range, direction, confidence, opaque, opaque_reason.\n"
+        "Use a numeric confidence from 0.0 to 1.0.\n\n"
         f"Card variant:\n{payload['card_variant']}\n\n"
         f"Visible relation:\n{payload['visible_relation']}\n\n"
         f"Direction:\n{payload['direction']}\n\n"
@@ -182,7 +183,8 @@ def build_pair_classification_prompt(
     return (
         "PAIR CLASSIFICATION TASK\n"
         "Given a frozen relation card and one ordered pair (x,y), decide whether the pair satisfies the card predicate.\n"
-        "The order matters. Return only JSON with keys: satisfies, direction_correct, confidence.\n\n"
+        "The order matters. Return only JSON with keys: satisfies, direction_correct, confidence.\n"
+        "Use booleans for satisfies/direction_correct and a numeric confidence from 0.0 to 1.0.\n\n"
         f"Card predicate:\n{card.description}\n\n"
         f"Argument 1 role:\n{card.generated.get('argument_1_role', '')}\n\n"
         f"Argument 2 role:\n{card.generated.get('argument_2_role', '')}\n\n"
@@ -194,7 +196,7 @@ def build_pair_classification_prompt(
 
 
 def generated_card_from_json(data: dict[str, Any], raw_output: str) -> GeneratedCardText:
-    opaque = bool(data.get("opaque", False))
+    opaque = parse_bool(data.get("opaque", False))
     opaque_reason = str(data.get("opaque_reason", "") or "")
     if opaque and not opaque_reason:
         opaque_reason = "generator marked card opaque"
@@ -205,11 +207,58 @@ def generated_card_from_json(data: dict[str, Any], raw_output: str) -> Generated
         domain=str(data.get("domain", "") or ""),
         range=str(data.get("range", "") or ""),
         direction=str(data.get("direction", "") or ""),
-        confidence=float(data.get("confidence", 0.0) or 0.0),
+        confidence=parse_confidence(data.get("confidence")),
         opaque=opaque,
         opaque_reason=opaque_reason,
         raw_output=raw_output,
     )
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "yes", "y", "1"}:
+            return True
+        if normalized in {"false", "no", "n", "0", ""}:
+            return False
+    return bool(value)
+
+
+def parse_confidence(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return clamp_confidence(float(value))
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        labels = {
+            "none": 0.0,
+            "very low": 0.1,
+            "low": 0.25,
+            "medium-low": 0.4,
+            "medium": 0.5,
+            "moderate": 0.5,
+            "medium-high": 0.7,
+            "high": 0.85,
+            "very high": 0.95,
+        }
+        if normalized in labels:
+            return labels[normalized]
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if match:
+            number = float(match.group(0))
+            if "%" in normalized:
+                number /= 100.0
+            return clamp_confidence(number)
+    return 0.0
+
+
+def clamp_confidence(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def parse_json_object(text: str) -> dict[str, Any]:

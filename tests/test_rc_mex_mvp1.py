@@ -8,7 +8,7 @@ from pathlib import Path
 from cigr_d_mvp1.io_utils import load_json, write_json
 
 from rc_mex.evidence import CONDITIONS, RenderContext, render_example
-from rc_mex.oracle import OPENAI_API_BASE_URL, make_client
+from rc_mex.oracle import OPENAI_API_BASE_URL, make_client, parse_bool, parse_confidence
 from rc_mex.run_mvp1 import DEFAULT_OPENAI_MODEL
 from rc_mex.run_mvp1 import main as run_main
 from rc_mex.sampling import sample_for_primitive
@@ -169,6 +169,14 @@ class RCMexMVP1Tests(unittest.TestCase):
         )
         self.assertEqual(client.model, "gpt-4o-mini")
         self.assertEqual(client.base_url, OPENAI_API_BASE_URL)
+
+    def test_local_model_string_confidence_and_booleans(self):
+        self.assertEqual(parse_confidence("low"), 0.25)
+        self.assertEqual(parse_confidence("high"), 0.85)
+        self.assertEqual(parse_confidence("82%"), 0.82)
+        self.assertFalse(parse_bool("false"))
+        self.assertFalse(parse_bool("no"))
+        self.assertTrue(parse_bool("true"))
 
 
 if __name__ == "__main__":
