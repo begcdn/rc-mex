@@ -18,7 +18,7 @@ from .schema import Primitive, RelationExample, inventory_primitives
 
 
 CARD_VARIANTS = {"contrastive_hard", "random_negative", "name_only"}
-DEFAULT_LOCAL_MODEL = "llama3.1"
+DEFAULT_LOCAL_MODEL = "llama3:8b-instruct"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
@@ -260,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--oracle-backend",
         choices=["mock", "ollama", "openai", "openai-compatible", "command"],
-        default="mock",
+        default="ollama",
     )
     parser.add_argument("--model", default=None)
     parser.add_argument("--ollama-host", default=None)
