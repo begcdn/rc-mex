@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from cigr_d_mvp1.io_utils import load_json, write_json
+from cigr_d_mvp1.judges import OllamaClient, OpenAICompatibleClient
 
 from rc_mex.debug import (
     compute_primitive_metrics,
@@ -184,6 +185,10 @@ class RCMexMVP1Tests(unittest.TestCase):
         )
         self.assertEqual(client.model, "gpt-4o-mini")
         self.assertEqual(client.base_url, OPENAI_API_BASE_URL)
+
+    def test_llm_client_host_normalization(self):
+        self.assertEqual(OllamaClient("llama3", host="127.0.0.1:11435").host, "http://127.0.0.1:11435")
+        self.assertEqual(OpenAICompatibleClient("model", base_url="localhost:8000/v1").base_url, "http://localhost:8000/v1")
 
     def test_local_model_string_confidence_and_booleans(self):
         self.assertEqual(parse_confidence("low"), 0.25)
