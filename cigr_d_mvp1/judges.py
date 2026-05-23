@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import socket
 import subprocess
 import time
 import urllib.error
@@ -218,13 +219,26 @@ def http_json(url: str, payload: dict, headers: dict[str, str] | None = None) ->
     request_headers = {"Content-Type": "application/json"}
     if headers:
         request_headers.update(headers)
-    request = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+    timeout = env_float("LLM_HTTP_TIMEOUT", 120.0)
+    retries = env_int("LLM_HTTP_RETRIES", 1)
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+        except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionResetError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            break
+    raise RuntimeError(
+        f"Request to {url} failed after {retries + 1} attempt(s) with timeout={timeout}s: {last_error}"
+    )
 
 
 def normalize_base_url(value: str) -> str:
@@ -232,6 +246,26 @@ def normalize_base_url(value: str) -> str:
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", normalized):
         normalized = f"http://{normalized}"
     return normalized
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def estimate_tokens(text: str) -> int:
