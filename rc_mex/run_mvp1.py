@@ -22,7 +22,7 @@ from .debug import (
 )
 from .evidence import CONDITIONS, EvidenceCondition, RenderContext, render_example, render_type_summary
 from .metrics import compute_metrics
-from .oracle import CardGenerator, PairClassifier, make_client
+from .oracle import CardGenerator, PairClassifier, make_client, prompt_templates_markdown
 from .sampling import PrimitiveSamples, sample_for_primitive
 from .schema import Primitive, RelationExample, inventory_primitives
 
@@ -131,12 +131,16 @@ def main() -> None:
                 card_json["condition_id"] = condition_id
                 card_rows.append(card_json)
                 card_jobs.append((primitive, samples, condition, variant, card))
+                visible_relation = context.relation_display(primitive.relation_id, condition)
+                log_line(
+                    f"Generated {primitive.primitive_id} {condition_id}/{variant} | "
+                    f"relation={visible_relation} | direction={primitive.direction} | "
+                    f'description="{card.description}" | confidence={card.confidence:.3f}'
+                )
                 if args.verbose:
-                    visible_relation = context.relation_display(primitive.relation_id, condition)
-                    log_line(f"Condition: {condition_id} | Variant: {variant}")
-                    log_line(f"Primitive: {primitive.primitive_id} | relation={visible_relation} | direction={primitive.direction}")
-                    log_line(f"Card description: {card.description}")
-                    log_line(f"Confidence: {card.confidence:.3f}")
+                    log_line(f"Positive rule: {card.generated.get('positive_rule', '')}")
+                    log_line(f"Negative rule: {card.generated.get('negative_rule', '')}")
+                    log_line(f"Decision test: {card.generated.get('minimal_decision_test', '')}")
 
     log_line(f"Generated {len(card_rows)} cards")
 
@@ -148,6 +152,8 @@ def main() -> None:
                 card=card,
                 pair=validation["pair"],
                 expected_label=validation["expected_label"],
+                category=validation["category"],
+                validation_mode=args.validation_mode,
             )
             row = {
                 "primitive_id": primitive.primitive_id,
@@ -164,6 +170,10 @@ def main() -> None:
                 "prompt_tokens": prediction.prompt_tokens_estimate,
                 "completion_tokens": prediction.completion_tokens_estimate,
                 "latency_seconds": prediction.latency_seconds,
+                "validation_mode": args.validation_mode,
+                "reason": prediction.reason,
+                "matched_rule": prediction.matched_rule,
+                "rejection_reason": prediction.rejection_reason,
                 "result": "",
                 "diagnosis": "",
                 "raw_output": prediction.raw_output if args.save_raw_outputs else "",
@@ -179,6 +189,8 @@ def main() -> None:
                 log_line(f"Predicted: {str(prediction.satisfies).upper()}")
                 log_line(f"Category: {validation['category']}")
                 log_line(f"Result: {row['result']}")
+                if prediction.reason:
+                    log_line(f"Reason: {prediction.reason}")
                 validation_print_counts[primitive.primitive_id] = count + 1
     log_line(f"Validated {len(prediction_rows)} pairs")
 
@@ -209,12 +221,14 @@ def main() -> None:
     write_jsonl(output_dir / "primitive_samples.jsonl", sample_rows)
     write_json(output_dir / "metrics.json", summary)
     write_report(output_dir / "report.md", summary)
+    (output_dir / "prompts_used.md").write_text(prompt_templates_markdown(args.validation_mode), encoding="utf-8")
     for filename in [
         "relation_cards.jsonl",
         "validation_predictions.jsonl",
         "primitive_samples.jsonl",
         "metrics.json",
         "report.md",
+        "prompts_used.md",
         "examples_summary.json",
         "primitive_metrics.jsonl",
         "debug_examples.md",
@@ -288,6 +302,12 @@ def build_card(
             "domain": generated.domain,
             "range": generated.range,
             "direction": generated.direction,
+            "positive_rule": generated.positive_rule,
+            "negative_rule": generated.negative_rule,
+            "confusable_relations": generated.confusable_relations,
+            "minimal_decision_test": generated.minimal_decision_test,
+            "valid_direction_explanation": generated.valid_direction_explanation,
+            "invalid_swapped_direction_explanation": generated.invalid_swapped_direction_explanation,
             "confidence": generated.confidence,
             "opaque": generated.opaque,
             "opaque_reason": generated.opaque_reason,
@@ -369,6 +389,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openai-api-key", default=None)
     parser.add_argument("--oracle-command", default=None)
     parser.add_argument("--save-raw-outputs", action="store_true")
+    parser.add_argument(
+        "--validation-mode",
+        choices=["pairwise", "contrastive"],
+        default="pairwise",
+        help="pairwise classifies one held-out pair; contrastive emphasizes comparison to positive and hard-negative anchors.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print primitive-level debug progress.")
     parser.add_argument(
         "--debug-examples-per-primitive",
