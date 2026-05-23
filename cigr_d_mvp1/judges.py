@@ -116,7 +116,7 @@ class MockLLMClient:
 class OllamaClient:
     def __init__(self, model: str, host: str | None = None):
         self.model = model
-        self.host = (host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        self.host = normalize_base_url(host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434")
 
     def complete(self, prompt: str) -> str:
         payload = {
@@ -136,7 +136,7 @@ class OllamaClient:
 class OpenAICompatibleClient:
     def __init__(self, model: str, base_url: str | None = None, api_key: str | None = None):
         self.model = model
-        self.base_url = (
+        self.base_url = normalize_base_url(
             base_url
             or os.environ.get("OPENAI_BASE_URL")
             or os.environ.get("LOCAL_LLM_BASE_URL")
@@ -225,6 +225,13 @@ def http_json(url: str, payload: dict, headers: dict[str, str] | None = None) ->
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+
+
+def normalize_base_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", normalized):
+        normalized = f"http://{normalized}"
+    return normalized
 
 
 def estimate_tokens(text: str) -> int:
