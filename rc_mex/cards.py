@@ -12,6 +12,12 @@ class GeneratedCardText:
     domain: str
     range: str
     direction: str
+    positive_rule: str
+    negative_rule: str
+    confusable_relations: list[str]
+    minimal_decision_test: str
+    valid_direction_explanation: str
+    invalid_swapped_direction_explanation: str
     confidence: float
     opaque: bool
     opaque_reason: str
