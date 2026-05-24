@@ -19,6 +19,31 @@ class PrimitiveSamples:
     swapped_direction_heldout: list[RelationExample]
     hard_negative_source_ids: list[str]
 
+    def train_entity_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for example in self.positive_train + self.hard_negative_train:
+            ids.add(example.head_id)
+            ids.add(example.tail_id)
+        return ids
+
+    def heldout_entity_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for example in (
+            self.positive_heldout
+            + self.hard_negative_heldout
+            + self.random_negative_heldout
+            + self.swapped_direction_heldout
+        ):
+            ids.add(example.head_id)
+            ids.add(example.tail_id)
+        return ids
+
+    def train_heldout_entity_overlap_rate(self) -> float:
+        heldout = self.heldout_entity_ids()
+        if not heldout:
+            return 0.0
+        return len(self.train_entity_ids() & heldout) / len(heldout)
+
 
 def sample_for_primitive(
     graph: KnowledgeGraph,

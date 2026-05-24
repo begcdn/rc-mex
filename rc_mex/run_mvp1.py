@@ -154,6 +154,7 @@ def main() -> None:
                 expected_label=validation["expected_label"],
                 category=validation["category"],
                 validation_mode=args.validation_mode,
+                reveal_validation_category=args.reveal_validation_category,
             )
             row = {
                 "primitive_id": primitive.primitive_id,
@@ -171,6 +172,7 @@ def main() -> None:
                 "completion_tokens": prediction.completion_tokens_estimate,
                 "latency_seconds": prediction.latency_seconds,
                 "validation_mode": args.validation_mode,
+                "reveal_validation_category": args.reveal_validation_category,
                 "reason": prediction.reason,
                 "matched_rule": prediction.matched_rule,
                 "rejection_reason": prediction.rejection_reason,
@@ -361,6 +363,7 @@ def sample_summary(primitive: Primitive, samples: PrimitiveSamples) -> dict[str,
         "n_random_negative_heldout": len(samples.random_negative_heldout),
         "n_swapped_direction_heldout": len(samples.swapped_direction_heldout),
         "hard_negative_source_ids": samples.hard_negative_source_ids,
+        "train_heldout_entity_overlap_rate": samples.train_heldout_entity_overlap_rate(),
     }
 
 
@@ -394,6 +397,14 @@ def parse_args() -> argparse.Namespace:
         choices=["pairwise", "contrastive"],
         default="pairwise",
         help="pairwise classifies one held-out pair; contrastive emphasizes comparison to positive and hard-negative anchors.",
+    )
+    parser.add_argument(
+        "--reveal-validation-category",
+        action="store_true",
+        help=(
+            "Debug only: reveal positive/hard_negative/random_negative/swapped_direction to the LLM. "
+            "Do not use this for reported metrics."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Print primitive-level debug progress.")
     parser.add_argument(

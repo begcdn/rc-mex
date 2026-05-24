@@ -10,10 +10,19 @@ from cigr_d_mvp1.judges import OllamaClient, OpenAICompatibleClient
 
 from rc_mex.debug import (
     compute_primitive_metrics,
+    has_broad_description,
     is_metadata_relation,
 )
 from rc_mex.evidence import CONDITIONS, RenderContext, render_example
-from rc_mex.oracle import OPENAI_API_BASE_URL, make_client, parse_bool, parse_confidence
+from rc_mex.oracle import (
+    OPENAI_API_BASE_URL,
+    build_card_generation_prompt,
+    build_pair_classification_prompt,
+    generated_card_from_json,
+    make_client,
+    parse_bool,
+    parse_confidence,
+)
 from rc_mex.run_mvp1 import DEFAULT_OPENAI_MODEL
 from rc_mex.run_mvp1 import main as run_main
 from rc_mex.sampling import sample_for_primitive
@@ -167,10 +176,12 @@ class RCMexMVP1Tests(unittest.TestCase):
             self.assertTrue((out / "debug_report.html").exists())
             self.assertTrue((out / "examples_summary.json").exists())
             self.assertTrue((out / "primitive_metrics.jsonl").exists())
+            self.assertTrue((out / "prompts_used.md").exists())
             html = (out / "debug_report.html").read_text(encoding="utf-8")
             self.assertIn("Summary Dashboard", html)
             self.assertIn("Primitive Browser", html)
             self.assertIn("Most Important Failures", html)
+            self.assertIn("Positive rule", html)
             metrics = load_json(out / "metrics.json")
             self.assertGreater(metrics["n_cards"], 0)
 
@@ -202,6 +213,7 @@ class RCMexMVP1Tests(unittest.TestCase):
         self.assertTrue(is_metadata_relation("Wikidata property"))
         self.assertTrue(is_metadata_relation("external ID"))
         self.assertFalse(is_metadata_relation("directed"))
+        self.assertTrue(has_broad_description("person is associated with a film"))
         cards = [
             {
                 "primitive_id": "P00001",
@@ -209,6 +221,7 @@ class RCMexMVP1Tests(unittest.TestCase):
                 "direction": "backward",
                 "condition_id": "A",
                 "card_variant": "contrastive_hard",
+                "description": "person is associated with a work",
                 "confidence": 0.5,
                 "opaque_reason": "",
             }
@@ -245,6 +258,94 @@ class RCMexMVP1Tests(unittest.TestCase):
         self.assertIn("metadata_relation", rows[0]["diagnosis"])
         self.assertIn("possibly_opaque", rows[0]["diagnosis"])
         self.assertIn("hard_negatives_not_helping", rows[0]["diagnosis"])
+        self.assertIn("too_broad_description", rows[0]["diagnosis"])
+
+    def test_prompt_exact_primitive_instructions_and_card_fields(self):
+        card_prompt = build_card_generation_prompt(
+            {
+                "card_variant": "contrastive_hard",
+                "visible_relation": "directed",
+                "direction": "forward",
+                "domain_types": ["person"],
+                "range_types": ["film"],
+                "positive_examples": [{"head": "Nolan", "tail": "Inception"}],
+                "negative_examples": [{"head": "Nolan", "tail": "Memento"}],
+            }
+        )
+        self.assertIn("exact KG primitive discrimination", card_prompt)
+        self.assertIn("Hard negatives are deliberately confusable", card_prompt)
+        self.assertIn("positive_rule", card_prompt)
+        generated = generated_card_from_json(
+            {
+                "predicate_description": "person x directed film y",
+                "argument_1_role": "director",
+                "argument_2_role": "film",
+                "domain": "person",
+                "range": "film",
+                "direction": "forward",
+                "positive_rule": "Accept only if x directed y.",
+                "negative_rule": "Reject if x merely wrote or produced y.",
+                "confusable_relations": ["wrote", "produced"],
+                "minimal_decision_test": "Was x the director of y?",
+                "valid_direction_explanation": "x is director, y is film",
+                "invalid_swapped_direction_explanation": "film cannot be argument 1 director",
+                "confidence": 0.9,
+                "opaque": False,
+                "opaque_reason": "",
+            },
+            "{}",
+        )
+        self.assertEqual(generated.positive_rule, "Accept only if x directed y.")
+        self.assertEqual(generated.confusable_relations, ["wrote", "produced"])
+
+    def test_validation_prompt_has_anchors_and_negative_warning(self):
+        from cigr_d_mvp1.kg import KnowledgeGraph
+        from rc_mex.run_mvp1 import build_card
+        from rc_mex.oracle import CardGenerator, MockRCMexClient
+
+        graph = KnowledgeGraph(rc_mex_kb())
+        primitives = inventory_primitives(graph, min_examples=1)
+        directed = [primitive for primitive in primitives if primitive.relation_id == "directed"][0]
+        samples = sample_for_primitive(graph, directed, primitives, 2, 1, 2, 1, 1, 3)
+        context = RenderContext.from_primitives(primitives)
+        card = build_card(graph, context, CONDITIONS["A"], directed, samples, "contrastive_hard", CardGenerator(MockRCMexClient()))
+        prompt = build_pair_classification_prompt(
+            card=card,
+            pair=render_example(graph, context, CONDITIONS["A"], samples.hard_negative_heldout[0]),
+            category="hard_negative",
+            validation_mode="contrastive",
+            reveal_validation_category=False,
+            expected_label=False,
+        )
+        self.assertIn("Do not classify a pair as true merely because the two entities are related", prompt)
+        self.assertIn("You are not told which", prompt)
+        self.assertNotIn("Validation category", prompt)
+        self.assertNotIn("hard_negative\n", prompt)
+        self.assertIn("Positive anchor examples", prompt)
+        self.assertIn("Hard-negative anchor examples", prompt)
+        self.assertIn("rejection_reason", prompt)
+
+    def test_validation_prompt_can_reveal_category_for_debug_only(self):
+        from cigr_d_mvp1.kg import KnowledgeGraph
+        from rc_mex.run_mvp1 import build_card
+        from rc_mex.oracle import CardGenerator, MockRCMexClient
+
+        graph = KnowledgeGraph(rc_mex_kb())
+        primitives = inventory_primitives(graph, min_examples=1)
+        directed = [primitive for primitive in primitives if primitive.relation_id == "directed"][0]
+        samples = sample_for_primitive(graph, directed, primitives, 2, 1, 2, 1, 1, 3)
+        context = RenderContext.from_primitives(primitives)
+        card = build_card(graph, context, CONDITIONS["A"], directed, samples, "contrastive_hard", CardGenerator(MockRCMexClient()))
+        prompt = build_pair_classification_prompt(
+            card=card,
+            pair=render_example(graph, context, CONDITIONS["A"], samples.hard_negative_heldout[0]),
+            category="hard_negative",
+            validation_mode="contrastive",
+            reveal_validation_category=True,
+            expected_label=False,
+        )
+        self.assertIn("shown only for debugging", prompt)
+        self.assertIn("hard_negative", prompt)
 
 
 if __name__ == "__main__":

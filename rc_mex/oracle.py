@@ -87,7 +87,11 @@ class CardGenerator:
         start = time.time()
         last_output = ""
         for _ in range(self.max_retries + 1):
-            last_output = self.client.complete(prompt)
+            try:
+                last_output = self.client.complete(prompt)
+            except RuntimeError as exc:
+                last_output = f"CLIENT_ERROR: {exc}"
+                continue
             data = parse_json_object(last_output)
             if data:
                 return generated_card_from_json(data, last_output)
@@ -124,18 +128,24 @@ class PairClassifier:
         expected_label: bool | None = None,
         category: str = "",
         validation_mode: str = "pairwise",
+        reveal_validation_category: bool = False,
     ) -> PairPrediction:
         prompt = build_pair_classification_prompt(
             card=card,
             pair=pair,
             category=category,
             validation_mode=validation_mode,
+            reveal_validation_category=reveal_validation_category,
             expected_label=expected_label if self.include_mock_label else None,
         )
         start = time.time()
         last_output = ""
         for _ in range(self.max_retries + 1):
-            last_output = self.client.complete(prompt)
+            try:
+                last_output = self.client.complete(prompt)
+            except RuntimeError as exc:
+                last_output = f"CLIENT_ERROR: {exc}"
+                continue
             data = parse_json_object(last_output)
             if data and "satisfies" in data:
                 return PairPrediction(
@@ -154,9 +164,9 @@ class PairClassifier:
             satisfies=False,
             direction_correct=False,
             confidence=0.0,
-            reason="classifier did not return parseable JSON",
+            reason="classifier did not return parseable JSON or the LLM request failed",
             matched_rule="",
-            rejection_reason="unparseable classifier output",
+            rejection_reason=last_output or "unparseable classifier output",
             raw_output=last_output,
             prompt_tokens_estimate=estimate_tokens(prompt),
             completion_tokens_estimate=estimate_tokens(last_output),
@@ -215,25 +225,22 @@ def build_pair_classification_prompt(
     pair: dict[str, Any],
     category: str,
     validation_mode: str,
+    reveal_validation_category: bool,
     expected_label: bool | None,
 ) -> str:
     mock_line = ""
     if expected_label is not None:
         mock_line = f"\nExpected label for mock:\n{str(expected_label).lower()}\n"
-    hard_negative_warning = ""
-    if category == "hard_negative":
-        hard_negative_warning = (
-            "\nHARD NEGATIVE WARNING:\n"
-            "This is a hard negative. It may look very similar to the positive examples. "
-            "Your job is to decide whether it matches the exact predicate, not whether it is generally related.\n"
+    category_line = ""
+    if reveal_validation_category:
+        category_line = (
+            f"Validation category, shown only for debugging and not valid blind evaluation:\n{category}\n\n"
         )
-    swapped_warning = ""
-    if category == "swapped_direction":
-        swapped_warning = (
-            "\nSWAPPED-DIRECTION WARNING:\n"
-            "The two entities may be correct, but the order may be wrong. "
-            "If the order violates the predicate direction, classify false.\n"
-        )
+    blind_warning = (
+        "The held-out pair may be a positive example, a hard negative, a random negative, "
+        "or a swapped-direction pair. You are not told which. Hard negatives may look very "
+        "similar to positives, and swapped pairs may contain the right entities in the wrong order.\n"
+    )
     contrastive_line = ""
     if validation_mode == "contrastive":
         contrastive_line = (
@@ -249,6 +256,7 @@ def build_pair_classification_prompt(
         "If the pair fits a nearby relation such as wrote, produced, acted_in, located_in, member_of, notable_work, spouse, author, publisher, or a broad 'associated with' relation, but not the exact predicate, classify false.\n"
         "When uncertain, be conservative and classify false.\n"
         "The order matters. Check whether the head plays argument_1_role and the tail plays argument_2_role. Ask whether swapping the pair would change the meaning.\n"
+        f"{blind_warning}"
         f"{contrastive_line}"
         "Return only JSON with keys: satisfies, direction_correct, confidence, reason, matched_rule, rejection_reason.\n"
         "Use booleans for satisfies/direction_correct and a numeric confidence from 0.0 to 1.0.\n\n"
@@ -265,9 +273,7 @@ def build_pair_classification_prompt(
         f"Invalid swapped direction explanation:\n{card.generated.get('invalid_swapped_direction_explanation', '')}\n\n"
         f"Positive anchor examples:\n{json.dumps(card.positive_examples_train[:4], ensure_ascii=False, indent=2)}\n\n"
         f"Hard-negative anchor examples:\n{json.dumps(card.hard_negative_examples_train[:4], ensure_ascii=False, indent=2)}\n\n"
-        f"Validation category:\n{category}\n"
-        f"{hard_negative_warning}"
-        f"{swapped_warning}\n"
+        f"{category_line}"
         f"Held-out pair to classify:\n{json.dumps(pair, ensure_ascii=False, indent=2)}\n"
         f"{mock_line}"
     )
