@@ -27,6 +27,19 @@ DEFAULT_METADATA_RELATION_PATTERNS = [
 ]
 
 
+BROAD_DESCRIPTION_PATTERNS = [
+    r"related to",
+    r"associated with",
+    r"connected to",
+    r"linked to",
+    r"involves",
+    r"has property",
+    r"has relation with",
+    r"corresponds to",
+    r"has connection to",
+]
+
+
 def parse_metadata_patterns(value: str | None) -> list[str]:
     if not value:
         return list(DEFAULT_METADATA_RELATION_PATTERNS)
@@ -36,6 +49,10 @@ def parse_metadata_patterns(value: str | None) -> list[str]:
 def is_metadata_relation(relation_id: str, patterns: list[str] | None = None) -> bool:
     patterns = patterns or DEFAULT_METADATA_RELATION_PATTERNS
     return any(re.search(pattern, relation_id, flags=re.I) for pattern in patterns)
+
+
+def has_broad_description(text: str) -> bool:
+    return any(re.search(pattern, text, flags=re.I) for pattern in BROAD_DESCRIPTION_PATTERNS)
 
 
 def graph_debug_stats(graph: Any) -> dict[str, int]:
@@ -116,6 +133,10 @@ def prediction_to_debug(row: dict[str, Any]) -> dict[str, Any]:
         "confidence": float(row.get("confidence", 0.0) or 0.0),
         "result": prediction_result(row),
         "diagnosis": short_diagnosis(row),
+        "model_reason": row.get("reason", ""),
+        "matched_rule": row.get("matched_rule", ""),
+        "rejection_reason": row.get("rejection_reason", ""),
+        "suspected_issue": row.get("suspected_issue", ""),
     }
 
 
@@ -207,6 +228,8 @@ def diagnose_card(
         labels.append("hard_negatives_not_helping")
     if metrics.get("swapped_direction_rejection_accuracy", 0.0) < 0.55:
         labels.append("direction_confusion")
+    if has_broad_description(description):
+        labels.append("too_broad_description")
     if (
         result_counts.get("false_positive_count", 0) > 0
         or metrics.get("hard_negative_rejection_accuracy", 0.0) < 0.55
@@ -268,7 +291,11 @@ def build_examples_summary(
                 "cards": {},
             },
         )
-        outcomes = [prediction_to_debug(row) for row in prediction_groups.get(key, [])]
+        card_metrics = metrics_by_key.get(key, {})
+        outcomes = [
+            enrich_outcome(prediction_to_debug(row), card, card_metrics)
+            for row in prediction_groups.get(key, [])
+        ]
         primitive["cards"][card_key] = {
             "condition_id": card["condition_id"],
             "card_variant": card["card_variant"],
@@ -277,6 +304,12 @@ def build_examples_summary(
             "argument_2_role": card.get("generated", {}).get("argument_2_role", ""),
             "domain": card.get("generated", {}).get("domain", ""),
             "range": card.get("generated", {}).get("range", ""),
+            "positive_rule": card.get("generated", {}).get("positive_rule", ""),
+            "negative_rule": card.get("generated", {}).get("negative_rule", ""),
+            "confusable_relations": card.get("generated", {}).get("confusable_relations", []),
+            "minimal_decision_test": card.get("generated", {}).get("minimal_decision_test", ""),
+            "valid_direction_explanation": card.get("generated", {}).get("valid_direction_explanation", ""),
+            "invalid_swapped_direction_explanation": card.get("generated", {}).get("invalid_swapped_direction_explanation", ""),
             "domain_types": card.get("domain_types", []),
             "range_types": card.get("range_types", []),
             "confidence": float(card.get("confidence", 0.0) or 0.0),
@@ -302,10 +335,30 @@ def build_examples_summary(
                     row for row in outcomes if row["result"] in {"TRUE POSITIVE", "TRUE NEGATIVE"}
                 ],
             },
-            "metrics": metrics_by_key.get(key, {}),
-            "diagnosis": metrics_by_key.get(key, {}).get("diagnosis", []),
+            "metrics": card_metrics,
+            "diagnosis": card_metrics.get("diagnosis", []),
         }
     return summary
+
+
+def enrich_outcome(outcome: dict[str, Any], card: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    outcome["suspected_issue"] = suspected_issue(outcome, card, metrics)
+    return outcome
+
+
+def suspected_issue(outcome: dict[str, Any], card: dict[str, Any], metrics: dict[str, Any]) -> str:
+    diagnosis = metrics.get("diagnosis", [])
+    if outcome["result"] == "DIRECTION ERROR" or outcome["category"] == "swapped_direction":
+        return "direction_confusion"
+    if "possibly_opaque" in diagnosis:
+        return "primitive_incoherent"
+    if "entity_name_dependency" in diagnosis:
+        return "entity_world_knowledge"
+    if "too_broad_description" in diagnosis or has_broad_description(str(card.get("description", ""))):
+        return "too_broad_description"
+    if outcome["category"] == "hard_negative":
+        return "hard_negative_too_similar"
+    return ""
 
 
 def select_wins_losses(summary: dict[str, Any], limit: int = 10) -> dict[str, list[dict[str, Any]]]:
@@ -320,6 +373,8 @@ def select_wins_losses(summary: dict[str, Any], limit: int = 10) -> dict[str, li
                     "direction": primitive["direction"],
                     "card_key": card_key,
                     "description": card["description"],
+                    "positive_rule": card.get("positive_rule", ""),
+                    "negative_rule": card.get("negative_rule", ""),
                 }
                 rows.append(row)
     correct = [row for row in rows if row["result"] in {"TRUE POSITIVE", "TRUE NEGATIVE"}]
@@ -395,6 +450,12 @@ def write_debug_examples_md(path: Path, summary: dict[str, Any], wins_losses: di
                     f"Argument 1 role: {escape_md(card['argument_1_role'])}",
                     f"Argument 2 role: {escape_md(card['argument_2_role'])}",
                     f"Domain/range: {escape_md(card['domain'])} → {escape_md(card['range'])}",
+                    f"Positive rule: {escape_md(card['positive_rule'])}",
+                    f"Negative rule: {escape_md(card['negative_rule'])}",
+                    f"Confusable relations: {escape_md(', '.join(card['confusable_relations']))}",
+                    f"Minimal decision test: {escape_md(card['minimal_decision_test'])}",
+                    f"Valid direction: {escape_md(card['valid_direction_explanation'])}",
+                    f"Invalid swapped direction: {escape_md(card['invalid_swapped_direction_explanation'])}",
                     f"Confidence: {card['confidence']:.3f}",
                     f"Opaque: {str(card['opaque']).lower()}",
                 ]
@@ -440,12 +501,12 @@ def outcome_table(rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return ["_No examples._"]
     out = [
-        "| Primitive | Card | Pair | Types | Expected | Predicted | Category | Confidence | Result | Diagnosis |",
-        "|---|---|---|---|---:|---:|---|---:|---|---|",
+        "| Primitive | Card | Pair | Types | Expected | Predicted | Category | Confidence | Result | Model Reason | Rejection Reason | Suspected Issue | Diagnosis |",
+        "|---|---|---|---|---:|---:|---|---:|---|---|---|---|---|",
     ]
     for row in rows:
         out.append(
-            "| {primitive} | {card} | {pair} | {types} | {expected} | {predicted} | {category} | {confidence:.3f} | {result} | {diagnosis} |".format(
+            "| {primitive} | {card} | {pair} | {types} | {expected} | {predicted} | {category} | {confidence:.3f} | {result} | {model_reason} | {rejection_reason} | {suspected_issue} | {diagnosis} |".format(
                 primitive=escape_md(str(row.get("primitive_id", ""))),
                 card=escape_md(str(row.get("card_key", ""))),
                 pair=escape_md(str(row.get("pair", ""))),
@@ -455,6 +516,9 @@ def outcome_table(rows: list[dict[str, Any]]) -> list[str]:
                 category=escape_md(str(row.get("category", ""))),
                 confidence=float(row.get("confidence", 0.0) or 0.0),
                 result=escape_md(str(row.get("result", ""))),
+                model_reason=escape_md(str(row.get("model_reason", ""))),
+                rejection_reason=escape_md(str(row.get("rejection_reason", ""))),
+                suspected_issue=escape_md(str(row.get("suspected_issue", ""))),
                 diagnosis=escape_md(str(row.get("diagnosis", ""))),
             )
         )
@@ -675,12 +739,16 @@ function renderPrimitiveCards() {
 
 function renderCard({primitive, cardKey, card, m}) {
   const outcomes = card.examples.all_validation_outcomes || [];
-  const show = list => (list || []).slice(0, 8).map(x => `<li>${badge(x.result)} ${esc(x.pair)} <span class="muted">${esc(x.types)}</span> conf=${fmt(x.confidence)}</li>`).join('') || '<li class="muted">None</li>';
+  const show = list => (list || []).slice(0, 8).map(x => `<li>${badge(x.result)} ${esc(x.pair)} <span class="muted">${esc(x.types)}</span> conf=${fmt(x.confidence)}<br><b>Reason:</b> ${esc(x.model_reason || '')}<br><b>Rejection:</b> ${esc(x.rejection_reason || '')}<br><b>Suspected:</b> ${esc(x.suspected_issue || '')}</li>`).join('') || '<li class="muted">None</li>';
   const examples = name => (card.examples[name] || []).slice(0, 6).map(x => `<li>${esc(x.head)} → ${esc(x.tail)} <span class="muted">${esc((x.head_types||[]).join(', '))} → ${esc((x.tail_types||[]).join(', '))}</span></li>`).join('') || '<li class="muted">None</li>';
   return `<details>
     <summary>${esc(primitive.primitive_id)} | ${esc(primitive.relation_id)} | ${esc(primitive.direction)} | ${esc(cardKey)} ${card.opaque ? badge('OPAQUE') : ''}</summary>
     <p><b>Description:</b> ${esc(card.description)}</p>
     <p><b>Roles:</b> ${esc(card.argument_1_role)} → ${esc(card.argument_2_role)} | <b>Confidence:</b> ${fmt(card.confidence)}</p>
+    <p><b>Positive rule:</b> ${esc(card.positive_rule)}</p>
+    <p><b>Negative rule:</b> ${esc(card.negative_rule)}</p>
+    <p><b>Confusable relations:</b> ${esc((card.confusable_relations || []).join(', '))}</p>
+    <p><b>Decision test:</b> ${esc(card.minimal_decision_test)}</p>
     <p>${diag(card.diagnosis)}</p>
     <table><tr><th>F1</th><th>Positive acc.</th><th>Hard-neg reject</th><th>Random-neg reject</th><th>Swapped reject</th><th>FP</th><th>FN</th></tr>
       <tr><td class="${cls(m.f1||0)}">${fmt(m.f1||0)}</td><td class="${cls(m.positive_accuracy||0)}">${fmt(m.positive_accuracy||0)}</td><td class="${cls(m.hard_negative_rejection_accuracy||0)}">${fmt(m.hard_negative_rejection_accuracy||0)}</td><td class="${cls(m.random_negative_rejection_accuracy||0)}">${fmt(m.random_negative_rejection_accuracy||0)}</td><td class="${cls(m.swapped_direction_rejection_accuracy||0)}">${fmt(m.swapped_direction_rejection_accuracy||0)}</td><td>${esc(m.false_positive_count||0)}</td><td>${esc(m.false_negative_count||0)}</td></tr>
@@ -692,6 +760,7 @@ function renderCard({primitive, cardKey, card, m}) {
       <div><h3>Swapped examples</h3><ul>${examples('swapped_direction_heldout')}</ul></div>
       <div><h3>False positives</h3><ul>${show(card.examples.false_positives)}</ul></div>
       <div><h3>False negatives</h3><ul>${show(card.examples.false_negatives)}</ul></div>
+      <div><h3>Hard Negative Failures</h3><ul>${show(card.examples.hard_negative_failures)}</ul></div>
     </div>
   </details>`;
 }
@@ -709,7 +778,7 @@ function renderFailures() {
 function renderFailureRows(rows) {
   if (!rows || !rows.length) return '<p class="muted">None.</p>';
   return `<ul>${rows.slice(0,10).map(row => {
-    if (row.pair) return `<li>${badge(row.result)} <b>${esc(row.primitive_id)}</b> ${esc(row.card_key)}: ${esc(row.pair)} <span class="muted">${esc(row.description)}</span> conf=${fmt(row.confidence)}</li>`;
+    if (row.pair) return `<li>${badge(row.result)} <b>${esc(row.primitive_id)}</b> ${esc(row.card_key)}: ${esc(row.pair)} <span class="muted">${esc(row.description)}</span> conf=${fmt(row.confidence)}<br><b>Reason:</b> ${esc(row.model_reason || '')}<br><b>Rejection:</b> ${esc(row.rejection_reason || '')}<br><b>Suspected issue:</b> ${esc(row.suspected_issue || '')}</li>`;
     return `<li><b>${esc(row.primitive_id)}</b> ${esc(row.condition_id)}/${esc(row.card_variant)} ${diag(row.diagnosis)} F1=${fmt(row.f1)}</li>`;
   }).join('')}</ul>`;
 }
