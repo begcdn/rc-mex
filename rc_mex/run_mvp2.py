@@ -153,6 +153,7 @@ def main() -> None:
         before = len(instances)
         instances = filter_instances_with_gold_cards(instances, card_index)
         log_line(f"Instances with a gold card in the loaded library: {len(instances)} / {before}")
+    oracle_injection = args.frontier_mode == "oracle_include_gold"
 
     if args.oracle_backend == "mock":
         ranker: CardRanker = MockCardRanker()
@@ -169,7 +170,14 @@ def main() -> None:
 
     log_stage(4, 6, "Ranking candidate relation cards")
     rows: list[dict[str, Any]] = []
+    frontier_failures: list[dict[str, Any]] = []
+    raw_relation_cap = max(1, len(graph.relations()) * 2)
     for instance in instances:
+        raw_relation_frontier = graph.candidate_relations(
+            instance.current_entity_ids,
+            cap=raw_relation_cap,
+            sample_entities=len(instance.current_entity_ids),
+        )
         relation_frontier = graph.candidate_relations(
             instance.current_entity_ids,
             cap=args.relation_cap,
@@ -181,15 +189,50 @@ def main() -> None:
                 f"gold={instance.gold_predicate}/{instance.gold_direction}"
             )
         for (condition_id, variant), cards_by_relation in sorted(card_index.items()):
-            candidates = build_candidate_cards(
+            local_candidates = build_candidate_cards(
                 cards_by_relation=cards_by_relation,
                 relation_frontier=relation_frontier,
                 candidate_card_cap=args.candidate_card_cap,
             )
             gold_card = cards_by_relation.get(key_from_instance(instance))
             gold_card_id = card_id(gold_card) if gold_card else ""
+            local_gold_in_pool = bool(
+                gold_card_id and any(candidate["card_id"] == gold_card_id for candidate in local_candidates)
+            )
+            candidates = list(local_candidates)
+            injected_gold = False
+            if oracle_injection and gold_card and not local_gold_in_pool:
+                injected_gold = inject_gold_candidate(candidates, gold_card)
             gold_in_pool = bool(gold_card_id and any(candidate["card_id"] == gold_card_id for candidate in candidates))
-            row = base_prediction_row(instance, condition_id, variant, candidates, gold_card_id, gold_in_pool)
+            row = base_prediction_row(
+                instance,
+                condition_id,
+                variant,
+                candidates,
+                gold_card_id,
+                gold_in_pool,
+                local_gold_in_pool=local_gold_in_pool,
+                injected_gold=injected_gold,
+                frontier_mode=args.frontier_mode,
+            )
+
+            if gold_card and not local_gold_in_pool:
+                frontier_failures.append(
+                    build_frontier_failure_diagnostic(
+                        graph=graph,
+                        instance=instance,
+                        condition_id=condition_id,
+                        variant=variant,
+                        gold_card=gold_card,
+                        raw_relation_frontier=raw_relation_frontier,
+                        relation_frontier=relation_frontier,
+                        local_candidates=local_candidates,
+                        final_candidates=candidates,
+                        relation_cap=args.relation_cap,
+                        candidate_card_cap=args.candidate_card_cap,
+                        cards_by_relation=cards_by_relation,
+                    )
+                )
 
             if not candidates:
                 row["skip_reason"] = "empty_candidate_pool"
@@ -234,9 +277,11 @@ def main() -> None:
 
     log_stage(5, 6, "Computing metrics")
     metrics = compute_retrieval_metrics(rows)
+    frontier_metrics = compute_frontier_metrics(rows)
     for group, group_metrics in sorted(metrics.items()):
         log_line(
-            f"{group}: candidate_recall={group_metrics['candidate_recall']:.3f} "
+            f"{group}: local_candidate_recall={group_metrics['local_candidate_recall']:.3f} "
+            f"final_candidate_recall={group_metrics['candidate_recall']:.3f} "
             f"R@1={group_metrics['recall_at_1']:.3f} "
             f"R@5={group_metrics['recall_at_5']:.3f} "
             f"MRR={group_metrics['mrr']:.3f}"
@@ -251,13 +296,19 @@ def main() -> None:
         "n_instances": len(instances),
         "n_prediction_rows": len(rows),
         "covered_only": bool(args.require_gold_card or args.covered_only),
+        "frontier_mode": args.frontier_mode,
         "coverage": coverage,
+        "frontier_metrics": frontier_metrics,
         "metrics": metrics,
     }
     write_jsonl(output_dir / "retrieval_predictions.jsonl", rows)
+    write_json(output_dir / "candidate_frontier_diagnostics.json", {"failures": frontier_failures})
+    write_frontier_diagnostics_report(output_dir / "candidate_frontier_diagnostics.md", frontier_failures)
     write_json(output_dir / "metrics.json", summary)
     write_report(output_dir / "report.md", summary)
     log_line("retrieval_predictions.jsonl")
+    log_line("candidate_frontier_diagnostics.json")
+    log_line("candidate_frontier_diagnostics.md")
     log_line("metrics.json")
     log_line("report.md")
     log_line("mvp2_coverage.json")
@@ -347,6 +398,155 @@ def build_candidate_cards(
     return candidates
 
 
+def inject_gold_candidate(candidates: list[dict[str, Any]], gold_card: dict[str, Any]) -> bool:
+    gold_card_id = card_id(gold_card)
+    if any(candidate["card_id"] == gold_card_id for candidate in candidates):
+        return False
+    candidates.append(
+        {
+            "candidate_id": f"C{len(candidates) + 1:03d}",
+            "card_id": gold_card_id,
+            "relation_id": gold_card.get("relation_id", ""),
+            "direction": gold_card.get("direction", ""),
+            "frontier_frequency": 0,
+            "injected_gold": True,
+            "card": gold_card,
+        }
+    )
+    return True
+
+
+def build_frontier_failure_diagnostic(
+    graph: KnowledgeGraph,
+    instance: RelationGroundingInstance,
+    condition_id: str,
+    variant: str,
+    gold_card: dict[str, Any],
+    raw_relation_frontier: list[Any],
+    relation_frontier: list[Any],
+    local_candidates: list[dict[str, Any]],
+    final_candidates: list[dict[str, Any]],
+    relation_cap: int,
+    candidate_card_cap: int,
+    cards_by_relation: dict[PrimitiveKey, dict[str, Any]],
+) -> dict[str, Any]:
+    gold_key = key_from_instance(instance)
+    raw_keys = [key_from_relation_candidate(candidate) for candidate in raw_relation_frontier]
+    pruned_keys = [key_from_relation_candidate(candidate) for candidate in relation_frontier]
+    all_card_candidates = build_candidate_cards(cards_by_relation, relation_frontier, candidate_card_cap=10**9)
+    all_card_ids = [candidate["card_id"] for candidate in all_card_candidates]
+    gold_card_id = card_id(gold_card)
+    gold_in_raw = gold_key in raw_keys
+    gold_in_pruned = gold_key in pruned_keys
+    gold_in_all_cards_before_cap = gold_card_id in all_card_ids
+    gold_result, gold_proofs = graph.follow(
+        instance.current_entity_ids,
+        instance.gold_predicate,
+        instance.gold_direction,
+    )
+    same_relation_other_direction = [
+        key.to_json()
+        for key in raw_keys
+        if key.relation_id == gold_key.relation_id and key.direction != gold_key.direction
+    ]
+    return {
+        "instance_id": instance.instance_id,
+        "program_index": instance.program_index,
+        "step_index": instance.step_index,
+        "question": instance.question,
+        "condition_id": condition_id,
+        "card_variant": variant,
+        "gold_relation_id": instance.gold_predicate,
+        "gold_direction": instance.gold_direction,
+        "gold_key": gold_key.to_json(),
+        "current_entity_count": len(instance.current_entity_ids),
+        "current_entities": render_current_entities(graph, instance.current_entity_ids, limit=20),
+        "raw_local_relation_frontier": relation_frontier_rows(raw_relation_frontier),
+        "candidate_frontier_after_pruning": relation_frontier_rows(relation_frontier),
+        "final_candidate_cards": candidate_rows(final_candidates),
+        "local_candidate_cards": candidate_rows(local_candidates),
+        "gold_relation_appears_in_raw_frontier": gold_in_raw,
+        "gold_relation_appears_after_relation_cap": gold_in_pruned,
+        "gold_card_available": bool(gold_card),
+        "gold_card_id": gold_card_id,
+        "gold_card_appears_before_candidate_card_cap": gold_in_all_cards_before_cap,
+        "removed_by_relation_cap": gold_in_raw and not gold_in_pruned,
+        "removed_by_candidate_card_cap": gold_in_all_cards_before_cap and gold_card_id not in [candidate["card_id"] for candidate in local_candidates],
+        "relation_cap": relation_cap,
+        "candidate_card_cap": candidate_card_cap,
+        "gold_execution_non_empty": bool(gold_result),
+        "gold_execution_result_count": len(gold_result),
+        "gold_execution_examples": render_current_entities(graph, gold_result, limit=10),
+        "gold_execution_proofs": [
+            {
+                "subject": graph.entity_name(proof.subject_id),
+                "predicate": proof.predicate,
+                "object": graph.entity_name(proof.object_id),
+                "direction": proof.direction,
+            }
+            for proof in gold_proofs
+        ],
+        "same_relation_other_direction_in_raw_frontier": same_relation_other_direction,
+        "suspected_cause": suspect_frontier_failure(
+            gold_in_raw=gold_in_raw,
+            gold_in_pruned=gold_in_pruned,
+            gold_in_all_cards_before_cap=gold_in_all_cards_before_cap,
+            gold_in_local_cards=gold_card_id in [candidate["card_id"] for candidate in local_candidates],
+            gold_execution_non_empty=bool(gold_result),
+            same_relation_other_direction=bool(same_relation_other_direction),
+        ),
+    }
+
+
+def relation_frontier_rows(frontier: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "relation_id": relation.predicate,
+            "direction": relation.direction,
+            "frequency": relation.frequency,
+            "key": key_from_relation_candidate(relation).display(),
+        }
+        for relation in frontier
+    ]
+
+
+def candidate_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "card_id": candidate["card_id"],
+            "relation_id": candidate.get("relation_id", ""),
+            "direction": candidate.get("direction", ""),
+            "frontier_frequency": candidate.get("frontier_frequency", 0),
+            "injected_gold": bool(candidate.get("injected_gold", False)),
+        }
+        for candidate in candidates
+    ]
+
+
+def suspect_frontier_failure(
+    gold_in_raw: bool,
+    gold_in_pruned: bool,
+    gold_in_all_cards_before_cap: bool,
+    gold_in_local_cards: bool,
+    gold_execution_non_empty: bool,
+    same_relation_other_direction: bool,
+) -> str:
+    if same_relation_other_direction and not gold_in_raw:
+        return "direction_mismatch"
+    if gold_in_raw and not gold_in_pruned:
+        return "pruned_by_cap"
+    if gold_in_pruned and gold_in_all_cards_before_cap and not gold_in_local_cards:
+        return "pruned_by_cap"
+    if gold_in_pruned and not gold_in_all_cards_before_cap:
+        return "missing_card_for_frontier_relation"
+    if not gold_in_raw and gold_execution_non_empty:
+        return "prefix_state_wrong"
+    if not gold_in_raw:
+        return "gold_relation_not_adjacent"
+    return "unsupported_kopl_semantics"
+
+
 def build_coverage_report(
     cards: list[dict[str, Any]],
     instances: list[RelationGroundingInstance],
@@ -416,6 +616,77 @@ def write_coverage_report(path: Path, coverage: dict[str, Any]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_frontier_diagnostics_report(path: Path, failures: list[dict[str, Any]]) -> None:
+    lines = [
+        "# RC-MEX MVP2 Candidate Frontier Diagnostics",
+        "",
+        "These are slots where the gold card exists in the loaded library but was absent from the local candidate frontier.",
+        "",
+        f"Total frontier failures: {len(failures)}",
+        "",
+    ]
+    for row in failures:
+        lines.extend(
+            [
+                f"## {row['instance_id']} — {row['condition_id']}/{row['card_variant']}",
+                "",
+                f"- Question: {row['question']}",
+                f"- Gold: `{row['gold_relation_id']}/{row['gold_direction']}`",
+                f"- Suspected cause: `{row['suspected_cause']}`",
+                f"- Gold in raw frontier: `{row['gold_relation_appears_in_raw_frontier']}`",
+                f"- Gold after relation cap: `{row['gold_relation_appears_after_relation_cap']}`",
+                f"- Removed by relation/card cap: `{row['removed_by_relation_cap'] or row['removed_by_candidate_card_cap']}`",
+                f"- Gold execution non-empty: `{row['gold_execution_non_empty']}` ({row['gold_execution_result_count']} results)",
+                "",
+                "### Current Entities",
+                "",
+                *format_entity_list(row["current_entities"]),
+                "",
+                "### Raw Local Relation+Direction Frontier",
+                "",
+                *format_frontier_list(row["raw_local_relation_frontier"]),
+                "",
+                "### Candidate Frontier After Pruning",
+                "",
+                *format_frontier_list(row["candidate_frontier_after_pruning"]),
+                "",
+                "### Final Candidate Cards Shown To LLM",
+                "",
+                *format_candidate_list(row["final_candidate_cards"]),
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def format_entity_list(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["_None_"]
+    return [
+        f"- {row.get('entity', '')} | types: {', '.join(row.get('types', []) or []) or 'unknown'}"
+        for row in rows
+    ]
+
+
+def format_frontier_list(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["_None_"]
+    return [
+        f"- `{row['relation_id']}/{row['direction']}` frequency={row['frequency']}"
+        for row in rows
+    ]
+
+
+def format_candidate_list(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["_None_"]
+    return [
+        f"- {row['candidate_id']} `{row['relation_id']}/{row['direction']}`"
+        f" frequency={row['frontier_frequency']} injected_gold={row['injected_gold']}"
+        for row in rows
+    ]
+
+
 def format_key_list(rows: list[dict[str, str]]) -> list[str]:
     if not rows:
         return ["_None_"]
@@ -435,6 +706,9 @@ def base_prediction_row(
     candidates: list[dict[str, Any]],
     gold_card_id: str,
     gold_in_pool: bool,
+    local_gold_in_pool: bool,
+    injected_gold: bool,
+    frontier_mode: str,
 ) -> dict[str, Any]:
     return {
         "instance_id": instance.instance_id,
@@ -447,6 +721,9 @@ def base_prediction_row(
         "gold_direction": instance.gold_direction,
         "gold_card_id": gold_card_id,
         "gold_in_candidate_pool": gold_in_pool,
+        "local_gold_in_candidate_pool": local_gold_in_pool,
+        "injected_gold": injected_gold,
+        "frontier_mode": frontier_mode,
         "candidate_count": len(candidates),
         "candidate_card_ids": [candidate["card_id"] for candidate in candidates],
         "ranked_card_ids": [],
@@ -577,20 +854,58 @@ def group_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
         return {}
     candidate_rows = [row for row in rows if row["gold_card_id"]]
     ranked_rows = [row for row in rows if row.get("gold_rank", 0)]
+    local_ranked_rows = [row for row in ranked_rows if row.get("local_gold_in_candidate_pool")]
+    injected_ranked_rows = [row for row in ranked_rows if row.get("injected_gold")]
     return {
         "n_instances": float(len(rows)),
         "n_gold_card_available": float(len(candidate_rows)),
         "n_ranked_instances": float(len(ranked_rows)),
         "missing_gold_card_rate": average_bool([not bool(row["gold_card_id"]) for row in rows]),
+        "local_candidate_recall": average_bool([bool(row.get("local_gold_in_candidate_pool")) for row in candidate_rows]),
         "candidate_recall": average_bool([bool(row["gold_in_candidate_pool"]) for row in candidate_rows]),
+        "oracle_injected_rate": average_bool([bool(row.get("injected_gold")) for row in candidate_rows]),
         "recall_at_1": recall_at(ranked_rows, 1),
         "recall_at_3": recall_at(ranked_rows, 3),
         "recall_at_5": recall_at(ranked_rows, 5),
         "mrr": average([1.0 / row["gold_rank"] for row in ranked_rows if row["gold_rank"]]),
+        "local_frontier_recall_at_1": recall_at(local_ranked_rows, 1),
+        "local_frontier_mrr": average([1.0 / row["gold_rank"] for row in local_ranked_rows if row["gold_rank"]]),
+        "oracle_injected_recall_at_1": recall_at(injected_ranked_rows, 1),
+        "oracle_injected_mrr": average([1.0 / row["gold_rank"] for row in injected_ranked_rows if row["gold_rank"]]),
         "avg_candidate_count": average([float(row["candidate_count"]) for row in rows]),
         "avg_prompt_tokens": average([float(row.get("prompt_tokens", 0.0) or 0.0) for row in ranked_rows]),
         "avg_completion_tokens": average([float(row.get("completion_tokens", 0.0) or 0.0) for row in ranked_rows]),
         "avg_latency_seconds": average([float(row.get("latency_seconds", 0.0) or 0.0) for row in ranked_rows]),
+    }
+
+
+def compute_frontier_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_rows = [row for row in rows if row.get("gold_card_id")]
+    return {
+        "n_rows": len(rows),
+        "n_gold_card_available": len(candidate_rows),
+        "local_frontier_candidate_recall": average_bool(
+            [bool(row.get("local_gold_in_candidate_pool")) for row in candidate_rows]
+        ),
+        "final_candidate_recall": average_bool(
+            [bool(row.get("gold_in_candidate_pool")) for row in candidate_rows]
+        ),
+        "oracle_injected_rate": average_bool([bool(row.get("injected_gold")) for row in candidate_rows]),
+        "ranking_recall_at_1_when_gold_available": recall_at(
+            [row for row in rows if row.get("gold_rank", 0)],
+            1,
+        ),
+        "ranking_mrr_when_gold_available": average(
+            [1.0 / row["gold_rank"] for row in rows if row.get("gold_rank", 0)]
+        ),
+        "ranking_recall_at_1_local_frontier_only": recall_at(
+            [row for row in rows if row.get("gold_rank", 0) and row.get("local_gold_in_candidate_pool")],
+            1,
+        ),
+        "ranking_recall_at_1_oracle_injected_only": recall_at(
+            [row for row in rows if row.get("gold_rank", 0) and row.get("injected_gold")],
+            1,
+        ),
     }
 
 
@@ -627,12 +942,14 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
                 "n_instances": summary["n_instances"],
                 "n_prediction_rows": summary["n_prediction_rows"],
                 "covered_only": summary["covered_only"],
+                "frontier_mode": summary["frontier_mode"],
                 "extraction_stats": summary["extraction_stats"],
                 "coverage": {
                     "n_loaded_card_keys": summary["coverage"]["n_loaded_card_keys"],
                     "n_gold_slot_keys": summary["coverage"]["n_gold_slot_keys"],
                     "n_overlapping_keys": summary["coverage"]["n_overlapping_keys"],
                 },
+                "frontier_metrics": summary["frontier_metrics"],
             },
             indent=2,
             sort_keys=True,
@@ -727,6 +1044,16 @@ def parse_args() -> argparse.Namespace:
         "--fail-if-zero-coverage",
         action="store_true",
         help="Stop before ranking if loaded cards do not overlap any gold slot relation+direction keys.",
+    )
+    parser.add_argument(
+        "--frontier-mode",
+        choices=["local_frontier", "oracle_include_gold"],
+        default="local_frontier",
+        help=(
+            "local_frontier ranks only cards reachable from the current entity set. "
+            "oracle_include_gold injects the gold card when the local frontier misses it, "
+            "for ranking-only diagnostics."
+        ),
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

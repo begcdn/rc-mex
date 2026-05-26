@@ -162,10 +162,91 @@ class RCMexMVP2Tests(unittest.TestCase):
             self.assertTrue((mvp2_out / "retrieval_predictions.jsonl").exists())
             self.assertTrue((mvp2_out / "metrics.json").exists())
             self.assertTrue((mvp2_out / "report.md").exists())
+            self.assertTrue((mvp2_out / "candidate_frontier_diagnostics.json").exists())
+            self.assertTrue((mvp2_out / "candidate_frontier_diagnostics.md").exists())
             metrics = load_json(mvp2_out / "metrics.json")
             self.assertGreater(metrics["n_prediction_rows"], 0)
+            self.assertIn("frontier_metrics", metrics)
             group = metrics["metrics"]["A/contrastive_hard"]
+            self.assertIn("local_candidate_recall", group)
             self.assertGreaterEqual(group["candidate_recall"], 0.5)
+
+    def test_oracle_include_gold_injects_missing_local_frontier_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kb_path = root / "kb.json"
+            questions_path = root / "val.json"
+            mvp1_out = root / "mvp1"
+            mvp2_out = root / "mvp2"
+            write_json(kb_path, rc_mex_kb())
+            write_json(questions_path, [rc_mex_questions()[0]])
+
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "run_mvp1",
+                    "--kb",
+                    str(kb_path),
+                    "--output",
+                    str(mvp1_out),
+                    "--max-primitives",
+                    "5",
+                    "--min-examples",
+                    "1",
+                    "--train-positives",
+                    "1",
+                    "--heldout-positives",
+                    "1",
+                    "--train-negatives",
+                    "1",
+                    "--heldout-negatives",
+                    "1",
+                    "--random-negatives",
+                    "1",
+                    "--oracle-backend",
+                    "mock",
+                    "--conditions",
+                    "A",
+                    "--card-variants",
+                    "contrastive_hard",
+                ]
+                run_mvp1_main()
+                sys.argv = [
+                    "run_mvp2",
+                    "--kb",
+                    str(kb_path),
+                    "--questions",
+                    str(questions_path),
+                    "--cards",
+                    str(mvp1_out / "relation_cards.jsonl"),
+                    "--output",
+                    str(mvp2_out),
+                    "--conditions",
+                    "A",
+                    "--card-variants",
+                    "contrastive_hard",
+                    "--oracle-backend",
+                    "mock",
+                    "--max-instances",
+                    "1",
+                    "--relation-cap",
+                    "0",
+                    "--frontier-mode",
+                    "oracle_include_gold",
+                ]
+                run_mvp2_main()
+            finally:
+                sys.argv = old_argv
+
+            rows = [
+                __import__("json").loads(line)
+                for line in (mvp2_out / "retrieval_predictions.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(rows), 1)
+            self.assertFalse(rows[0]["local_gold_in_candidate_pool"])
+            self.assertTrue(rows[0]["gold_in_candidate_pool"])
+            self.assertTrue(rows[0]["injected_gold"])
 
 
 if __name__ == "__main__":

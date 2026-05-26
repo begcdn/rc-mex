@@ -104,6 +104,16 @@ class KnowledgeGraph:
             return []
         return entity.get("relations", []) or []
 
+    def relations(self) -> set[tuple[str, str]]:
+        out = set()
+        for entity_id in self.entities:
+            for relation in self.iter_relations(entity_id):
+                predicate = str(relation.get("predicate", ""))
+                direction = str(relation.get("direction", ""))
+                if predicate and direction:
+                    out.add((predicate, direction))
+        return out
+
     def candidate_relations(
         self,
         entity_ids: Iterable[str],
