@@ -44,6 +44,13 @@ class RCMexMVP3Tests(unittest.TestCase):
         row = evaluate_prediction(graph, instance, prediction, top_k=2, weight_scheme="reciprocal_rank")
         self.assertLess(row["top1_gold_recall"], 1.0)
         self.assertEqual(row["marginal_gold_recall"], 1.0)
+        self.assertTrue(row["direct_edge_executable"])
+        self.assertFalse(row["gold_relation_in_top1"])
+        self.assertTrue(row["gold_relation_in_top3"])
+        self.assertIn("top1_precision", row)
+        self.assertIn("marginal_precision", row)
+        self.assertIn("top1_f1", row)
+        self.assertIn("marginal_f1", row)
 
     def test_runner_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,6 +106,13 @@ class RCMexMVP3Tests(unittest.TestCase):
             self.assertTrue((output / "metrics.json").exists())
             metrics = load_json(output / "metrics.json")
             self.assertEqual(metrics["n_execution_rows"], 1)
+            group = metrics["metrics"]["A/contrastive_hard"]
+            self.assertEqual(group["direct_edge_executable_rate"], 1.0)
+            self.assertEqual(group["gold_relation_in_top1_rate"], 1.0)
+            self.assertIn("average_top1_result_size", group)
+            self.assertIn("average_marginal_result_size", group)
+            self.assertIn("__executable_only__", metrics["metrics"])
+            self.assertIn("__local_frontier_only__", metrics["metrics"])
             rows = [
                 json.loads(line)
                 for line in (output / "execution_predictions.jsonl").read_text().splitlines()

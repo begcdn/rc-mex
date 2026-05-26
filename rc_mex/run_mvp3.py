@@ -159,6 +159,11 @@ def evaluate_prediction(
     ranked_entities = sorted(scores.items(), key=lambda item: (-item[1], graph.entity_name(item[0]), item[0]))
     top_n = max(1, len(gold_entities))
     marginal_topn = {entity_id for entity_id, _ in ranked_entities[:top_n]}
+    gold_relation_ranks = gold_relation_rank_positions(ranked_card_ids, instance)
+    top1_recall = set_recall(gold_entities, top1_entities)
+    top1_precision = set_precision(gold_entities, top1_entities)
+    marginal_recall = set_recall(gold_entities, marginal_entities)
+    marginal_precision = set_precision(gold_entities, marginal_entities)
     return {
         "instance_id": instance.instance_id,
         "question": instance.question,
@@ -172,18 +177,27 @@ def evaluate_prediction(
         "gold_result_count": len(gold_entities),
         "gold_result_examples": entity_examples(graph, gold_entities),
         "gold_execution_non_empty": bool(gold_entities),
+        "direct_edge_executable": bool(gold_entities),
+        "gold_relation_rank": gold_relation_ranks[0] if gold_relation_ranks else 0,
+        "gold_relation_in_top1": any(rank <= 1 for rank in gold_relation_ranks),
+        "gold_relation_in_top3": any(rank <= 3 for rank in gold_relation_ranks),
+        "gold_relation_in_top5": any(rank <= 5 for rank in gold_relation_ranks),
         "top1_relation_id": top1_relation_id,
         "top1_direction": top1_direction,
         "top1_result_count": len(top1_entities),
-        "top1_gold_recall": set_recall(gold_entities, top1_entities),
-        "top1_precision_vs_gold": set_precision(gold_entities, top1_entities),
+        "top1_gold_recall": top1_recall,
+        "top1_precision": top1_precision,
+        "top1_precision_vs_gold": top1_precision,
+        "top1_f1": f1(top1_precision, top1_recall),
         "top1_jaccard": jaccard(gold_entities, top1_entities),
         "top1_any_gold": bool(gold_entities & top1_entities),
         "top1_exact_relation": primitive_key(top1_relation_id, top1_direction) == primitive_key(instance.gold_predicate, instance.gold_direction),
         "marginal_top_k": top_k,
         "marginal_result_count": len(marginal_entities),
-        "marginal_gold_recall": set_recall(gold_entities, marginal_entities),
-        "marginal_precision_vs_gold": set_precision(gold_entities, marginal_entities),
+        "marginal_gold_recall": marginal_recall,
+        "marginal_precision": marginal_precision,
+        "marginal_precision_vs_gold": marginal_precision,
+        "marginal_f1": f1(marginal_precision, marginal_recall),
         "marginal_jaccard": jaccard(gold_entities, marginal_entities),
         "marginal_any_gold": bool(gold_entities & marginal_entities),
         "marginal_topn_gold_recall": set_recall(gold_entities, marginal_topn),
@@ -204,6 +218,16 @@ def evaluate_prediction(
             for proof in gold_proofs[:10]
         ],
     }
+
+
+def gold_relation_rank_positions(ranked_card_ids: list[str], instance: RelationGroundingInstance) -> list[int]:
+    gold_key = primitive_key(instance.gold_predicate, instance.gold_direction)
+    out = []
+    for rank, card_id in enumerate(ranked_card_ids, start=1):
+        parsed = parse_card_id(card_id)
+        if primitive_key(parsed["relation_id"], parsed["direction"]) == gold_key:
+            out.append(rank)
+    return out
 
 
 def parse_card_id(card_id: str) -> dict[str, str]:
@@ -244,6 +268,12 @@ def set_precision(gold: set[str], predicted: set[str]) -> float:
     return len(gold & predicted) / len(predicted)
 
 
+def f1(precision: float, recall: float) -> float:
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
 def jaccard(left: set[str], right: set[str]) -> float:
     if not left and not right:
         return 1.0
@@ -256,30 +286,55 @@ def compute_mvp3_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(row["condition_id"], row["card_variant"])].append(row)
-    return {
+    metrics = {
         f"{condition}/{variant}": group_metrics(group_rows)
         for (condition, variant), group_rows in sorted(groups.items())
     }
+    metrics["__overall__"] = group_metrics(rows)
+    metrics["__executable_only__"] = group_metrics([row for row in rows if row["direct_edge_executable"]])
+    metrics["__local_frontier_only__"] = group_metrics([row for row in rows if row["local_gold_in_candidate_pool"]])
+    metrics["__oracle_injected_only__"] = group_metrics([row for row in rows if row["injected_gold"]])
+    return metrics
 
 
 def group_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     if not rows:
         return {}
+    executable_rows = [row for row in rows if row["direct_edge_executable"]]
     return {
         "n_instances": float(len(rows)),
+        "n_executable_instances": float(len(executable_rows)),
+        "direct_edge_executable_rate": average_bool([row["direct_edge_executable"] for row in rows]),
         "local_gold_in_candidate_pool_rate": average_bool([row["local_gold_in_candidate_pool"] for row in rows]),
         "injected_gold_rate": average_bool([row["injected_gold"] for row in rows]),
         "top1_exact_relation_rate": average_bool([row["top1_exact_relation"] for row in rows]),
+        "gold_relation_in_top1_rate": average_bool([row["gold_relation_in_top1"] for row in rows]),
+        "gold_relation_in_top3_rate": average_bool([row["gold_relation_in_top3"] for row in rows]),
+        "gold_relation_in_top5_rate": average_bool([row["gold_relation_in_top5"] for row in rows]),
         "top1_any_gold_rate": average_bool([row["top1_any_gold"] for row in rows]),
         "marginal_any_gold_rate": average_bool([row["marginal_any_gold"] for row in rows]),
         "top1_gold_recall": average([row["top1_gold_recall"] for row in rows]),
         "marginal_gold_recall": average([row["marginal_gold_recall"] for row in rows]),
         "marginal_recall_gain": average([row["marginal_gold_recall"] - row["top1_gold_recall"] for row in rows]),
-        "top1_precision_vs_gold": average([row["top1_precision_vs_gold"] for row in rows]),
-        "marginal_precision_vs_gold": average([row["marginal_precision_vs_gold"] for row in rows]),
+        "top1_precision": average([row["top1_precision"] for row in rows]),
+        "marginal_precision": average([row["marginal_precision"] for row in rows]),
+        "top1_f1": average([row["top1_f1"] for row in rows]),
+        "marginal_f1": average([row["marginal_f1"] for row in rows]),
+        "marginal_f1_gain": average([row["marginal_f1"] - row["top1_f1"] for row in rows]),
+        "average_top1_result_size": average([float(row["top1_result_count"]) for row in rows]),
+        "average_marginal_result_size": average([float(row["marginal_result_count"]) for row in rows]),
         "top1_jaccard": average([row["top1_jaccard"] for row in rows]),
         "marginal_jaccard": average([row["marginal_jaccard"] for row in rows]),
         "marginal_topn_gold_recall": average([row["marginal_topn_gold_recall"] for row in rows]),
+        "executable_top1_gold_recall": average([row["top1_gold_recall"] for row in executable_rows]),
+        "executable_marginal_gold_recall": average([row["marginal_gold_recall"] for row in executable_rows]),
+        "executable_marginal_recall_gain": average(
+            [row["marginal_gold_recall"] - row["top1_gold_recall"] for row in executable_rows]
+        ),
+        "executable_top1_precision": average([row["top1_precision"] for row in executable_rows]),
+        "executable_marginal_precision": average([row["marginal_precision"] for row in executable_rows]),
+        "executable_top1_f1": average([row["top1_f1"] for row in executable_rows]),
+        "executable_marginal_f1": average([row["marginal_f1"] for row in executable_rows]),
     }
 
 
