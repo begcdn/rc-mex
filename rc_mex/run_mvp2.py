@@ -17,6 +17,15 @@ from cigr_d_mvp1.kopl import RelationGroundingInstance, extract_relation_groundi
 
 from .debug import graph_debug_stats, is_metadata_relation, parse_metadata_patterns
 from .oracle import LLMClient, make_client, parse_json_object
+from .primitive_key import (
+    PrimitiveKey,
+    key_from_card,
+    key_from_instance,
+    key_from_relation_candidate,
+    possible_direction_mismatches,
+    possible_relation_normalization_matches,
+    possible_text_mismatches,
+)
 
 
 DEFAULT_LOCAL_MODEL = "llama3:8b-instruct"
@@ -127,7 +136,20 @@ def main() -> None:
     log_line(f"Relation steps seen: {extraction_stats['relation_steps_seen']}")
     log_line(f"Instances created: {extraction_stats['instances_created']}")
     log_line(f"Unsupported prefixes: {extraction_stats['unsupported_prefix']}")
-    if args.require_gold_card:
+    coverage = build_coverage_report(all_cards, instances, card_index)
+    write_json(output_dir / "mvp2_coverage.json", coverage)
+    write_coverage_report(output_dir / "mvp2_coverage_report.md", coverage)
+    log_line(
+        f"Coverage overlap: {coverage['n_overlapping_keys']} / "
+        f"{coverage['n_gold_slot_keys']} gold keys against {coverage['n_loaded_card_keys']} loaded card keys"
+    )
+    if args.fail_if_zero_coverage and coverage["n_overlapping_keys"] == 0:
+        raise SystemExit(
+            "MVP2 coverage is zero: no gold relation+direction key appears in the loaded card library. "
+            "Build targeted cards with `python3 -m rc_mex.build_target_cards` or use a larger MVP1 card library. "
+            f"See {output_dir / 'mvp2_coverage_report.md'}."
+        )
+    if args.require_gold_card or args.covered_only:
         before = len(instances)
         instances = filter_instances_with_gold_cards(instances, card_index)
         log_line(f"Instances with a gold card in the loaded library: {len(instances)} / {before}")
@@ -164,8 +186,7 @@ def main() -> None:
                 relation_frontier=relation_frontier,
                 candidate_card_cap=args.candidate_card_cap,
             )
-            gold_key = (instance.gold_predicate, instance.gold_direction)
-            gold_card = cards_by_relation.get(gold_key)
+            gold_card = cards_by_relation.get(key_from_instance(instance))
             gold_card_id = card_id(gold_card) if gold_card else ""
             gold_in_pool = bool(gold_card_id and any(candidate["card_id"] == gold_card_id for candidate in candidates))
             row = base_prediction_row(instance, condition_id, variant, candidates, gold_card_id, gold_in_pool)
@@ -229,6 +250,8 @@ def main() -> None:
         "n_cards": len(all_cards),
         "n_instances": len(instances),
         "n_prediction_rows": len(rows),
+        "covered_only": bool(args.require_gold_card or args.covered_only),
+        "coverage": coverage,
         "metrics": metrics,
     }
     write_jsonl(output_dir / "retrieval_predictions.jsonl", rows)
@@ -237,6 +260,8 @@ def main() -> None:
     log_line("retrieval_predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
+    log_line("mvp2_coverage.json")
+    log_line("mvp2_coverage_report.md")
     print(f"Wrote RC-MEX MVP2 outputs to {output_dir}")
 
 
@@ -276,36 +301,35 @@ def filter_cards(
     return out
 
 
-def index_cards(cards: list[dict[str, Any]]) -> dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]]:
-    index: dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]] = defaultdict(dict)
+def index_cards(cards: list[dict[str, Any]]) -> dict[tuple[str, str], dict[PrimitiveKey, dict[str, Any]]]:
+    index: dict[tuple[str, str], dict[PrimitiveKey, dict[str, Any]]] = defaultdict(dict)
     for card in cards:
         group = (str(card.get("condition_id", "")), str(card.get("card_variant", "")))
-        relation_key = (str(card.get("relation_id", "")), str(card.get("direction", "")))
-        index[group][relation_key] = card
+        index[group][key_from_card(card)] = card
     return dict(index)
 
 
 def filter_instances_with_gold_cards(
     instances: list[RelationGroundingInstance],
-    card_index: dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]],
+    card_index: dict[tuple[str, str], dict[PrimitiveKey, dict[str, Any]]],
 ) -> list[RelationGroundingInstance]:
     covered = set()
     for cards_by_relation in card_index.values():
         covered.update(cards_by_relation)
     return [
         instance for instance in instances
-        if (instance.gold_predicate, instance.gold_direction) in covered
+        if key_from_instance(instance) in covered
     ]
 
 
 def build_candidate_cards(
-    cards_by_relation: dict[tuple[str, str], dict[str, Any]],
+    cards_by_relation: dict[PrimitiveKey, dict[str, Any]],
     relation_frontier: list[Any],
     candidate_card_cap: int,
 ) -> list[dict[str, Any]]:
     candidates = []
     for relation in relation_frontier:
-        card = cards_by_relation.get((relation.predicate, relation.direction))
+        card = cards_by_relation.get(key_from_relation_candidate(relation))
         if not card:
             continue
         candidates.append(
@@ -321,6 +345,87 @@ def build_candidate_cards(
         if len(candidates) >= candidate_card_cap:
             break
     return candidates
+
+
+def build_coverage_report(
+    cards: list[dict[str, Any]],
+    instances: list[RelationGroundingInstance],
+    card_index: dict[tuple[str, str], dict[PrimitiveKey, dict[str, Any]]],
+) -> dict[str, Any]:
+    loaded_keys = {key_from_card(card) for card in cards}
+    gold_keys = {key_from_instance(instance) for instance in instances}
+    overlapping = loaded_keys & gold_keys
+    first_loaded = sorted(loaded_keys)[:20]
+    first_gold = sorted(gold_keys)[:20]
+    missing_gold = sorted(gold_keys - loaded_keys)[:20]
+    group_counts = {
+        f"{condition}/{variant}": len(cards_by_relation)
+        for (condition, variant), cards_by_relation in sorted(card_index.items())
+    }
+    return {
+        "n_loaded_card_keys": len(loaded_keys),
+        "n_gold_slot_keys": len(gold_keys),
+        "n_overlapping_keys": len(overlapping),
+        "first_20_loaded_card_keys": [key.to_json() for key in first_loaded],
+        "first_20_gold_slot_keys": [key.to_json() for key in first_gold],
+        "first_20_missing_gold_keys": [key.to_json() for key in missing_gold],
+        "first_20_overlapping_keys": [key.to_json() for key in sorted(overlapping)[:20]],
+        "possible_direction_mismatches": possible_direction_mismatches(loaded_keys, gold_keys),
+        "possible_relation_name_normalization_mismatches": possible_relation_normalization_matches(loaded_keys, gold_keys),
+        "possible_text_mismatches": possible_text_mismatches(loaded_keys, gold_keys),
+        "card_group_key_counts": group_counts,
+    }
+
+
+def write_coverage_report(path: Path, coverage: dict[str, Any]) -> None:
+    lines = [
+        "# RC-MEX MVP2 Coverage Report",
+        "",
+        "This report checks whether loaded relation cards cover the gold relation slots before any LLM ranking.",
+        "",
+        "## Summary",
+        "",
+        f"- Loaded card keys: {coverage['n_loaded_card_keys']}",
+        f"- Gold slot keys: {coverage['n_gold_slot_keys']}",
+        f"- Overlapping keys: {coverage['n_overlapping_keys']}",
+        "",
+        "## First 20 Loaded Card Keys",
+        "",
+        *format_key_list(coverage["first_20_loaded_card_keys"]),
+        "",
+        "## First 20 Gold Slot Keys",
+        "",
+        *format_key_list(coverage["first_20_gold_slot_keys"]),
+        "",
+        "## First 20 Missing Gold Keys",
+        "",
+        *format_key_list(coverage["first_20_missing_gold_keys"]),
+        "",
+        "## Possible Direction Mismatches",
+        "",
+        *format_dict_list(coverage["possible_direction_mismatches"]),
+        "",
+        "## Possible Relation-Name Normalization Mismatches",
+        "",
+        *format_dict_list(coverage["possible_relation_name_normalization_mismatches"]),
+        "",
+        "## Possible Text Mismatches",
+        "",
+        *format_dict_list(coverage["possible_text_mismatches"]),
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def format_key_list(rows: list[dict[str, str]]) -> list[str]:
+    if not rows:
+        return ["_None_"]
+    return [f"- `{row['display']}` raw=({row['raw_relation_id']!r}, {row['raw_direction']!r})" for row in rows]
+
+
+def format_dict_list(rows: list[dict[str, str]]) -> list[str]:
+    if not rows:
+        return ["_None_"]
+    return ["- " + ", ".join(f"{key}: `{value}`" for key, value in row.items()) for row in rows]
 
 
 def base_prediction_row(
@@ -521,7 +626,13 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
                 "n_cards": summary["n_cards"],
                 "n_instances": summary["n_instances"],
                 "n_prediction_rows": summary["n_prediction_rows"],
+                "covered_only": summary["covered_only"],
                 "extraction_stats": summary["extraction_stats"],
+                "coverage": {
+                    "n_loaded_card_keys": summary["coverage"]["n_loaded_card_keys"],
+                    "n_gold_slot_keys": summary["coverage"]["n_gold_slot_keys"],
+                    "n_overlapping_keys": summary["coverage"]["n_overlapping_keys"],
+                },
             },
             indent=2,
             sort_keys=True,
@@ -606,6 +717,16 @@ def parse_args() -> argparse.Namespace:
         "--require-gold-card",
         action="store_true",
         help="Evaluate only gold relation slots whose relation+direction exists in the loaded card library.",
+    )
+    parser.add_argument(
+        "--covered-only",
+        action="store_true",
+        help="Alias for --require-gold-card; marks this as a controlled covered-slot MVP2 run.",
+    )
+    parser.add_argument(
+        "--fail-if-zero-coverage",
+        action="store_true",
+        help="Stop before ranking if loaded cards do not overlap any gold slot relation+direction keys.",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

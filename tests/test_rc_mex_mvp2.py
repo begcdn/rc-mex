@@ -7,7 +7,13 @@ from pathlib import Path
 
 from cigr_d_mvp1.io_utils import load_json, write_json
 
-from rc_mex.run_mvp2 import compute_retrieval_metrics, filter_instances_with_gold_cards
+from rc_mex.primitive_key import primitive_key
+from rc_mex.run_mvp2 import (
+    build_coverage_report,
+    compute_retrieval_metrics,
+    filter_instances_with_gold_cards,
+    index_cards,
+)
 from rc_mex.run_mvp2 import main as run_mvp2_main
 from rc_mex.run_mvp1 import main as run_mvp1_main
 from tests.test_rc_mex_mvp1 import rc_mex_kb
@@ -68,11 +74,25 @@ class RCMexMVP2Tests(unittest.TestCase):
         ]
         card_index = {
             ("A", "contrastive_hard"): {
-                ("directed", "forward"): {"relation_id": "directed", "direction": "forward"}
+                primitive_key("Directed", "FORWARD"): {"relation_id": "directed", "direction": "forward"}
             }
         }
         filtered = filter_instances_with_gold_cards(instances, card_index)
         self.assertEqual([instance.instance_id for instance in filtered], ["i1"])
+
+    def test_coverage_report_detects_overlap_and_misses(self):
+        from cigr_d_mvp1.kopl import RelationGroundingInstance
+
+        cards = [{"condition_id": "A", "card_variant": "contrastive_hard", "relation_id": "Directed", "direction": "FORWARD"}]
+        instances = [
+            RelationGroundingInstance("i1", "q", 0, 1, {"nolan"}, "directed", "forward", None),
+            RelationGroundingInstance("i2", "q", 0, 1, {"nolan"}, "spouse", "forward", None),
+        ]
+        coverage = build_coverage_report(cards, instances, index_cards(cards))
+        self.assertEqual(coverage["n_loaded_card_keys"], 1)
+        self.assertEqual(coverage["n_gold_slot_keys"], 2)
+        self.assertEqual(coverage["n_overlapping_keys"], 1)
+        self.assertEqual(coverage["first_20_missing_gold_keys"][0]["display"], "spouse/forward")
 
     def test_runner_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
