@@ -7,7 +7,7 @@ from pathlib import Path
 
 from cigr_d_mvp1.io_utils import load_json, write_json
 
-from rc_mex.run_mvp2 import compute_retrieval_metrics
+from rc_mex.run_mvp2 import compute_retrieval_metrics, filter_instances_with_gold_cards
 from rc_mex.run_mvp2 import main as run_mvp2_main
 from rc_mex.run_mvp1 import main as run_mvp1_main
 from tests.test_rc_mex_mvp1 import rc_mex_kb
@@ -58,6 +58,21 @@ class RCMexMVP2Tests(unittest.TestCase):
         self.assertEqual(metrics["candidate_recall"], 1.0)
         self.assertEqual(metrics["recall_at_1"], 0.5)
         self.assertEqual(metrics["recall_at_3"], 1.0)
+
+    def test_filter_instances_with_gold_cards(self):
+        from cigr_d_mvp1.kopl import RelationGroundingInstance
+
+        instances = [
+            RelationGroundingInstance("i1", "q", 0, 1, {"nolan"}, "directed", "forward", None),
+            RelationGroundingInstance("i2", "q", 0, 1, {"nolan"}, "spouse", "forward", None),
+        ]
+        card_index = {
+            ("A", "contrastive_hard"): {
+                ("directed", "forward"): {"relation_id": "directed", "direction": "forward"}
+            }
+        }
+        filtered = filter_instances_with_gold_cards(instances, card_index)
+        self.assertEqual([instance.instance_id for instance in filtered], ["i1"])
 
     def test_runner_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -127,6 +127,10 @@ def main() -> None:
     log_line(f"Relation steps seen: {extraction_stats['relation_steps_seen']}")
     log_line(f"Instances created: {extraction_stats['instances_created']}")
     log_line(f"Unsupported prefixes: {extraction_stats['unsupported_prefix']}")
+    if args.require_gold_card:
+        before = len(instances)
+        instances = filter_instances_with_gold_cards(instances, card_index)
+        log_line(f"Instances with a gold card in the loaded library: {len(instances)} / {before}")
 
     if args.oracle_backend == "mock":
         ranker: CardRanker = MockCardRanker()
@@ -279,6 +283,19 @@ def index_cards(cards: list[dict[str, Any]]) -> dict[tuple[str, str], dict[tuple
         relation_key = (str(card.get("relation_id", "")), str(card.get("direction", "")))
         index[group][relation_key] = card
     return dict(index)
+
+
+def filter_instances_with_gold_cards(
+    instances: list[RelationGroundingInstance],
+    card_index: dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]],
+) -> list[RelationGroundingInstance]:
+    covered = set()
+    for cards_by_relation in card_index.values():
+        covered.update(cards_by_relation)
+    return [
+        instance for instance in instances
+        if (instance.gold_predicate, instance.gold_direction) in covered
+    ]
 
 
 def build_candidate_cards(
@@ -585,6 +602,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-raw-outputs", action="store_true")
     parser.add_argument("--exclude-metadata-relations", action="store_true")
     parser.add_argument("--metadata-relation-patterns", default=None)
+    parser.add_argument(
+        "--require-gold-card",
+        action="store_true",
+        help="Evaluate only gold relation slots whose relation+direction exists in the loaded card library.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if args.model is None:
