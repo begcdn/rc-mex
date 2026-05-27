@@ -2,6 +2,21 @@
 
 This is the first MVP for **RC-MEX: Relation-Card Marginalized Execution for KGQA**.
 
+## MVP Ladder
+
+- **MVP1:** Relation cards beat relation-name-only baselines and remain useful under hidden or misleading relation labels.
+- **MVP2:** Question slots can retrieve/rank the correct relation card from a local candidate frontier.
+- **MVP3:** Top-k relation-card execution improves recall but adds noise. MVP3 is complete as a diagnostic, not a main contribution.
+- **MVP3.5:** Compare relation-card retrieval/execution against raw relation names, anonymized IDs, and misleading labels.
+
+MVP3 conclusion:
+
+> MVP3 is not the novelty claim. It only verifies that MVP2's top-k relation-card uncertainty contains useful recoverable graph evidence. Future work should use prior KGQA search/pruning ideas rather than re-testing top-k.
+
+The RC-MEX-specific claim remains focused:
+
+> Relation cards provide a more robust semantic interface for KG relations than raw relation names/IDs, especially when schema labels are hidden, noisy, or misleading.
+
 MVP1 tests:
 
 > Contrastive relation cards can induce reusable semantic descriptions of KG primitives from executable examples and hard negatives, remaining useful when relation names are hidden or misleading.
