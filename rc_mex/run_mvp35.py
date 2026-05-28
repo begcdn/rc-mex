@@ -141,6 +141,32 @@ class CardPromptRanker:
         return self.ranker.rank(prompt_payload, candidates)
 
 
+class CardBlueprintRanker:
+    """CoG-style soft-prior reranker using relation cards instead of blueprints."""
+
+    def rank(self, prompt_payload: dict[str, Any], candidates: list[dict[str, Any]]) -> RankingResult:
+        question = str(prompt_payload.get("question", ""))
+        current_types = type_set(prompt_payload.get("current_entities", []))
+        scored = []
+        for candidate in candidates:
+            card = candidate["card"]
+            question_score = char_ngram_similarity(question, card_search_text(card))
+            label_score = char_ngram_similarity(question, str(candidate.get("visible_relation", "")))
+            domain_score = type_overlap_score(current_types, set(card.get("domain_types", []) or []))
+            output_score = output_compatibility_score(candidate)
+            final_score = 0.60 * question_score + 0.15 * label_score + 0.15 * domain_score + 0.10 * output_score
+            scored.append((final_score, candidate["candidate_id"]))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        ranking = [candidate_id for _, candidate_id in scored]
+        return RankingResult(
+            ranked_card_ids=ranking,
+            raw_output=json.dumps({"ranking": ranking, "method": "relation_card_blueprint"}),
+            prompt_tokens=0,
+            completion_tokens=0,
+            latency_seconds=0.0,
+        )
+
+
 def main() -> None:
     args = parse_args()
     output_dir = ensure_dir(args.output)
@@ -192,6 +218,7 @@ def main() -> None:
         )
         label_ranker = LabelRanker(client)
         card_ranker = CardPromptRanker(client)
+    card_blueprint_ranker = CardBlueprintRanker()
 
     log_stage(5, 6, "Ranking names vs relation cards")
     rows: list[dict[str, Any]] = []
@@ -220,7 +247,11 @@ def main() -> None:
                     args.entity_sample_size,
                 ),
             }
-            for method, ranker in [("relation_label", label_ranker), ("relation_card", card_ranker)]:
+            for method, ranker in [
+                ("relation_label", label_ranker),
+                ("relation_card", card_ranker),
+                ("relation_card_blueprint", card_blueprint_ranker),
+            ]:
                 result = ranker.rank(prompt_payload, candidates)
                 row = evaluate_ranked_candidates(
                     graph=graph,
@@ -301,6 +332,26 @@ def build_label_prompt(payload: dict[str, Any], candidates: list[dict[str, Any]]
         f"Candidate relation labels:\n{candidate_text}\n\n"
         "Rank every candidate ID from best to worst."
     )
+
+
+def type_set(current_entities: list[dict[str, Any]]) -> set[str]:
+    out = set()
+    for entity in current_entities:
+        for type_name in entity.get("types", []) or []:
+            out.add(str(type_name).casefold())
+    return out
+
+
+def type_overlap_score(left: set[str], right: set[str]) -> float:
+    right = {str(value).casefold() for value in right if value}
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def output_compatibility_score(candidate: dict[str, Any]) -> float:
+    frequency = float(candidate.get("frontier_frequency", 0) or 0)
+    return min(1.0, frequency / 5.0)
 
 
 def evaluate_ranked_candidates(

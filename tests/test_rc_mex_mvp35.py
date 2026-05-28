@@ -85,6 +85,7 @@ class RCMexMVP35Tests(unittest.TestCase):
             self.assertGreater(metrics["n_rows"], 0)
             self.assertIn("A/contrastive_hard/relation_label", metrics["metrics"])
             self.assertIn("A/contrastive_hard/relation_card", metrics["metrics"])
+            self.assertIn("A/contrastive_hard/relation_card_blueprint", metrics["metrics"])
             self.assertIn("robustness_drop", metrics["metrics"])
 
 

@@ -26,5 +26,29 @@ The RC-MEX-specific contribution remains the semantic interface:
 - **MVP1:** Relation cards beat relation-name-only baselines and remain useful under hidden or misleading relation labels.
 - **MVP2:** Question slots can retrieve/rank the correct relation card from a local candidate frontier.
 - **MVP3:** Top-k relation-card execution improves recall but adds noise. This validates that relation-card uncertainty contains recoverable graph evidence, but naive top-k union is not the final answer method.
-- **MVP3.5:** The next experiment should compare relation-card retrieval/execution against raw relation names, anonymized IDs, and misleading labels under the same controlled slot setup.
+- **MVP3.5:** The next experiment compares relation-card retrieval/execution against raw relation names, anonymized IDs, and misleading labels under the same controlled slot setup.
 
+## CoG-Style RC-MEX Adaptation
+
+The codebase includes an MVP3.5 method called `relation_card_blueprint`. Despite the name, it does not use CoG blueprints. It borrows CoG's role for blueprints: a cheap soft-prior reranker before heavier reasoning.
+
+CoG-style blueprint scoring:
+
+```text
+candidate relation label
+  scored by question similarity
+  plus predicted blueprint relation similarity
+  plus global blueprint similarity
+```
+
+RC-MEX adaptation:
+
+```text
+candidate relation card
+  scored by question/card semantic similarity
+  plus visible label similarity
+  plus current entity type compatibility
+  plus local output-frequency compatibility
+```
+
+This tests the actual RC-MEX question: whether reusable relation cards are a better schema-grounding prior than raw relation labels or arbitrary IDs.
