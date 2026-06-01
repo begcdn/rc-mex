@@ -118,6 +118,17 @@ def select_examples(
 
 def parse_simple_two_hop(graph: KnowledgeGraph, sample: dict[str, Any], program_index: int) -> SmokeExample:
     program = sample.get("program", []) or []
+    try:
+        return parse_legacy_exact_two_relate(graph, sample, program_index)
+    except ValueError as legacy_error:
+        try:
+            return parse_linear_two_relate_entity_answer(graph, sample, program_index)
+        except ValueError:
+            raise legacy_error
+
+
+def parse_legacy_exact_two_relate(graph: KnowledgeGraph, sample: dict[str, Any], program_index: int) -> SmokeExample:
+    program = sample.get("program", []) or []
     if len(program) != 3:
         raise ValueError("unsupported_program")
     find_step, first_relate, second_relate = program
@@ -150,6 +161,102 @@ def parse_simple_two_hop(graph: KnowledgeGraph, sample: dict[str, Any], program_
         gold_answer_ids=gold_state,
         gold_answer_labels=entity_labels(graph, gold_state),
     )
+
+
+def parse_linear_two_relate_entity_answer(graph: KnowledgeGraph, sample: dict[str, Any], program_index: int) -> SmokeExample:
+    """Accept real KQA Pro simple chains with type filters.
+
+    KQA Pro validation has no literal three-step Find->Relate->Relate programs.
+    The simple entity-answer chains usually look like:
+
+      Find -> Relate -> FilterConcept -> Relate -> FilterConcept -> What
+
+    This parser uses the gold program only to select that controlled subset, find
+    the topic entity, compute the final gold answer, and infer hop budget=2.
+    Search still never sees the gold relation IDs or intermediate prefixes.
+    """
+    program = sample.get("program", []) or []
+    if not program or program[-1].get("function") != "What":
+        raise ValueError("unsupported_program")
+    chain_indices = dependency_chain_to_root(program, len(program) - 1)
+    chain = [program[index] for index in chain_indices]
+    functions = [step.get("function") for step in chain]
+    if not functions or functions[0] != "Find":
+        raise ValueError("unsupported_program")
+    allowed = {"Find", "Relate", "FilterConcept", "What"}
+    if any(function not in allowed for function in functions):
+        raise ValueError("unsupported_program")
+    if functions.count("Relate") != 2:
+        raise ValueError("unsupported_program")
+    if functions[-1] != "What":
+        raise ValueError("unsupported_program")
+
+    find_inputs = chain[0].get("inputs", []) or []
+    if not find_inputs:
+        raise ValueError("unsupported_program")
+    start_ids = graph.find_entities(str(find_inputs[0]))
+    if not start_ids:
+        raise ValueError("empty_start_entity")
+
+    gold_state = execute_linear_gold_chain(graph, start_ids, chain[1:])
+    if not gold_state:
+        raise ValueError("empty_gold_execution")
+    return SmokeExample(
+        question_id=str(sample.get("id") or sample.get("qid") or sample.get("ID") or f"val:{program_index}"),
+        question=str(sample.get("question", "")),
+        program_index=program_index,
+        start_entity_ids=start_ids,
+        start_entity_name=str(find_inputs[0]),
+        gold_answer_ids=gold_state,
+        gold_answer_labels=entity_labels(graph, gold_state),
+    )
+
+
+def dependency_chain_to_root(program: list[dict[str, Any]], final_index: int) -> list[int]:
+    out = []
+    seen = set()
+    index = final_index
+    while True:
+        if index in seen or index < 0 or index >= len(program):
+            raise ValueError("unsupported_program")
+        seen.add(index)
+        out.append(index)
+        dependencies = program[index].get("dependencies", []) or []
+        if not dependencies:
+            break
+        if len(dependencies) != 1:
+            raise ValueError("unsupported_program")
+        index = int(dependencies[0])
+    return list(reversed(out))
+
+
+def execute_linear_gold_chain(
+    graph: KnowledgeGraph,
+    start_ids: set[str],
+    chain: list[dict[str, Any]],
+) -> set[str]:
+    state = set(start_ids)
+    for step in chain:
+        function = step.get("function")
+        inputs = step.get("inputs", []) or []
+        if function == "Relate":
+            if len(inputs) < 2:
+                raise ValueError("unsupported_program")
+            state, _ = graph.follow(state, str(inputs[0]), str(inputs[1]), max_proofs=10000)
+        elif function == "FilterConcept":
+            if not inputs:
+                raise ValueError("unsupported_program")
+            concept_ids = graph.find_concepts(str(inputs[0]))
+            if not concept_ids:
+                raise ValueError("unsupported_program")
+            state = {entity_id for entity_id in state if graph.is_instance_of_any(entity_id, concept_ids)}
+        elif function == "What":
+            continue
+        else:
+            raise ValueError("unsupported_program")
+        if not state:
+            return set()
+    return state
 
 
 def run_baseline_path_beam(

@@ -53,6 +53,23 @@ def smoke_questions():
     ]
 
 
+def real_kqa_style_questions():
+    return [
+        {
+            "id": "q2",
+            "question": "tell me the genre of the film directed by Christopher Nolan.",
+            "program": [
+                {"function": "Find", "dependencies": [], "inputs": ["Christopher Nolan"]},
+                {"function": "Relate", "dependencies": [0], "inputs": ["directed", "forward"]},
+                {"function": "FilterConcept", "dependencies": [1], "inputs": ["film"]},
+                {"function": "Relate", "dependencies": [2], "inputs": ["genre", "forward"]},
+                {"function": "FilterConcept", "dependencies": [3], "inputs": ["genre"]},
+                {"function": "What", "dependencies": [4], "inputs": []},
+            ],
+        }
+    ]
+
+
 class ProofStateSearchSmokeTests(unittest.TestCase):
     def test_smoke_runner_writes_requested_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +125,46 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             self.assertIn("Proof-State Search Smoke Test", report)
             self.assertIn("Proof-State Wins", report)
             self.assertIn("Both Fail", report)
+
+    def test_runner_selects_real_kqa_style_two_relate_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kb_path = root / "kb.json"
+            questions_path = root / "val.json"
+            output = root / "proof_state_search_smoke"
+            write_json(kb_path, smoke_kb())
+            write_json(questions_path, real_kqa_style_questions())
+
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "run_proof_state_search_smoke",
+                    "--kb",
+                    str(kb_path),
+                    "--questions",
+                    str(questions_path),
+                    "--output",
+                    str(output),
+                    "--max-examples",
+                    "1",
+                    "--top-k",
+                    "2",
+                    "--beam-width",
+                    "2",
+                ]
+                run_smoke_main()
+            finally:
+                sys.argv = old_argv
+
+            metrics = load_json(output / "metrics.json")
+            self.assertEqual(metrics["metrics"]["number_of_selected_questions"], 1)
+            rows = [
+                json.loads(line)
+                for line in (output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(rows[0]["question_id"], "q2")
+            self.assertEqual(rows[0]["gold_answers"], ["science fiction"])
 
 
 if __name__ == "__main__":
