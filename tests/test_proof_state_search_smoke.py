@@ -96,6 +96,9 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
                     "2",
                     "--beam-width",
                     "2",
+                    "--debug-trace",
+                    "--debug-limit",
+                    "1",
                 ]
                 run_smoke_main()
             finally:
@@ -104,6 +107,8 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             self.assertTrue((output / "predictions.jsonl").exists())
             self.assertTrue((output / "metrics.json").exists())
             self.assertTrue((output / "report.md").exists())
+            self.assertTrue((output / "debug_trace.md").exists())
+            self.assertTrue((output / "debug_trace.jsonl").exists())
 
             metrics = load_json(output / "metrics.json")
             self.assertEqual(metrics["metrics"]["number_of_selected_questions"], 1)
@@ -125,6 +130,10 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             self.assertIn("Proof-State Search Smoke Test", report)
             self.assertIn("Proof-State Wins", report)
             self.assertIn("Both Fail", report)
+            trace = (output / "debug_trace.md").read_text(encoding="utf-8")
+            self.assertIn("Baseline Hop Trace", trace)
+            self.assertIn("Proof-State Hop Trace", trace)
+            self.assertIn("Why Proof-State Chose This Over Baseline", trace)
 
     def test_runner_selects_real_kqa_style_two_relate_chain(self):
         with tempfile.TemporaryDirectory() as tmp:

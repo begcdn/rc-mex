@@ -60,6 +60,7 @@ def main() -> None:
             relation_cap=args.relation_cap,
             sample_entities=args.sample_entities,
             max_branch_entities=args.max_branch_entities,
+            debug_trace=args.debug_trace,
         )
         proof_state = run_soft_proof_state_beam(
             graph=graph,
@@ -70,6 +71,7 @@ def main() -> None:
             sample_entities=args.sample_entities,
             max_branch_entities=args.max_branch_entities,
             noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
         )
         row = build_prediction_row(graph, example, baseline, proof_state)
         print_runtime_log(row, index, len(examples))
@@ -89,6 +91,12 @@ def main() -> None:
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
+    if args.debug_trace:
+        trace_rows = select_trace_rows(rows, args.debug_limit)
+        write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
+        (output_dir / "debug_trace.md").write_text(write_debug_trace_markdown(trace_rows), encoding="utf-8")
+        log_line("debug_trace.jsonl")
+        log_line("debug_trace.md")
     print(f"Wrote proof-state search smoke outputs to {output_dir}")
 
 
@@ -267,6 +275,7 @@ def run_baseline_path_beam(
     relation_cap: int,
     sample_entities: int,
     max_branch_entities: int,
+    debug_trace: bool = False,
 ) -> dict[str, Any]:
     states = [
         SearchState(
@@ -278,6 +287,7 @@ def run_baseline_path_beam(
         for entity_id in sorted(example.start_entity_ids)
     ]
     expansion_count = 0
+    trace: list[dict[str, Any]] = []
     for hop in [1, 2]:
         next_states: list[SearchState] = []
         for state in states:
@@ -296,12 +306,33 @@ def run_baseline_path_beam(
                             evidence=state.evidence + [step],
                             relation_sequences=[(state.relation_sequences[0] if state.relation_sequences else []) + [candidate["relation_id"]]],
                             entity_sequences=[(state.entity_sequences[0] if state.entity_sequences else [graph.entity_name(source_id)]) + [graph.entity_name(target_id)]],
-                            soft_signals={"label_score": candidate["label_score"]},
+                            soft_signals={
+                                "lexical_similarity": candidate["lexical_similarity"],
+                                "frequency_bonus": candidate["frequency_bonus"],
+                                "label_score": candidate["label_score"],
+                            },
                         )
                     )
         next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": [
+                        summarize_baseline_state(state, rank)
+                        for rank, state in enumerate(next_states[:5], start=1)
+                    ],
+                }
+            )
         states = next_states[:beam_width]
-    return search_result(graph, states, example.gold_answer_ids, expansion_count, mode="baseline_path_beam")
+    return search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="baseline_path_beam",
+        debug_trace=trace,
+    )
 
 
 def run_soft_proof_state_beam(
@@ -313,6 +344,7 @@ def run_soft_proof_state_beam(
     sample_entities: int,
     max_branch_entities: int,
     noisy_branch_threshold: int,
+    debug_trace: bool = False,
 ) -> dict[str, Any]:
     answer_type = guess_answer_type(example.question)
     states = [
@@ -325,6 +357,7 @@ def run_soft_proof_state_beam(
         )
     ]
     expansion_count = 0
+    trace: list[dict[str, Any]] = []
     for hop in [1, 2]:
         next_states: list[SearchState] = []
         for state in states:
@@ -371,22 +404,41 @@ def run_soft_proof_state_beam(
                     )
                 )
         next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": [
+                        summarize_proof_state(state, rank)
+                        for rank, state in enumerate(next_states[:5], start=1)
+                    ],
+                }
+            )
         states = next_states[:beam_width]
-    return search_result(graph, states, example.gold_answer_ids, expansion_count, mode="soft_proof_state_beam")
+    return search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="soft_proof_state_beam",
+        debug_trace=trace,
+    )
 
 
 def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
     ranked = []
     for relation in frontier:
         label = f"{relation.predicate.replace('_', ' ')} {relation.direction}"
-        label_score = char_ngram_similarity(question, label)
+        lexical_similarity = char_ngram_similarity(question, label)
         frequency_bonus = 0.03 * min(1.0, float(relation.frequency) / 5.0)
         ranked.append(
             {
                 "relation_id": relation.predicate,
                 "direction": relation.direction,
                 "frequency": relation.frequency,
-                "label_score": label_score + frequency_bonus,
+                "lexical_similarity": lexical_similarity,
+                "frequency_bonus": frequency_bonus,
+                "label_score": lexical_similarity + frequency_bonus,
             }
         )
     ranked.sort(key=lambda item: (-item["label_score"], item["relation_id"], item["direction"]))
@@ -424,6 +476,8 @@ def evidence_step(
         "to_entity": graph.entity_name(target_id),
         "to_types": graph.entity_type_names(target_id),
         "relation_label_score": candidate["label_score"],
+        "lexical_similarity": candidate.get("lexical_similarity", candidate["label_score"]),
+        "frequency_bonus": candidate.get("frequency_bonus", 0.0),
         "branch_size": branch_size,
         "readable": f"{graph.entity_name(source_id)} --{candidate['relation_id']}[{candidate['direction']}]--> {graph.entity_name(target_id)}",
     }
@@ -564,6 +618,7 @@ def search_result(
     gold_answer_ids: set[str],
     expansion_count: int,
     mode: str,
+    debug_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     grouped: dict[str, dict[str, Any]] = {}
     for state in states:
@@ -616,6 +671,42 @@ def search_result(
         "final_result_size": len(predicted),
         "candidate_count": len(candidates),
         "expansion_count": expansion_count,
+        "debug_trace": debug_trace or [],
+    }
+
+
+def summarize_baseline_state(state: SearchState, rank: int) -> dict[str, Any]:
+    last_step = state.evidence[-1] if state.evidence else {}
+    return {
+        "rank": rank,
+        "hop": last_step.get("hop"),
+        "candidate_path": " | ".join(step["readable"] for step in state.evidence),
+        "relation_chosen": last_step.get("relation_id", ""),
+        "direction": last_step.get("direction", ""),
+        "lexical_similarity": last_step.get("lexical_similarity", 0.0),
+        "frequency_bonus": last_step.get("frequency_bonus", 0.0),
+        "final_baseline_score": state.score,
+        "target_entity": next(iter(state.frontier_ids), ""),
+        "target_label": last_step.get("to_entity", ""),
+    }
+
+
+def summarize_proof_state(state: SearchState, rank: int) -> dict[str, Any]:
+    return {
+        "rank": rank,
+        "hop": state.evidence[-1].get("hop") if state.evidence else None,
+        "candidate_evidence_state": " | ".join(step["readable"] for step in state.evidence),
+        "fragments": [step["readable"] for step in state.evidence],
+        "best_label_similarity": state.soft_signals.get("best_label_similarity", 0.0),
+        "avg_label_similarity": state.soft_signals.get("avg_label_similarity", 0.0),
+        "convergence_bonus": state.soft_signals.get("convergence_bonus", 0.0),
+        "type_compatibility": state.soft_signals.get("type_compatibility", 0.0),
+        "plausible_progress": state.soft_signals.get("plausible_progress", 0.0),
+        "uncertainty_floor": state.soft_signals.get("uncertainty_floor", 0.0),
+        "noisy_branch_penalty": state.soft_signals.get("noisy_branch_penalty", 0.0),
+        "redundancy_penalty": state.soft_signals.get("redundancy_penalty", 0.0),
+        "final_proof_state_score": state.score,
+        "target_entity": next(iter(state.frontier_ids), ""),
     }
 
 
@@ -714,6 +805,191 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         *debug_section_rows(select_debug_rows(rows, "both_fail"), limit=5),
     ]
     return "\n".join(lines)
+
+
+def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for kind in ["proof", "baseline", "both_fail"]:
+        for row in select_debug_rows(rows, kind):
+            key = str(row["question_id"])
+            if key not in seen:
+                selected.append(row)
+                seen.add(key)
+            if len(selected) >= debug_limit:
+                return selected
+    for row in rows:
+        key = str(row["question_id"])
+        if key not in seen:
+            selected.append(row)
+            seen.add(key)
+        if len(selected) >= debug_limit:
+            break
+    return selected
+
+
+def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "question_id": row["question_id"],
+        "program_index": row["program_index"],
+        "question": row["question"],
+        "gold_answers": row["gold_answers"],
+        "start_entity": row["start_entity"],
+        "failure_type": row["failure_type"],
+        "baseline_correct": row["baseline_path_beam"]["hits_at_1"],
+        "proof_state_correct": row["soft_proof_state_beam"]["hits_at_1"],
+        "baseline_top_answer": row["baseline_path_beam"]["top_answer"],
+        "proof_state_top_answer": row["soft_proof_state_beam"]["top_answer"],
+        "baseline_debug_trace": row["baseline_path_beam"].get("debug_trace", []),
+        "proof_state_debug_trace": row["soft_proof_state_beam"].get("debug_trace", []),
+        "explanation": proof_state_choice_explanation(row),
+    }
+
+
+def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Proof-State Search Debug Trace",
+        "",
+        "This file explains why the current heuristic baseline and proof-state searches chose their top path/state.",
+        "",
+        "No search logic, scores, prompts, LLMs, or relation cards are changed by this debug mode.",
+        "",
+    ]
+    for row in rows:
+        baseline = row["baseline_path_beam"]
+        proof = row["soft_proof_state_beam"]
+        baseline_top = baseline["top_answer"] or {}
+        proof_top = proof["top_answer"] or {}
+        lines.extend(
+            [
+                f"## {row['question_id']}",
+                "",
+                f"Question: {row['question']}",
+                "",
+                f"Gold answer: `{', '.join(row['gold_answers'])}`",
+                "",
+                f"Baseline top final path: {top_path_readable(baseline_top)}",
+                "",
+                f"Proof-state top final state: {top_path_readable(proof_top)}",
+                "",
+                f"Baseline correct: `{baseline['hits_at_1']}`",
+                f"Proof-state correct: `{proof['hits_at_1']}`",
+                "",
+                "### Baseline Hop Trace",
+                "",
+                *baseline_trace_lines(baseline.get("debug_trace", [])),
+                "### Proof-State Hop Trace",
+                "",
+                *proof_trace_lines(proof.get("debug_trace", [])),
+                "### Why Proof-State Chose This Over Baseline",
+                "",
+                *proof_state_choice_explanation(row),
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def baseline_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
+    if not trace:
+        return ["_No baseline trace captured._", ""]
+    lines: list[str] = []
+    for hop in trace:
+        lines.append(f"#### Hop {hop['hop']}")
+        lines.append("")
+        lines.append("| Rank | Candidate path | Relation | Lexical similarity | Frequency bonus | Final baseline score |")
+        lines.append("|---:|---|---|---:|---:|---:|")
+        for state in hop.get("top_candidate_states", []):
+            lines.append(
+                "| {rank} | {path} | `{relation}` `{direction}` | {lex:.4f} | {freq:.4f} | {score:.4f} |".format(
+                    rank=state["rank"],
+                    path=escape_md(state.get("candidate_path", "")),
+                    relation=escape_md(state.get("relation_chosen", "")),
+                    direction=escape_md(state.get("direction", "")),
+                    lex=float(state.get("lexical_similarity", 0.0)),
+                    freq=float(state.get("frequency_bonus", 0.0)),
+                    score=float(state.get("final_baseline_score", 0.0)),
+                )
+            )
+        lines.append("")
+    return lines
+
+
+def proof_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
+    if not trace:
+        return ["_No proof-state trace captured._", ""]
+    lines: list[str] = []
+    for hop in trace:
+        lines.append(f"#### Hop {hop['hop']}")
+        lines.append("")
+        lines.append(
+            "| Rank | Candidate evidence state | Best label | Avg label | Convergence | Type | Progress | Uncertain | Noisy | Redundant | Final score |"
+        )
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for state in hop.get("top_candidate_states", []):
+            lines.append(
+                "| {rank} | {path} | {best:.4f} | {avg:.4f} | {conv:.4f} | {typ:.4f} | {prog:.4f} | {unc:.4f} | {noisy:.4f} | {red:.4f} | {score:.4f} |".format(
+                    rank=state["rank"],
+                    path=escape_md(state.get("candidate_evidence_state", "")),
+                    best=float(state.get("best_label_similarity", 0.0)),
+                    avg=float(state.get("avg_label_similarity", 0.0)),
+                    conv=float(state.get("convergence_bonus", 0.0)),
+                    typ=float(state.get("type_compatibility", 0.0)),
+                    prog=float(state.get("plausible_progress", 0.0)),
+                    unc=float(state.get("uncertainty_floor", 0.0)),
+                    noisy=float(state.get("noisy_branch_penalty", 0.0)),
+                    red=float(state.get("redundancy_penalty", 0.0)),
+                    score=float(state.get("final_proof_state_score", 0.0)),
+                )
+            )
+        lines.append("")
+    return lines
+
+
+def proof_state_choice_explanation(row: dict[str, Any]) -> list[str]:
+    proof_top = row["soft_proof_state_beam"].get("top_answer") or {}
+    paths = proof_top.get("paths", []) if proof_top else []
+    signals = paths[0].get("soft_signals", {}) if paths else {}
+    positive_components = {
+        key: float(signals.get(key, 0.0))
+        for key in [
+            "best_label_similarity",
+            "avg_label_similarity",
+            "convergence_bonus",
+            "type_compatibility",
+            "plausible_progress",
+            "uncertainty_floor",
+        ]
+    }
+    negative_components = {
+        key: float(signals.get(key, 0.0))
+        for key in ["noisy_branch_penalty", "redundancy_penalty"]
+    }
+    strongest = max(positive_components.items(), key=lambda item: item[1], default=("", 0.0))
+    lines = [
+        f"- Strongest positive component: `{strongest[0] or 'none'}` = `{strongest[1]:.4f}`",
+        f"- Avoided noisy branch: `{negative_components.get('noisy_branch_penalty', 0.0) >= 0.0}` "
+        f"(noisy penalty `{negative_components.get('noisy_branch_penalty', 0.0):.4f}`)",
+        f"- Convergence helped: `{positive_components.get('convergence_bonus', 0.0) > 0.0}` "
+        f"(bonus `{positive_components.get('convergence_bonus', 0.0):.4f}`)",
+        f"- Type compatibility helped: `{positive_components.get('type_compatibility', 0.0) > 0.0}` "
+        f"(score `{positive_components.get('type_compatibility', 0.0):.4f}`)",
+        f"- Redundancy penalty applied: `{negative_components.get('redundancy_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('redundancy_penalty', 0.0):.4f}`)",
+    ]
+    if row["soft_proof_state_beam"]["hits_at_1"] and not row["baseline_path_beam"]["hits_at_1"]:
+        lines.append("- Outcome: proof-state beat baseline on this question.")
+    elif row["baseline_path_beam"]["hits_at_1"] and not row["soft_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: baseline beat proof-state on this question.")
+    elif row["baseline_path_beam"]["hits_at_1"] and row["soft_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: both methods were correct.")
+    else:
+        lines.append("- Outcome: both methods failed.")
+    return lines
+
+
+def escape_md(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
@@ -874,6 +1150,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-entities", type=int, default=25)
     parser.add_argument("--max-branch-entities", type=int, default=40)
     parser.add_argument("--noisy-branch-threshold", type=int, default=25)
+    parser.add_argument("--debug-trace", action="store_true", help="Write debug_trace.md/jsonl with top hop states and score components.")
+    parser.add_argument("--debug-limit", type=int, default=10, help="Maximum number of questions to include in debug trace outputs.")
     return parser.parse_args()
 
 
