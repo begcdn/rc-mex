@@ -17,6 +17,20 @@ STOPWORDS = {
     "which", "who", "whose", "with", "tell", "me", "give", "show", "list", "does", "did",
 }
 
+FUTURE_AWARE_V2_CONSTANTS = {
+    "future_cap": 0.25,
+    "first_hop_relation_family_limit": 1,
+    "current_relevance_weight": 0.55,
+    "gated_future_weight": 1.0,
+    "type_compatibility_weight": 0.16,
+    "strong_loop_penalty": -0.45,
+    "start_entity_return_penalty": -0.45,
+    "surface_convergence_penalty": -0.25,
+    "drift_penalty": -0.30,
+    "redundancy_penalty": -0.18,
+    "noisy_branch_penalty": -0.30,
+}
+
 
 @dataclass
 class SmokeExample:
@@ -55,7 +69,7 @@ def main() -> None:
     log_line(f"Skipped unsupported: {selection_stats.get('unsupported_program', 0)}")
     log_line(f"Skipped empty gold execution: {selection_stats.get('empty_gold_execution', 0)}")
 
-    log_stage(3, 4, "Running baseline, soft proof-state, and future-aware proof-state beams")
+    log_stage(3, 4, "Running baseline, soft proof-state, future-aware, and future-aware v2 beams")
     rows = []
     for index, example in enumerate(examples, start=1):
         baseline = run_baseline_path_beam(
@@ -90,7 +104,18 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, future_aware)
+        future_aware_v2 = run_future_aware_v2_proof_state_beam(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
+        row = build_prediction_row(graph, example, baseline, proof_state, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -99,6 +124,9 @@ def main() -> None:
     summary = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "args": vars(args),
+        "scorer_constants": {
+            "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
+        },
         "selection_stats": selection_stats,
         "metrics": metrics,
     }
@@ -539,6 +567,112 @@ def run_future_aware_proof_state_beam(
     )
 
 
+def run_future_aware_v2_proof_state_beam(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    answer_type = guess_answer_type(example.question)
+    states = [
+        SearchState(
+            frontier_ids=set(example.start_entity_ids),
+            score=0.0,
+            entity_sequences=[[graph.entity_name(entity_id)] for entity_id in sorted(example.start_entity_ids)],
+            relation_sequences=[[]],
+            soft_signals={"answer_type_known": 1.0 if answer_type else 0.0},
+        )
+    ]
+    expansion_count = 0
+    trace: list[dict[str, Any]] = []
+    for hop in [1, 2]:
+        next_states: list[SearchState] = []
+        for state in states:
+            expansion_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for source_id in sorted(state.frontier_ids):
+                frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
+                ranked = rank_relations(example.question, frontier)
+                for candidate in ranked[:top_k]:
+                    targets = relation_targets(graph, source_id, candidate, max_branch_entities)
+                    expansion_count += 1
+                    for target_id in targets:
+                        expansion_groups[target_id].append(
+                            {
+                                "source_id": source_id,
+                                "candidate": candidate,
+                                "branch_size": len(targets),
+                            }
+                        )
+            for target_id, fragments in expansion_groups.items():
+                steps = [
+                    evidence_step(graph, fragment["source_id"], fragment["candidate"], target_id, hop, fragment["branch_size"])
+                    for fragment in fragments
+                ]
+                signals = future_aware_v2_fragment_signals(
+                    graph=graph,
+                    question=example.question,
+                    answer_type=answer_type,
+                    state=state,
+                    target_id=target_id,
+                    steps=steps,
+                    hop=hop,
+                    relation_cap=relation_cap,
+                    sample_entities=sample_entities,
+                    noisy_branch_threshold=noisy_branch_threshold,
+                    start_entity_ids=example.start_entity_ids,
+                )
+                relation_sequences = extend_relation_sequences(state.relation_sequences, steps)
+                entity_sequences = extend_entity_sequences(graph, state.entity_sequences, steps)
+                next_states.append(
+                    SearchState(
+                        frontier_ids={target_id},
+                        score=state.score + signals["total_delta"],
+                        evidence=state.evidence + steps,
+                        relation_sequences=relation_sequences,
+                        entity_sequences=entity_sequences,
+                        soft_signals=merge_signal_dicts(state.soft_signals, signals),
+                    )
+                )
+        next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        if hop == 1:
+            selected_states = diversify_first_hop_states(
+                next_states,
+                beam_width=beam_width,
+                family_limit=int(FUTURE_AWARE_V2_CONSTANTS["first_hop_relation_family_limit"]),
+            )
+        else:
+            selected_states = next_states[:beam_width]
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": [
+                        summarize_future_aware_v2_state(state, rank)
+                        for rank, state in enumerate(next_states[:5], start=1)
+                    ],
+                    "selected_states": [
+                        summarize_future_aware_v2_state(state, rank)
+                        for rank, state in enumerate(selected_states[:5], start=1)
+                    ],
+                    "constants": FUTURE_AWARE_V2_CONSTANTS,
+                }
+            )
+        states = selected_states
+    return search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="future_aware_v2_proof_state_beam",
+        debug_trace=trace,
+    )
+
+
 def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
     ranked = []
     for relation in frontier:
@@ -717,6 +851,105 @@ def future_aware_fragment_signals(
     }
 
 
+def future_aware_v2_fragment_signals(
+    graph: KnowledgeGraph,
+    question: str,
+    answer_type: str,
+    state: SearchState,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    hop: int,
+    relation_cap: int,
+    sample_entities: int,
+    noisy_branch_threshold: int,
+    start_entity_ids: set[str],
+) -> dict[str, float]:
+    relation_text = " ".join(step["relation_id"].replace("_", " ") for step in state.evidence + steps)
+    remaining_terms = remaining_question_terms(question, relation_text)
+    current_relevance = max((float(step["relation_label_score"]) for step in steps), default=0.0)
+    raw_future = future_satisfiability(
+        graph=graph,
+        question=question,
+        remaining_terms=remaining_terms,
+        entity_id=target_id,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+    )
+    future_capped = min(raw_future, float(FUTURE_AWARE_V2_CONSTANTS["future_cap"]))
+    loop_penalty = strong_loop_penalty(state, steps, target_id, start_entity_ids, hop)
+    drift = stronger_drift_penalty(
+        graph=graph,
+        question=question,
+        answer_type=answer_type,
+        target_id=target_id,
+        steps=steps,
+        remaining_terms=remaining_terms,
+        future_satisfiability_score=raw_future,
+        hop=hop,
+    )
+    role_gate = role_semantic_gate(
+        graph=graph,
+        question=question,
+        answer_type=answer_type,
+        target_id=target_id,
+        remaining_terms=remaining_terms,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+    )
+    non_drift_gate = 0.35 if drift < 0.0 else 1.0
+    non_loop_gate = 0.20 if loop_penalty < 0.0 else 1.0
+    gated_future = future_capped * role_gate * non_drift_gate * non_loop_gate
+    type_score = type_compatibility(graph, target_id, answer_type) if hop == 2 else 0.0
+    progress = plausible_progress(question, graph, target_id, steps, hop)
+    useful_convergence = useful_convergence_bonus_v2(
+        graph=graph,
+        target_id=target_id,
+        steps=steps,
+        future_satisfiability_score=gated_future,
+        type_score=type_score,
+    )
+    surface_penalty = surface_convergence_penalty_v2(
+        state=state,
+        steps=steps,
+        useful_convergence=useful_convergence,
+        gated_future_bonus=gated_future,
+    )
+    redundancy = float(FUTURE_AWARE_V2_CONSTANTS["redundancy_penalty"]) if repeats_relation_pattern(state, steps) else 0.0
+    branch_size = max((int(step["branch_size"]) for step in steps), default=1)
+    noisy_penalty = float(FUTURE_AWARE_V2_CONSTANTS["noisy_branch_penalty"]) if branch_size >= noisy_branch_threshold else 0.0
+    total = (
+        float(FUTURE_AWARE_V2_CONSTANTS["current_relevance_weight"]) * current_relevance
+        + float(FUTURE_AWARE_V2_CONSTANTS["gated_future_weight"]) * gated_future
+        + useful_convergence
+        + float(FUTURE_AWARE_V2_CONSTANTS["type_compatibility_weight"]) * type_score
+        + progress
+        + surface_penalty
+        + loop_penalty
+        + drift
+        + redundancy
+        + noisy_penalty
+    )
+    return {
+        "current_relevance": current_relevance,
+        "raw_future_bonus": raw_future,
+        "future_bonus_capped": future_capped,
+        "role_gate": role_gate,
+        "non_drift_gate": non_drift_gate,
+        "non_loop_gate": non_loop_gate,
+        "gated_future_bonus": gated_future,
+        "useful_convergence": useful_convergence,
+        "type_compatibility": type_score,
+        "progress": progress,
+        "surface_convergence_penalty": surface_penalty,
+        "loop_penalty": loop_penalty,
+        "drift_penalty": drift,
+        "redundancy_penalty": redundancy,
+        "noisy_branch_penalty": noisy_penalty,
+        "remaining_terms_count": float(len(remaining_terms)),
+        "total_delta": total,
+    }
+
+
 def future_satisfiability(
     graph: KnowledgeGraph,
     question: str,
@@ -811,6 +1044,229 @@ def has_inverse_loop(state: SearchState, steps: list[dict[str, Any]]) -> bool:
         if reverse in previous_edges:
             return True
     return False
+
+
+def strong_loop_penalty(
+    state: SearchState,
+    steps: list[dict[str, Any]],
+    target_id: str,
+    start_entity_ids: set[str],
+    hop: int,
+) -> float:
+    penalty = 0.0
+    if has_inverse_loop(state, steps) or has_repeated_entity_cycle(state.evidence + steps):
+        penalty += float(FUTURE_AWARE_V2_CONSTANTS["strong_loop_penalty"])
+    if hop == 2 and target_id in start_entity_ids:
+        penalty += float(FUTURE_AWARE_V2_CONSTANTS["start_entity_return_penalty"])
+    if same_relation_out_and_back(state.evidence + steps):
+        penalty += float(FUTURE_AWARE_V2_CONSTANTS["strong_loop_penalty"])
+    return penalty
+
+
+def has_repeated_entity_cycle(evidence: list[dict[str, Any]]) -> bool:
+    if not evidence:
+        return False
+    chain = [str(evidence[0].get("from_entity_id", ""))]
+    chain.extend(str(step.get("to_entity_id", "")) for step in evidence)
+    chain = [entity_id for entity_id in chain if entity_id]
+    return len(chain) != len(set(chain))
+
+
+def same_relation_out_and_back(evidence: list[dict[str, Any]]) -> bool:
+    seen = set()
+    for step in evidence:
+        edge = (step.get("from_entity_id"), step.get("relation_id"), step.get("direction"), step.get("to_entity_id"))
+        reverse_direction = "backward" if step.get("direction") == "forward" else "forward"
+        reverse = (step.get("to_entity_id"), step.get("relation_id"), reverse_direction, step.get("from_entity_id"))
+        if reverse in seen:
+            return True
+        seen.add(edge)
+    return False
+
+
+def role_semantic_gate(
+    graph: KnowledgeGraph,
+    question: str,
+    answer_type: str,
+    target_id: str,
+    remaining_terms: set[str],
+    relation_cap: int,
+    sample_entities: int,
+) -> float:
+    q = question.casefold()
+    target_text = entity_context_text(graph, target_id)
+    future_labels = future_relation_labels(graph, target_id, relation_cap, sample_entities)
+    future_text = " ".join(future_labels).casefold()
+    if "legal form" in q or "legal-form" in q:
+        return 1.0 if "legal form" in future_text else 0.35
+    if any(word in q for word in ["occupation", "job", "position"]):
+        if any(word in future_text for word in ["occupation", "position", "field of work", "work period"]):
+            return 1.0
+        if any(word in target_text for word in ["human", "person", "player", "athlete"]):
+            return 0.85
+        return 0.35
+    if any(word in q for word in ["county", "city", "state", "province"]):
+        if any(word in target_text for word in ["county", "city", "state", "province", "territorial"]):
+            return 1.0
+        if "country" in target_text and "country" not in q:
+            return 0.35
+        return 0.65
+    if answer_type == "person":
+        if any(word in target_text for word in ["human", "person"]):
+            return 1.0
+        if any(word in future_text for word in ["spouse", "place of birth", "occupation", "cast member", "participant", "member of sports team"]):
+            return 0.85
+        if generic_hub_text(target_text):
+            return 0.40
+    if answer_type == "organization":
+        if any(word in target_text for word in ["organization", "company", "institution", "team"]):
+            return 1.0
+        if any(word in future_text for word in ["headquarters", "parent organization", "subsidiary", "legal form"]):
+            return 0.85
+    if generic_hub_text(target_text) and not question_needs_generic_family(q):
+        return 0.45
+    return 0.75
+
+
+def stronger_drift_penalty(
+    graph: KnowledgeGraph,
+    question: str,
+    answer_type: str,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    remaining_terms: set[str],
+    future_satisfiability_score: float,
+    hop: int,
+) -> float:
+    q = question.casefold()
+    text = " ".join([entity_context_text(graph, target_id), " ".join(step["relation_id"].replace("_", " ") for step in steps)])
+    family = relation_family_from_text(text)
+    if family in {"geography_drift", "broad_location_or_country_branch"} and not question_needs_geography(q):
+        return float(FUTURE_AWARE_V2_CONSTANTS["drift_penalty"])
+    if family == "cast_or_film_drift" and not question_needs_film(q):
+        return float(FUTURE_AWARE_V2_CONSTANTS["drift_penalty"])
+    if family == "award_or_fame_drift" and not question_needs_award_or_fame(q):
+        return float(FUTURE_AWARE_V2_CONSTANTS["drift_penalty"])
+    if family == "organization_parent_subsidiary_loop" and not question_needs_org(q):
+        return float(FUTURE_AWARE_V2_CONSTANTS["drift_penalty"])
+    if hop == 2 and answer_type and type_compatibility(graph, target_id, answer_type) == 0.0 and future_satisfiability_score < 0.08:
+        return float(FUTURE_AWARE_V2_CONSTANTS["drift_penalty"])
+    return 0.0
+
+
+def useful_convergence_bonus_v2(
+    graph: KnowledgeGraph,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    future_satisfiability_score: float,
+    type_score: float,
+) -> float:
+    if len(steps) < 2:
+        return 0.0
+    relation_pairs = {(step["relation_id"], step["direction"]) for step in steps}
+    relation_names = {step["relation_id"] for step in steps}
+    relation_diverse = len(relation_names) > 1
+    not_inverse_duplicate = len(relation_pairs) == len(relation_names)
+    if future_satisfiability_score > 0.08 or type_score > 0.0 or (relation_diverse and not_inverse_duplicate):
+        return 0.14
+    return 0.0
+
+
+def surface_convergence_penalty_v2(
+    state: SearchState,
+    steps: list[dict[str, Any]],
+    useful_convergence: float,
+    gated_future_bonus: float,
+) -> float:
+    if len(steps) < 2:
+        return 0.0
+    if useful_convergence <= 0.0 or gated_future_bonus < 0.04:
+        return float(FUTURE_AWARE_V2_CONSTANTS["surface_convergence_penalty"])
+    relation_names = [step["relation_id"] for step in steps]
+    if len(set(relation_names)) == 1:
+        return float(FUTURE_AWARE_V2_CONSTANTS["surface_convergence_penalty"])
+    return 0.0
+
+
+def diversify_first_hop_states(states: list[SearchState], beam_width: int, family_limit: int) -> list[SearchState]:
+    selected: list[SearchState] = []
+    counts: Counter[str] = Counter()
+    deferred: list[SearchState] = []
+    for state in states:
+        family = first_hop_relation_family(state)
+        if counts[family] < family_limit:
+            selected.append(state)
+            counts[family] += 1
+        else:
+            deferred.append(state)
+        if len(selected) >= beam_width:
+            return selected
+    for state in deferred:
+        selected.append(state)
+        if len(selected) >= beam_width:
+            break
+    return selected
+
+
+def first_hop_relation_family(state: SearchState) -> str:
+    for step in state.evidence:
+        if step.get("hop") == 1:
+            return relation_family_from_text(str(step.get("relation_id", "")))
+    return "unknown"
+
+
+def relation_family_from_text(text: str) -> str:
+    value = text.casefold().replace("_", " ")
+    if any(term in value for term in ["country", "capital", "shares border", "diplomatic", "administrative", "located in"]):
+        return "geography_drift"
+    if any(term in value for term in ["time zone", "location", "city", "state", "province"]):
+        return "broad_location_or_country_branch"
+    if any(term in value for term in ["cast member", "film", "movie", "director", "producer", "screenwriter", "composer"]):
+        return "cast_or_film_drift"
+    if any(term in value for term in ["award", "famous", "notable", "winner", "nominated"]):
+        return "award_or_fame_drift"
+    if any(term in value for term in ["subsidiary", "parent organization", "owner of", "owned by"]):
+        return "organization_parent_subsidiary_loop"
+    return "unknown"
+
+
+def entity_context_text(graph: KnowledgeGraph, entity_id: str) -> str:
+    return " ".join([graph.entity_name(entity_id), *graph.entity_type_names(entity_id)]).casefold()
+
+
+def future_relation_labels(graph: KnowledgeGraph, entity_id: str, relation_cap: int, sample_entities: int) -> list[str]:
+    return [
+        relation.predicate.replace("_", " ")
+        for relation in graph.candidate_relations([entity_id], cap=relation_cap, sample_entities=sample_entities)
+    ]
+
+
+def generic_hub_text(text: str) -> bool:
+    return any(term in text for term in ["country", "sovereign state", "organization", "location", "continent", "time zone"])
+
+
+def question_needs_generic_family(question: str) -> bool:
+    return question_needs_geography(question) or question_needs_org(question)
+
+
+def question_needs_geography(question: str) -> bool:
+    question = question.casefold()
+    return any(term in question for term in ["country", "city", "county", "state", "province", "capital", "border", "located", "place", "where"])
+
+
+def question_needs_film(question: str) -> bool:
+    question = question.casefold()
+    return any(term in question for term in ["film", "movie", "cast", "director", "producer", "screenwriter", "composer", "visual artwork"])
+
+
+def question_needs_award_or_fame(question: str) -> bool:
+    question = question.casefold()
+    return any(term in question for term in ["award", "winner", "famous", "notable", "nominated", "well-known"])
+
+
+def question_needs_org(question: str) -> bool:
+    question = question.casefold()
+    return any(term in question for term in ["organization", "company", "subsidiary", "parent", "headquartered", "legal form", "institution", "publisher"])
 
 
 def plausible_progress(question: str, graph: KnowledgeGraph, target_id: str, steps: list[dict[str, Any]], hop: int) -> float:
@@ -1018,27 +1474,57 @@ def summarize_future_aware_state(state: SearchState, rank: int) -> dict[str, Any
     }
 
 
+def summarize_future_aware_v2_state(state: SearchState, rank: int) -> dict[str, Any]:
+    return {
+        "rank": rank,
+        "hop": state.evidence[-1].get("hop") if state.evidence else None,
+        "candidate_evidence_state": " | ".join(step["readable"] for step in state.evidence),
+        "fragments": [step["readable"] for step in state.evidence],
+        "current_relevance": state.soft_signals.get("current_relevance", 0.0),
+        "raw_future_bonus": state.soft_signals.get("raw_future_bonus", 0.0),
+        "future_bonus_capped": state.soft_signals.get("future_bonus_capped", 0.0),
+        "role_gate": state.soft_signals.get("role_gate", 0.0),
+        "non_drift_gate": state.soft_signals.get("non_drift_gate", 0.0),
+        "non_loop_gate": state.soft_signals.get("non_loop_gate", 0.0),
+        "gated_future_bonus": state.soft_signals.get("gated_future_bonus", 0.0),
+        "useful_convergence": state.soft_signals.get("useful_convergence", 0.0),
+        "type_compatibility": state.soft_signals.get("type_compatibility", 0.0),
+        "progress": state.soft_signals.get("progress", 0.0),
+        "surface_convergence_penalty": state.soft_signals.get("surface_convergence_penalty", 0.0),
+        "loop_penalty": state.soft_signals.get("loop_penalty", 0.0),
+        "drift_penalty": state.soft_signals.get("drift_penalty", 0.0),
+        "redundancy_penalty": state.soft_signals.get("redundancy_penalty", 0.0),
+        "noisy_branch_penalty": state.soft_signals.get("noisy_branch_penalty", 0.0),
+        "final_score": state.score,
+        "target_entity": next(iter(state.frontier_ids), ""),
+    }
+
+
 def build_prediction_row(
     graph: KnowledgeGraph,
     example: SmokeExample,
     baseline: dict[str, Any],
     proof_state: dict[str, Any],
     future_aware: dict[str, Any],
+    future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
     baseline_correct = baseline["hits_at_1"]
     proof_correct = proof_state["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
-    if baseline_correct and proof_correct and future_correct:
+    future_v2_correct = future_aware_v2["hits_at_1"]
+    if baseline_correct and proof_correct and future_correct and future_v2_correct:
         failure_type = "both_correct"
+    elif future_v2_correct and not future_correct and not proof_correct:
+        failure_type = "future_aware_v2_correct"
     elif future_correct and not proof_correct:
         failure_type = "future_aware_correct"
     elif proof_correct:
         failure_type = "proof_state_correct"
     elif baseline_correct:
         failure_type = "baseline_correct"
-    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not future_aware["gold_generated"]:
+    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not future_aware["gold_generated"] and not future_aware_v2["gold_generated"]:
         failure_type = "gold_not_generated"
-    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not future_aware["candidate_answers"]:
+    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not future_aware["candidate_answers"] or not future_aware_v2["candidate_answers"]:
         failure_type = "empty_frontier"
     else:
         failure_type = "both_fail"
@@ -1056,6 +1542,7 @@ def build_prediction_row(
         "baseline_path_beam": baseline,
         "soft_proof_state_beam": proof_state,
         "future_aware_proof_state_beam": future_aware,
+        "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
     }
 
@@ -1064,29 +1551,38 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     baseline = [row["baseline_path_beam"] for row in rows]
     proof = [row["soft_proof_state_beam"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
+    future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
+    future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
     return {
         "number_of_selected_questions": len(rows),
         "baseline_hits_at_1": avg_bool(item["hits_at_1"] for item in baseline),
         "proof_state_hits_at_1": avg_bool(item["hits_at_1"] for item in proof),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
+        "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
         "proof_state_exact_match": avg_bool(item["exact_match"] for item in proof),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
+        "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
         "proof_state_final_answer_f1": avg(item["final_answer_f1"] for item in proof),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
+        "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
         "proof_state_gold_generated_rate": avg_bool(item["gold_generated"] for item in proof),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
+        "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
         "average_candidate_count_proof_state": avg(item["candidate_count"] for item in proof),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
+        "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
         "average_expansion_count_proof_state": avg(item["expansion_count"] for item in proof),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
+        "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
         "average_final_result_size_proof_state": avg(item["final_result_size"] for item in proof),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
+        "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
             1 for row in rows
             if row["soft_proof_state_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
@@ -1103,17 +1599,35 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["soft_proof_state_beam"]["final_answer_f1"] > row["future_aware_proof_state_beam"]["final_answer_f1"]
         ),
+        "future_v2_wins_over_future_v1": sum(
+            1 for row in rows
+            if row["future_aware_v2_proof_state_beam"]["final_answer_f1"] > row["future_aware_proof_state_beam"]["final_answer_f1"]
+        ),
+        "future_v1_wins_over_future_v2": sum(
+            1 for row in rows
+            if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["future_aware_v2_proof_state_beam"]["final_answer_f1"]
+        ),
+        "future_v2_wins_over_current_proof_state": sum(
+            1 for row in rows
+            if row["future_aware_v2_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
+        ),
+        "current_proof_state_wins_over_future_v2": sum(
+            1 for row in rows
+            if row["soft_proof_state_beam"]["final_answer_f1"] > row["future_aware_v2_proof_state_beam"]["final_answer_f1"]
+        ),
         "both_correct": sum(
             1 for row in rows
             if row["baseline_path_beam"]["hits_at_1"]
             and row["soft_proof_state_beam"]["hits_at_1"]
             and row["future_aware_proof_state_beam"]["hits_at_1"]
+            and row["future_aware_v2_proof_state_beam"]["hits_at_1"]
         ),
         "both_fail": sum(
             1 for row in rows
             if not row["baseline_path_beam"]["hits_at_1"]
             and not row["soft_proof_state_beam"]["hits_at_1"]
             and not row["future_aware_proof_state_beam"]["hits_at_1"]
+            and not row["future_aware_v2_proof_state_beam"]["hits_at_1"]
         ),
         "future_aware_avoids_surface_convergence": sum(
             1 for row in rows
@@ -1123,6 +1637,30 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "future_aware_hurts_current_proof_state": sum(
             1 for row in rows
             if row["soft_proof_state_beam"]["hits_at_1"] and not row["future_aware_proof_state_beam"]["hits_at_1"]
+        ),
+        "future_v2_repeats_baseline_mistake": sum(
+            1 for row in rows
+            if error_overlap_case(row, future_key="future_aware_v2_proof_state_beam")["future_repeats_baseline_mistake"]
+        ),
+        "future_v2_same_first_hop_as_baseline": sum(
+            1 for case in future_v2_overlap
+            if case["same_first_hop_relation_as_baseline"]
+        ),
+        "future_v2_same_relation_sequence_as_baseline": sum(
+            1 for case in future_v2_overlap
+            if case["same_relation_sequence_as_baseline"]
+        ),
+        "future_v2_same_drift_family_as_baseline": sum(
+            1 for case in future_v2_overlap
+            if case["same_drift_family_as_baseline"]
+        ),
+        "future_v2_loses_current_proof_state_win": sum(
+            1 for row in rows
+            if row["soft_proof_state_beam"]["hits_at_1"] and not row["future_aware_v2_proof_state_beam"]["hits_at_1"]
+        ),
+        "future_v2_penalties_tiny_compared_with_positive_terms": sum(
+            1 for case in future_v2_overlap
+            if case["penalties_tiny_compared_with_positive_terms"]
         ),
         "failure_counts": dict(Counter(row["failure_type"] for row in rows)),
     }
@@ -1136,7 +1674,13 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         "",
         "No gold relation IDs, gold prefixes, relation cards, LLM constraint extraction, ToG/Freebase, or quantum-inspired scoring are used during search.",
         "",
-        "This run compares three modes: `baseline_path_beam`, current `soft_proof_state_beam`, and `future_aware_proof_state_beam`.",
+        "This run compares four modes: `baseline_path_beam`, current `soft_proof_state_beam`, `future_aware_proof_state_beam`, and `future_aware_v2_proof_state_beam`.",
+        "",
+        "Future-aware v2 constants:",
+        "",
+        "```json",
+        json.dumps(FUTURE_AWARE_V2_CONSTANTS, indent=2, sort_keys=True),
+        "```",
         "",
         "## Metrics",
         "",
@@ -1147,6 +1691,18 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         "## Future-Aware Wins Over Current Proof-State",
         "",
         *debug_section_rows(select_debug_rows(rows, "future"), limit=5),
+        "## Future-Aware V2 Wins Over Future-Aware V1",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "future_v2_over_v1"), limit=5),
+        "## Future-Aware V1 Wins Over Future-Aware V2",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "future_v1_over_v2"), limit=5),
+        "## Future-Aware V2 Wins Over Current Proof-State",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "future_v2_over_current"), limit=5),
+        "## Current Proof-State Wins Over Future-Aware V2",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "current_over_future_v2"), limit=5),
         "## Current Proof-State Wins Over Future-Aware",
         "",
         *debug_section_rows(select_debug_rows(rows, "current_over_future"), limit=5),
@@ -1173,7 +1729,19 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
 def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for kind in ["future", "current_over_future", "surface_avoidance", "future_hurts", "proof", "baseline", "both_fail"]:
+    for kind in [
+        "future_v2_over_v1",
+        "future_v1_over_v2",
+        "future_v2_over_current",
+        "current_over_future_v2",
+        "future",
+        "current_over_future",
+        "surface_avoidance",
+        "future_hurts",
+        "proof",
+        "baseline",
+        "both_fail",
+    ]:
         for row in select_debug_rows(rows, kind):
             key = str(row["question_id"])
             if key not in seen:
@@ -1210,14 +1778,19 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "baseline_correct": row["baseline_path_beam"]["hits_at_1"],
         "proof_state_correct": row["soft_proof_state_beam"]["hits_at_1"],
         "future_aware_correct": row["future_aware_proof_state_beam"]["hits_at_1"],
+        "future_aware_v2_correct": row["future_aware_v2_proof_state_beam"]["hits_at_1"],
         "baseline_top_answer": row["baseline_path_beam"]["top_answer"],
         "proof_state_top_answer": row["soft_proof_state_beam"]["top_answer"],
         "future_aware_top_answer": row["future_aware_proof_state_beam"]["top_answer"],
+        "future_aware_v2_top_answer": row["future_aware_v2_proof_state_beam"]["top_answer"],
         "baseline_debug_trace": row["baseline_path_beam"].get("debug_trace", []),
         "proof_state_debug_trace": row["soft_proof_state_beam"].get("debug_trace", []),
         "future_aware_debug_trace": row["future_aware_proof_state_beam"].get("debug_trace", []),
+        "future_aware_v2_debug_trace": row["future_aware_v2_proof_state_beam"].get("debug_trace", []),
+        "future_aware_v2_constants": FUTURE_AWARE_V2_CONSTANTS,
         "explanation": proof_state_choice_explanation(row),
         "future_aware_explanation": future_aware_choice_explanation(row),
+        "future_aware_v2_explanation": future_aware_v2_choice_explanation(row),
     }
 
 
@@ -1234,9 +1807,11 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         baseline = row["baseline_path_beam"]
         proof = row["soft_proof_state_beam"]
         future = row["future_aware_proof_state_beam"]
+        future_v2 = row["future_aware_v2_proof_state_beam"]
         baseline_top = baseline["top_answer"] or {}
         proof_top = proof["top_answer"] or {}
         future_top = future["top_answer"] or {}
+        future_v2_top = future_v2["top_answer"] or {}
         lines.extend(
             [
                 f"## {row['question_id']}",
@@ -1251,9 +1826,12 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"Future-aware top final state: {top_path_readable(future_top)}",
                 "",
+                f"Future-aware v2 top final state: {top_path_readable(future_v2_top)}",
+                "",
                 f"Baseline correct: `{baseline['hits_at_1']}`",
                 f"Proof-state correct: `{proof['hits_at_1']}`",
                 f"Future-aware correct: `{future['hits_at_1']}`",
+                f"Future-aware v2 correct: `{future_v2['hits_at_1']}`",
                 "",
                 "### Baseline Hop Trace",
                 "",
@@ -1264,12 +1842,18 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Future-Aware Proof-State Hop Trace",
                 "",
                 *future_aware_trace_lines(future.get("debug_trace", [])),
+                "### Future-Aware V2 Proof-State Hop Trace",
+                "",
+                *future_aware_v2_trace_lines(future_v2.get("debug_trace", [])),
                 "### Why Proof-State Chose This Over Baseline",
                 "",
                 *proof_state_choice_explanation(row),
                 "### Why Future-Aware Chose This",
                 "",
                 *future_aware_choice_explanation(row),
+                "### Why Future-Aware V2 Chose This",
+                "",
+                *future_aware_v2_choice_explanation(row),
                 "",
             ]
         )
@@ -1364,6 +1948,48 @@ def future_aware_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def future_aware_v2_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
+    if not trace:
+        return ["_No future-aware v2 proof-state trace captured._", ""]
+    lines: list[str] = []
+    for hop in trace:
+        lines.append(f"#### Hop {hop['hop']}")
+        lines.append("")
+        lines.append(
+            "| Rank | Candidate evidence state | Current | Raw future | Future cap | Role gate | Drift gate | Loop gate | Gated future | Convergence | Type | Progress | Surface | Loop | Drift | Redundant | Noisy | Final score |"
+        )
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for state in hop.get("top_candidate_states", []):
+            lines.append(
+                "| {rank} | {path} | {cur:.4f} | {raw:.4f} | {cap:.4f} | {role:.4f} | {drift_gate:.4f} | {loop_gate:.4f} | {gated:.4f} | {conv:.4f} | {typ:.4f} | {prog:.4f} | {surf:.4f} | {loop:.4f} | {drift:.4f} | {red:.4f} | {noisy:.4f} | {score:.4f} |".format(
+                    rank=state["rank"],
+                    path=escape_md(state.get("candidate_evidence_state", "")),
+                    cur=float(state.get("current_relevance", 0.0)),
+                    raw=float(state.get("raw_future_bonus", 0.0)),
+                    cap=float(state.get("future_bonus_capped", 0.0)),
+                    role=float(state.get("role_gate", 0.0)),
+                    drift_gate=float(state.get("non_drift_gate", 0.0)),
+                    loop_gate=float(state.get("non_loop_gate", 0.0)),
+                    gated=float(state.get("gated_future_bonus", 0.0)),
+                    conv=float(state.get("useful_convergence", 0.0)),
+                    typ=float(state.get("type_compatibility", 0.0)),
+                    prog=float(state.get("progress", 0.0)),
+                    surf=float(state.get("surface_convergence_penalty", 0.0)),
+                    loop=float(state.get("loop_penalty", 0.0)),
+                    drift=float(state.get("drift_penalty", 0.0)),
+                    red=float(state.get("redundancy_penalty", 0.0)),
+                    noisy=float(state.get("noisy_branch_penalty", 0.0)),
+                    score=float(state.get("final_score", 0.0)),
+                )
+            )
+        selected = hop.get("selected_states", [])
+        if selected:
+            lines.append("")
+            lines.append(f"_Selected after v2 first-hop diversity/pruning: {', '.join(str(item.get('rank')) for item in selected[:5])}_")
+        lines.append("")
+    return lines
+
+
 def proof_state_choice_explanation(row: dict[str, Any]) -> list[str]:
     proof_top = row["soft_proof_state_beam"].get("top_answer") or {}
     paths = proof_top.get("paths", []) if proof_top else []
@@ -1443,12 +2069,71 @@ def future_aware_choice_explanation(row: dict[str, Any]) -> list[str]:
     return lines
 
 
+def future_aware_v2_choice_explanation(row: dict[str, Any]) -> list[str]:
+    future_top = row["future_aware_v2_proof_state_beam"].get("top_answer") or {}
+    paths = future_top.get("paths", []) if future_top else []
+    signals = paths[0].get("soft_signals", {}) if paths else {}
+    positive_components = {
+        key: float(signals.get(key, 0.0))
+        for key in ["current_relevance", "gated_future_bonus", "useful_convergence", "type_compatibility", "progress"]
+    }
+    negative_components = {
+        key: float(signals.get(key, 0.0))
+        for key in ["surface_convergence_penalty", "loop_penalty", "drift_penalty", "redundancy_penalty", "noisy_branch_penalty"]
+    }
+    strongest = max(positive_components.items(), key=lambda item: item[1], default=("", 0.0))
+    lines = [
+        f"- Strongest positive component: `{strongest[0] or 'none'}` = `{strongest[1]:.4f}`",
+        f"- Raw future bonus: `{float(signals.get('raw_future_bonus', 0.0)):.4f}`",
+        f"- Capped future bonus: `{float(signals.get('future_bonus_capped', 0.0)):.4f}`",
+        f"- Role gate: `{float(signals.get('role_gate', 0.0)):.4f}`",
+        f"- Non-drift gate: `{float(signals.get('non_drift_gate', 0.0)):.4f}`",
+        f"- Non-loop gate: `{float(signals.get('non_loop_gate', 0.0)):.4f}`",
+        f"- Gated future bonus: `{positive_components.get('gated_future_bonus', 0.0):.4f}`",
+        f"- Loop penalty applied: `{negative_components.get('loop_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('loop_penalty', 0.0):.4f}`)",
+        f"- Drift penalty applied: `{negative_components.get('drift_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('drift_penalty', 0.0):.4f}`)",
+        f"- Surface convergence penalty applied: `{negative_components.get('surface_convergence_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('surface_convergence_penalty', 0.0):.4f}`)",
+    ]
+    if row["future_aware_v2_proof_state_beam"]["hits_at_1"] and not row["future_aware_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: future-aware v2 beat future-aware v1 on this question.")
+    elif row["future_aware_proof_state_beam"]["hits_at_1"] and not row["future_aware_v2_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: future-aware v2 hurt a case future-aware v1 got right.")
+    elif row["future_aware_v2_proof_state_beam"]["hits_at_1"] and row["future_aware_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: both future-aware variants were correct.")
+    else:
+        lines.append("- Outcome: both future-aware variants failed.")
+    return lines
+
+
 def escape_md(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    if kind == "future":
+    if kind == "future_v2_over_v1":
+        selected = [
+            row for row in rows
+            if row["future_aware_v2_proof_state_beam"]["final_answer_f1"] > row["future_aware_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "future_v1_over_v2":
+        selected = [
+            row for row in rows
+            if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["future_aware_v2_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "future_v2_over_current":
+        selected = [
+            row for row in rows
+            if row["future_aware_v2_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "current_over_future_v2":
+        selected = [
+            row for row in rows
+            if row["soft_proof_state_beam"]["final_answer_f1"] > row["future_aware_v2_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "future":
         selected = [
             row for row in rows
             if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
@@ -1495,9 +2180,11 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         baseline_top = row["baseline_path_beam"]["top_answer"] or {}
         proof_top = row["soft_proof_state_beam"]["top_answer"] or {}
         future_top = row["future_aware_proof_state_beam"]["top_answer"] or {}
+        future_v2_top = row["future_aware_v2_proof_state_beam"]["top_answer"] or {}
         baseline_path = top_path_readable(baseline_top)
         proof_path = top_path_readable(proof_top)
         future_path = top_path_readable(future_top)
+        future_v2_path = top_path_readable(future_v2_top)
         likely = likely_reason(row)
         lines.extend(
             [
@@ -1510,6 +2197,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
                 f"- Proof-state evidence: {proof_path}",
                 f"- Future-aware top answer: `{future_top.get('answer_label', '')}`",
                 f"- Future-aware evidence: {future_path}",
+                f"- Future-aware v2 top answer: `{future_v2_top.get('answer_label', '')}`",
+                f"- Future-aware v2 evidence: {future_v2_path}",
                 f"- Likely reason: {likely}",
                 "",
             ]
@@ -1518,7 +2207,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
 
 
 def build_error_overlap(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    cases = [error_overlap_case(row) for row in rows]
+    cases_v2 = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
+    cases_v1 = [error_overlap_case(row, future_key="future_aware_proof_state_beam") for row in rows]
     summary_keys = [
         "same_top_answer_as_baseline",
         "same_top_answer_as_current_proof_state",
@@ -1533,25 +2223,31 @@ def build_error_overlap(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "future_avoids_surface_convergence_successfully",
         "penalties_tiny_compared_with_positive_terms",
     ]
-    summary = {key: sum(1 for case in cases if case[key]) for key in summary_keys}
-    summary["total_questions"] = len(cases)
-    summary["drift_family_counts_baseline"] = dict(Counter(case["baseline_drift_family"] for case in cases))
-    summary["drift_family_counts_future_aware"] = dict(Counter(case["future_aware_drift_family"] for case in cases))
+    summary = {key: sum(1 for case in cases_v2 if case[key]) for key in summary_keys}
+    summary["total_questions"] = len(cases_v2)
+    summary["diagnostic_future_mode"] = "future_aware_v2_proof_state_beam"
+    summary["future_aware_v2_constants"] = FUTURE_AWARE_V2_CONSTANTS
+    summary["drift_family_counts_baseline"] = dict(Counter(case["baseline_drift_family"] for case in cases_v2))
+    summary["drift_family_counts_future_aware_v2"] = dict(Counter(case["future_aware_drift_family"] for case in cases_v2))
+    summary["future_v1_repeats_baseline_mistake"] = sum(1 for case in cases_v1 if case["future_repeats_baseline_mistake"])
+    summary["future_v1_loses_current_proof_state_win"] = sum(1 for case in cases_v1 if case["future_loses_current_proof_state_win"])
+    summary["future_v1_penalties_tiny_compared_with_positive_terms"] = sum(1 for case in cases_v1 if case["penalties_tiny_compared_with_positive_terms"])
     return {
         "summary": summary,
-        "cases": cases,
+        "cases": cases_v2,
+        "future_v1_cases": cases_v1,
         "examples": {
-            "future_repeats_baseline_mistakes": select_overlap_examples(cases, "future_repeats_baseline_mistake"),
-            "future_avoids_baseline_mistakes": select_overlap_examples(cases, "future_avoids_baseline_mistake"),
-            "future_loses_to_current_proof_state": select_overlap_examples(cases, "future_loses_current_proof_state_win"),
+            "future_repeats_baseline_mistakes": select_overlap_examples(cases_v2, "future_repeats_baseline_mistake"),
+            "future_avoids_baseline_mistakes": select_overlap_examples(cases_v2, "future_avoids_baseline_mistake"),
+            "future_loses_to_current_proof_state": select_overlap_examples(cases_v2, "future_loses_current_proof_state_win"),
         },
     }
 
 
-def error_overlap_case(row: dict[str, Any]) -> dict[str, Any]:
+def error_overlap_case(row: dict[str, Any], future_key: str = "future_aware_proof_state_beam") -> dict[str, Any]:
     baseline = row["baseline_path_beam"]
     current = row["soft_proof_state_beam"]
-    future = row["future_aware_proof_state_beam"]
+    future = row[future_key]
     baseline_top = baseline.get("top_answer") or {}
     current_top = current.get("top_answer") or {}
     future_top = future.get("top_answer") or {}
@@ -1647,11 +2343,17 @@ def select_overlap_examples(cases: list[dict[str, Any]], flag: str, limit: int =
 def write_error_overlap_markdown(error_overlap: dict[str, Any]) -> str:
     summary = error_overlap["summary"]
     lines = [
-        "# Future-Aware Error Overlap Diagnostic",
+        "# Future-Aware V2 Error Overlap Diagnostic",
         "",
-        "This diagnostic compares `baseline_path_beam`, current `soft_proof_state_beam`, and `future_aware_proof_state_beam` on the same selected questions.",
+        "This diagnostic compares `baseline_path_beam`, current `soft_proof_state_beam`, and `future_aware_v2_proof_state_beam` on the same selected questions.",
         "",
         "It does not change search, scoring, prompts, or candidate generation.",
+        "",
+        "Future-aware v2 constants:",
+        "",
+        "```json",
+        json.dumps(FUTURE_AWARE_V2_CONSTANTS, indent=2, sort_keys=True),
+        "```",
         "",
         "## Summary Counts",
         "",
@@ -1659,7 +2361,7 @@ def write_error_overlap_markdown(error_overlap: dict[str, Any]) -> str:
         "|---|---:|",
     ]
     for key, value in summary.items():
-        if isinstance(value, dict):
+        if isinstance(value, dict) or not isinstance(value, (bool, int, float)):
             continue
         lines.append(f"| `{key}` | {value} |")
     lines.extend(
@@ -1673,19 +2375,19 @@ def write_error_overlap_markdown(error_overlap: dict[str, Any]) -> str:
             json.dumps(summary.get("drift_family_counts_baseline", {}), indent=2, sort_keys=True),
             "```",
             "",
-            "**Future-aware**",
+            "**Future-aware v2**",
             "",
             "```json",
-            json.dumps(summary.get("drift_family_counts_future_aware", {}), indent=2, sort_keys=True),
+            json.dumps(summary.get("drift_family_counts_future_aware_v2", {}), indent=2, sort_keys=True),
             "```",
             "",
-            "## Future-Aware Repeats Baseline Mistakes",
+            "## Future-Aware V2 Repeats Baseline Mistakes",
             "",
             *overlap_example_lines(error_overlap["examples"]["future_repeats_baseline_mistakes"]),
-            "## Future-Aware Avoids Baseline Mistakes",
+            "## Future-Aware V2 Avoids Baseline Mistakes",
             "",
             *overlap_example_lines(error_overlap["examples"]["future_avoids_baseline_mistakes"]),
-            "## Future-Aware Loses To Current Proof-State",
+            "## Future-Aware V2 Loses To Current Proof-State",
             "",
             *overlap_example_lines(error_overlap["examples"]["future_loses_to_current_proof_state"]),
         ]
@@ -1708,17 +2410,25 @@ def overlap_example_lines(cases: list[dict[str, Any]]) -> list[str]:
                 f"- Baseline path: `{case['baseline_top_path']}`",
                 f"- Current proof-state top: `{case['current_proof_state_top_answer']}`",
                 f"- Current proof-state path: `{case['current_proof_state_top_path']}`",
-                f"- Future-aware top: `{case['future_aware_top_answer']}`",
-                f"- Future-aware path: `{case['future_aware_top_path']}`",
+                f"- Future-aware v2 top: `{case['future_aware_top_answer']}`",
+                f"- Future-aware v2 path: `{case['future_aware_top_path']}`",
                 f"- Same top as baseline: `{case['same_top_answer_as_baseline']}`",
                 f"- Same first hop as baseline: `{case['same_first_hop_relation_as_baseline']}`",
                 f"- Same second hop as baseline: `{case['same_second_hop_relation_as_baseline']}`",
                 f"- Baseline drift family: `{case['baseline_drift_family']}`",
-                f"- Future-aware drift family: `{case['future_aware_drift_family']}`",
-                "- Future-aware score breakdown:",
+                f"- Future-aware v2 drift family: `{case['future_aware_drift_family']}`",
+                "- Future-aware v2 score breakdown:",
+                f"  - current_relevance: `{score['current_relevance']:.4f}`",
+                f"  - raw_future_bonus: `{score['raw_future_bonus']:.4f}`",
+                f"  - future_bonus_capped: `{score['future_bonus_capped']:.4f}`",
+                f"  - role_gate: `{score['role_gate']:.4f}`",
+                f"  - non_drift_gate: `{score['non_drift_gate']:.4f}`",
+                f"  - non_loop_gate: `{score['non_loop_gate']:.4f}`",
+                f"  - gated_future_bonus: `{score['gated_future_bonus']:.4f}`",
                 f"  - future_bonus_total: `{score['future_bonus_total']:.4f}`",
                 f"  - useful_convergence: `{score['useful_convergence']:.4f}`",
                 f"  - surface_convergence_penalty: `{score['surface_convergence_penalty']:.4f}`",
+                f"  - loop_penalty: `{score['loop_penalty']:.4f}`",
                 f"  - redundancy_penalty: `{score['redundancy_penalty']:.4f}`",
                 f"  - drift_penalty: `{score['drift_penalty']:.4f}`",
                 f"  - noisy_branch_penalty: `{score['noisy_branch_penalty']:.4f}`",
@@ -1811,21 +2521,39 @@ def has_path_inverse_loop(evidence: list[dict[str, Any]]) -> bool:
 def future_score_breakdown(future_top: dict[str, Any]) -> dict[str, float]:
     paths = future_top.get("paths", []) if future_top else []
     signals = paths[0].get("soft_signals", {}) if paths else {}
-    future_bonus_total = float(signals.get("future_satisfiability", 0.0)) + float(signals.get("useful_convergence", 0.0))
+    is_v2 = "gated_future_bonus" in signals
+    current = float(signals.get("current_relevance", 0.0))
+    raw_future = float(signals.get("raw_future_bonus", signals.get("future_satisfiability", 0.0)))
+    capped_future = float(signals.get("future_bonus_capped", raw_future))
+    role_gate = float(signals.get("role_gate", 1.0))
+    non_drift_gate = float(signals.get("non_drift_gate", 1.0))
+    non_loop_gate = float(signals.get("non_loop_gate", 1.0))
+    gated_future = float(signals.get("gated_future_bonus", capped_future if is_v2 else raw_future))
     useful_convergence = float(signals.get("useful_convergence", 0.0))
+    future_bonus_total = gated_future + useful_convergence if is_v2 else raw_future + useful_convergence
     surface = float(signals.get("surface_convergence_penalty", 0.0))
+    loop = float(signals.get("loop_penalty", 0.0))
     redundancy = float(signals.get("redundancy_penalty", 0.0))
     drift = float(signals.get("drift_penalty", 0.0))
     noisy = float(signals.get("noisy_branch_penalty", 0.0))
+    future_positive_key = "gated_future_bonus" if is_v2 else "future_satisfiability"
     positive_sum = sum(
         max(0.0, float(signals.get(key, 0.0)))
-        for key in ["current_relevance", "future_satisfiability", "useful_convergence", "type_compatibility", "progress"]
+        for key in ["current_relevance", future_positive_key, "useful_convergence", "type_compatibility", "progress"]
     )
-    negative_sum = sum(abs(min(0.0, value)) for value in [surface, redundancy, drift, noisy])
+    negative_sum = sum(abs(min(0.0, value)) for value in [surface, loop, redundancy, drift, noisy])
     return {
+        "current_relevance": current,
+        "raw_future_bonus": raw_future,
+        "future_bonus_capped": capped_future,
+        "role_gate": role_gate,
+        "non_drift_gate": non_drift_gate,
+        "non_loop_gate": non_loop_gate,
+        "gated_future_bonus": gated_future,
         "future_bonus_total": future_bonus_total,
         "useful_convergence": useful_convergence,
         "surface_convergence_penalty": surface,
+        "loop_penalty": loop,
         "redundancy_penalty": redundancy,
         "drift_penalty": drift,
         "noisy_branch_penalty": noisy,
@@ -1858,9 +2586,11 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     baseline = row["baseline_path_beam"]
     proof = row["soft_proof_state_beam"]
     future = row["future_aware_proof_state_beam"]
+    future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
     proof_top = proof["top_answer"] or {}
     future_top = future["top_answer"] or {}
+    future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
     print(f"Q: {row['question']}", flush=True)
     print(f"Gold answer: {row['gold_answers']}", flush=True)
@@ -1868,12 +2598,15 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Baseline top answer: {baseline_top.get('answer_label', '<none>')}", flush=True)
     print(f"Proof-state top answer: {proof_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated proof-state: {'yes' if proof['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
     print(f"Proof-state evidence: {top_path_readable(proof_top)}", flush=True)
     print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
+    print(f"Future-aware v2 evidence: {top_path_readable(future_v2_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)
 
 

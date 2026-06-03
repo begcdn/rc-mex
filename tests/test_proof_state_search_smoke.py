@@ -116,6 +116,9 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             self.assertEqual(metrics["metrics"]["number_of_selected_questions"], 1)
             self.assertIn("baseline_hits_at_1", metrics["metrics"])
             self.assertIn("proof_state_hits_at_1", metrics["metrics"])
+            self.assertIn("future_aware_v2_hits_at_1", metrics["metrics"])
+            self.assertIn("future_v2_same_first_hop_as_baseline", metrics["metrics"])
+            self.assertIn("future_aware_v2_proof_state_beam", metrics["scorer_constants"])
 
             rows = [
                 json.loads(line)
@@ -125,6 +128,7 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             self.assertEqual(rows[0]["question_id"], "q1")
             self.assertIn("baseline_path_beam", rows[0])
             self.assertIn("soft_proof_state_beam", rows[0])
+            self.assertIn("future_aware_v2_proof_state_beam", rows[0])
             self.assertTrue(rows[0]["baseline_path_beam"]["candidate_answers"])
             self.assertTrue(rows[0]["soft_proof_state_beam"]["candidate_answers"])
 
@@ -135,12 +139,14 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             overlap = load_json(output / "error_overlap.json")
             self.assertIn("summary", overlap)
             self.assertIn("cases", overlap)
+            self.assertEqual(overlap["summary"]["diagnostic_future_mode"], "future_aware_v2_proof_state_beam")
             overlap_report = (output / "error_overlap.md").read_text(encoding="utf-8")
-            self.assertIn("Future-Aware Error Overlap Diagnostic", overlap_report)
-            self.assertIn("Future-Aware Repeats Baseline Mistakes", overlap_report)
+            self.assertIn("Future-Aware V2 Error Overlap Diagnostic", overlap_report)
+            self.assertIn("Future-Aware V2 Repeats Baseline Mistakes", overlap_report)
             trace = (output / "debug_trace.md").read_text(encoding="utf-8")
             self.assertIn("Baseline Hop Trace", trace)
             self.assertIn("Proof-State Hop Trace", trace)
+            self.assertIn("Future-Aware V2 Proof-State Hop Trace", trace)
             self.assertIn("Why Proof-State Chose This Over Baseline", trace)
 
     def test_runner_selects_real_kqa_style_two_relate_chain(self):
