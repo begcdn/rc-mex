@@ -60,6 +60,14 @@ TWO_SCORE_FIXED_CONSTANTS = {
     "fixed_mode": 1.0,
 }
 
+RELATION_PROPOSAL_K = 10
+
+TWO_SCORE_WIDE_PROPOSAL_CONSTANTS = {
+    **TWO_SCORE_FIXED_CONSTANTS,
+    "relation_proposal_k": float(RELATION_PROPOSAL_K),
+    "wide_proposal_mode": 1.0,
+}
+
 
 @dataclass
 class SmokeExample:
@@ -70,6 +78,7 @@ class SmokeExample:
     start_entity_name: str
     gold_answer_ids: set[str]
     gold_answer_labels: list[str]
+    gold_relation_steps: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -98,7 +107,7 @@ def main() -> None:
     log_line(f"Skipped unsupported: {selection_stats.get('unsupported_program', 0)}")
     log_line(f"Skipped empty gold execution: {selection_stats.get('empty_gold_execution', 0)}")
 
-    log_stage(3, 4, "Running baseline, soft proof-state, fixed two-score, and legacy beams")
+    log_stage(3, 4, "Running baseline, soft proof-state, fixed/wide two-score, and legacy beams")
     rows = []
     for index, example in enumerate(examples, start=1):
         baseline = run_baseline_path_beam(
@@ -144,6 +153,17 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        two_score_wide = run_two_score_wide_proposal_beam(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         future_aware = run_future_aware_proof_state_beam(
             graph=graph,
             example=example,
@@ -166,7 +186,7 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -178,6 +198,7 @@ def main() -> None:
         "scorer_constants": {
             "two_score_proof_state_beam": TWO_SCORE_CONSTANTS,
             "two_score_fixed_proof_state_beam": TWO_SCORE_FIXED_CONSTANTS,
+            "two_score_wide_proposal_beam": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -186,27 +207,27 @@ def main() -> None:
     write_jsonl(output_dir / "predictions.jsonl", rows)
     write_json(output_dir / "metrics.json", summary)
     (output_dir / "report.md").write_text(write_report(metrics, rows), encoding="utf-8")
-    error_overlap = build_error_overlap(rows, future_key="two_score_fixed_proof_state_beam", diagnostic_label="two_score_fixed_proof_state_beam")
+    error_overlap = build_error_overlap(rows, future_key="two_score_wide_proposal_beam", diagnostic_label="two_score_wide_proposal_beam")
     write_json(output_dir / "error_overlap.json", error_overlap)
     (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
     gold_survival_audit = build_target_gold_survival_audit(
         graph,
         rows,
         args,
-        target_key="two_score_fixed_proof_state_beam",
-        target_label="Two-Score Fixed",
+        target_key="two_score_wide_proposal_beam",
+        target_label="Two-Score Wide Proposal",
     )
     behavior_audit = build_target_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="two_score_fixed_proof_state_beam",
-        target_label="Two-Score Fixed",
+        target_key="two_score_wide_proposal_beam",
+        target_label="Two-Score Wide Proposal",
     )
     code_behavior_audit = build_two_score_code_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="two_score_fixed_proof_state_beam",
-        constants=TWO_SCORE_FIXED_CONSTANTS,
+        target_key="two_score_wide_proposal_beam",
+        constants=TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
     )
     write_json(output_dir / "gold_survival_audit.json", gold_survival_audit)
     (output_dir / "gold_survival_audit.md").write_text(write_gold_survival_audit_markdown(gold_survival_audit), encoding="utf-8")
@@ -287,10 +308,12 @@ def parse_legacy_exact_two_relate(graph: KnowledgeGraph, sample: dict[str, Any],
     if not start_ids:
         raise ValueError("empty_start_entity")
     gold_state = set(start_ids)
+    gold_relation_steps = []
     for step in [first_relate, second_relate]:
         inputs = step.get("inputs", []) or []
         if len(inputs) < 2:
             raise ValueError("unsupported_program")
+        gold_relation_steps.append({"relation_id": str(inputs[0]), "direction": str(inputs[1])})
         gold_state, _ = graph.follow(gold_state, str(inputs[0]), str(inputs[1]), max_proofs=10000)
         if not gold_state:
             raise ValueError("empty_gold_execution")
@@ -302,6 +325,7 @@ def parse_legacy_exact_two_relate(graph: KnowledgeGraph, sample: dict[str, Any],
         start_entity_name=str(find_inputs[0]),
         gold_answer_ids=gold_state,
         gold_answer_labels=entity_labels(graph, gold_state),
+        gold_relation_steps=gold_relation_steps,
     )
 
 
@@ -340,6 +364,11 @@ def parse_linear_two_relate_entity_answer(graph: KnowledgeGraph, sample: dict[st
     if not start_ids:
         raise ValueError("empty_start_entity")
 
+    gold_relation_steps = [
+        {"relation_id": str((step.get("inputs", []) or [""])[0]), "direction": str((step.get("inputs", []) or ["", ""])[1])}
+        for step in chain
+        if step.get("function") == "Relate" and len(step.get("inputs", []) or []) >= 2
+    ]
     gold_state = execute_linear_gold_chain(graph, start_ids, chain[1:])
     if not gold_state:
         raise ValueError("empty_gold_execution")
@@ -351,6 +380,7 @@ def parse_linear_two_relate_entity_answer(graph: KnowledgeGraph, sample: dict[st
         start_entity_name=str(find_inputs[0]),
         gold_answer_ids=gold_state,
         gold_answer_labels=entity_labels(graph, gold_state),
+        gold_relation_steps=gold_relation_steps,
     )
 
 
@@ -989,6 +1019,124 @@ def run_two_score_fixed_proof_state_beam(
         example.gold_answer_ids,
         expansion_count,
         mode="two_score_fixed_proof_state_beam",
+        debug_trace=trace,
+        answer_score_key="final_proof_score",
+    )
+    result["audit_trace"] = audit_trace
+    return result
+
+
+def run_two_score_wide_proposal_beam(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    del top_k
+    answer_type = guess_answer_type(example.question)
+    states = [
+        SearchState(
+            frontier_ids=set(example.start_entity_ids),
+            score=0.0,
+            entity_sequences=[[graph.entity_name(entity_id)] for entity_id in sorted(example.start_entity_ids)],
+            relation_sequences=[[]],
+            soft_signals={"answer_type_known": 1.0 if answer_type else 0.0},
+        )
+    ]
+    expansion_count = 0
+    trace: list[dict[str, Any]] = []
+    audit_trace: list[dict[str, Any]] = []
+    for hop in [1, 2]:
+        next_states: list[SearchState] = []
+        for state in states:
+            expansion_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for source_id in sorted(state.frontier_ids):
+                frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
+                ranked = rank_relations(example.question, frontier)
+                for candidate in ranked[:RELATION_PROPOSAL_K]:
+                    targets = relation_targets(graph, source_id, candidate, max_branch_entities)
+                    expansion_count += 1
+                    for target_id in targets:
+                        expansion_groups[target_id].append(
+                            {
+                                "source_id": source_id,
+                                "candidate": candidate,
+                                "branch_size": len(targets),
+                            }
+                        )
+            for target_id, fragments in expansion_groups.items():
+                steps = [
+                    evidence_step(graph, fragment["source_id"], fragment["candidate"], target_id, hop, fragment["branch_size"])
+                    for fragment in fragments
+                ]
+                signals = two_score_fixed_fragment_signals(
+                    graph=graph,
+                    question=example.question,
+                    answer_type=answer_type,
+                    state=state,
+                    target_id=target_id,
+                    steps=steps,
+                    hop=hop,
+                    relation_cap=relation_cap,
+                    sample_entities=sample_entities,
+                    noisy_branch_threshold=noisy_branch_threshold,
+                    start_entity_ids=example.start_entity_ids,
+                )
+                signals["relation_proposal_k"] = float(RELATION_PROPOSAL_K)
+                signals["wide_proposal_mode"] = 1.0
+                relation_sequences = extend_relation_sequences(state.relation_sequences, steps)
+                entity_sequences = extend_entity_sequences(graph, state.entity_sequences, steps)
+                next_states.append(
+                    SearchState(
+                        frontier_ids={target_id},
+                        score=state.score + signals["retention_delta"],
+                        evidence=state.evidence + steps,
+                        relation_sequences=relation_sequences,
+                        entity_sequences=entity_sequences,
+                        soft_signals=merge_two_score_fixed_signal_dicts(state.soft_signals, signals),
+                    )
+                )
+        next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        all_summaries = [
+            summarize_two_score_state(state, rank)
+            for rank, state in enumerate(next_states, start=1)
+        ]
+        selected_states = next_states[:beam_width]
+        selected_summaries = [
+            summarize_two_score_state(state, rank)
+            for rank, state in enumerate(selected_states, start=1)
+        ]
+        audit_trace.append(
+            {
+                "hop": hop,
+                "all_candidate_states": all_summaries,
+                "selected_states": selected_summaries,
+                "constants": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
+                "relation_proposal_k": RELATION_PROPOSAL_K,
+            }
+        )
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": all_summaries[:5],
+                    "selected_states": selected_summaries[:5],
+                    "constants": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
+                    "relation_proposal_k": RELATION_PROPOSAL_K,
+                }
+            )
+        states = selected_states
+    result = search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="two_score_wide_proposal_beam",
         debug_trace=trace,
         answer_score_key="final_proof_score",
     )
@@ -2359,6 +2507,7 @@ def build_prediction_row(
     proof_state: dict[str, Any],
     two_score: dict[str, Any],
     two_score_fixed: dict[str, Any],
+    two_score_wide: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2366,10 +2515,13 @@ def build_prediction_row(
     proof_correct = proof_state["hits_at_1"]
     two_score_correct = two_score["hits_at_1"]
     two_score_fixed_correct = two_score_fixed["hits_at_1"]
+    two_score_wide_correct = two_score_wide["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
-    if baseline_correct and proof_correct and two_score_fixed_correct:
+    if baseline_correct and proof_correct and two_score_wide_correct:
         failure_type = "both_correct"
+    elif two_score_wide_correct and not two_score_fixed_correct:
+        failure_type = "two_score_wide_correct"
     elif two_score_fixed_correct and not proof_correct:
         failure_type = "two_score_fixed_correct"
     elif two_score_correct and not proof_correct:
@@ -2382,9 +2534,9 @@ def build_prediction_row(
         failure_type = "proof_state_correct"
     elif baseline_correct:
         failure_type = "baseline_correct"
-    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not two_score_fixed["gold_generated"]:
+    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not two_score_wide["gold_generated"]:
         failure_type = "gold_not_generated"
-    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not two_score_fixed["candidate_answers"]:
+    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not two_score_wide["candidate_answers"]:
         failure_type = "empty_frontier"
     else:
         failure_type = "both_fail"
@@ -2394,6 +2546,7 @@ def build_prediction_row(
         "question": example.question,
         "gold_answer_ids": sorted(example.gold_answer_ids),
         "gold_answers": example.gold_answer_labels,
+        "gold_relation_steps": example.gold_relation_steps,
         "start_entity": {
             "name": example.start_entity_name,
             "entity_ids": sorted(example.start_entity_ids),
@@ -2403,6 +2556,7 @@ def build_prediction_row(
         "soft_proof_state_beam": proof_state,
         "two_score_proof_state_beam": two_score,
         "two_score_fixed_proof_state_beam": two_score_fixed,
+        "two_score_wide_proposal_beam": two_score_wide,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -2414,53 +2568,62 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     proof = [row["soft_proof_state_beam"] for row in rows]
     two_score = [row["two_score_proof_state_beam"] for row in rows]
     two_score_fixed = [row["two_score_fixed_proof_state_beam"] for row in rows]
+    two_score_wide = [row["two_score_wide_proposal_beam"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
     two_score_overlap = [error_overlap_case(row, future_key="two_score_proof_state_beam") for row in rows]
     two_score_fixed_overlap = [error_overlap_case(row, future_key="two_score_fixed_proof_state_beam") for row in rows]
+    two_score_wide_overlap = [error_overlap_case(row, future_key="two_score_wide_proposal_beam") for row in rows]
     return {
         "number_of_selected_questions": len(rows),
         "baseline_hits_at_1": avg_bool(item["hits_at_1"] for item in baseline),
         "proof_state_hits_at_1": avg_bool(item["hits_at_1"] for item in proof),
         "two_score_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score),
         "two_score_fixed_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_fixed),
+        "two_score_wide_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_wide),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
         "proof_state_exact_match": avg_bool(item["exact_match"] for item in proof),
         "two_score_exact_match": avg_bool(item["exact_match"] for item in two_score),
         "two_score_fixed_exact_match": avg_bool(item["exact_match"] for item in two_score_fixed),
+        "two_score_wide_exact_match": avg_bool(item["exact_match"] for item in two_score_wide),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
         "proof_state_final_answer_f1": avg(item["final_answer_f1"] for item in proof),
         "two_score_final_answer_f1": avg(item["final_answer_f1"] for item in two_score),
         "two_score_fixed_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_fixed),
+        "two_score_wide_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_wide),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
         "proof_state_gold_generated_rate": avg_bool(item["gold_generated"] for item in proof),
         "two_score_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score),
         "two_score_fixed_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_fixed),
+        "two_score_wide_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_wide),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
         "average_candidate_count_proof_state": avg(item["candidate_count"] for item in proof),
         "average_candidate_count_two_score": avg(item["candidate_count"] for item in two_score),
         "average_candidate_count_two_score_fixed": avg(item["candidate_count"] for item in two_score_fixed),
+        "average_candidate_count_two_score_wide": avg(item["candidate_count"] for item in two_score_wide),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
         "average_expansion_count_proof_state": avg(item["expansion_count"] for item in proof),
         "average_expansion_count_two_score": avg(item["expansion_count"] for item in two_score),
         "average_expansion_count_two_score_fixed": avg(item["expansion_count"] for item in two_score_fixed),
+        "average_expansion_count_two_score_wide": avg(item["expansion_count"] for item in two_score_wide),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
         "average_final_result_size_proof_state": avg(item["final_result_size"] for item in proof),
         "average_final_result_size_two_score": avg(item["final_result_size"] for item in two_score),
         "average_final_result_size_two_score_fixed": avg(item["final_result_size"] for item in two_score_fixed),
+        "average_final_result_size_two_score_wide": avg(item["final_result_size"] for item in two_score_wide),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
@@ -2511,6 +2674,22 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["two_score_proof_state_beam"]["final_answer_f1"] > row["two_score_fixed_proof_state_beam"]["final_answer_f1"]
         ),
+        "two_score_wide_wins_over_two_score_fixed": sum(
+            1 for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["two_score_fixed_proof_state_beam"]["final_answer_f1"]
+        ),
+        "two_score_fixed_wins_over_two_score_wide": sum(
+            1 for row in rows
+            if row["two_score_fixed_proof_state_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ),
+        "two_score_wide_wins_over_baseline": sum(
+            1 for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
+        ),
+        "baseline_wins_over_two_score_wide": sum(
+            1 for row in rows
+            if row["baseline_path_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ),
         "future_aware_wins_over_current_proof_state": sum(
             1 for row in rows
             if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
@@ -2539,13 +2718,13 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["hits_at_1"]
             and row["soft_proof_state_beam"]["hits_at_1"]
-            and row["two_score_fixed_proof_state_beam"]["hits_at_1"]
+            and row["two_score_wide_proposal_beam"]["hits_at_1"]
         ),
         "both_fail": sum(
             1 for row in rows
             if not row["baseline_path_beam"]["hits_at_1"]
             and not row["soft_proof_state_beam"]["hits_at_1"]
-            and not row["two_score_fixed_proof_state_beam"]["hits_at_1"]
+            and not row["two_score_wide_proposal_beam"]["hits_at_1"]
         ),
         "future_aware_avoids_surface_convergence": sum(
             1 for row in rows
@@ -2612,24 +2791,40 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["two_score_fixed_proof_state_beam"]["gold_generated"] and not row["two_score_fixed_proof_state_beam"]["hits_at_1"]
         ),
+        "two_score_wide_repeats_baseline_mistake": sum(
+            1 for case in two_score_wide_overlap
+            if case["future_repeats_baseline_mistake"]
+        ),
+        "two_score_wide_same_first_hop_as_baseline": sum(
+            1 for case in two_score_wide_overlap
+            if case["same_first_hop_relation_as_baseline"]
+        ),
+        "two_score_wide_same_drift_family_as_baseline": sum(
+            1 for case in two_score_wide_overlap
+            if case["same_drift_family_as_baseline"]
+        ),
+        "two_score_wide_gold_generated_but_ranked_low": sum(
+            1 for row in rows
+            if row["two_score_wide_proposal_beam"]["gold_generated"] and not row["two_score_wide_proposal_beam"]["hits_at_1"]
+        ),
         "failure_counts": dict(Counter(row["failure_type"] for row in rows)),
     }
 
 
 def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     lines = [
-        "# Two-Score Fixed Proof-State Search Smoke Test",
+        "# Two-Score Wide-Proposal Proof-State Search Smoke Test",
         "",
-        "This tests whether the minimal fixed two-score version improves candidate survival in simple KQA Pro two-hop search.",
+        "This tests whether widening the lexical relation proposal pool improves candidate survival before fixed two-score beam pruning.",
         "",
         "No gold relation IDs, gold prefixes, relation cards, LLM constraint extraction, ToG/Freebase, or quantum-inspired scoring are used during search.",
         "",
-        "The main comparison is `baseline_path_beam` vs current `soft_proof_state_beam` vs `two_score_fixed_proof_state_beam`. The legacy `two_score_proof_state_beam` is still logged for comparison.",
+        "The main comparison is `two_score_fixed_proof_state_beam` vs `two_score_wide_proposal_beam`. The scorer is unchanged; only the internal relation proposal pool is widened.",
         "",
-        "Two-score fixed constants:",
+        "Two-score wide-proposal constants:",
         "",
         "```json",
-        json.dumps(TWO_SCORE_FIXED_CONSTANTS, indent=2, sort_keys=True),
+        json.dumps(TWO_SCORE_WIDE_PROPOSAL_CONSTANTS, indent=2, sort_keys=True),
         "```",
         "",
         "## Metrics",
@@ -2638,18 +2833,24 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## Two-Score Wide Wins Over Two-Score Fixed",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_two_score_fixed"), limit=5),
+        "## Two-Score Fixed Wins Over Two-Score Wide",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_two_score_wide"), limit=5),
+        "## Two-Score Wide Wins Over Baseline",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_baseline"), limit=5),
+        "## Baseline Wins Over Two-Score Wide",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "baseline_over_two_score_wide"), limit=5),
         "## Two-Score Fixed Wins Over Current Proof-State",
         "",
         *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_current"), limit=5),
         "## Current Proof-State Wins Over Two-Score Fixed",
         "",
         *debug_section_rows(select_debug_rows(rows, "current_over_two_score_fixed"), limit=5),
-        "## Two-Score Fixed Wins Over Baseline",
-        "",
-        *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_baseline"), limit=5),
-        "## Baseline Wins Over Two-Score Fixed",
-        "",
-        *debug_section_rows(select_debug_rows(rows, "baseline_over_two_score_fixed"), limit=5),
         "## Two-Score Fixed Wins Over Legacy Two-Score",
         "",
         *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_two_score"), limit=5),
@@ -2674,6 +2875,10 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for kind in [
+        "two_score_wide_over_two_score_fixed",
+        "two_score_fixed_over_two_score_wide",
+        "two_score_wide_over_baseline",
+        "baseline_over_two_score_wide",
         "two_score_fixed_over_current",
         "current_over_two_score_fixed",
         "two_score_fixed_over_baseline",
@@ -2725,26 +2930,31 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "proof_state_correct": row["soft_proof_state_beam"]["hits_at_1"],
         "two_score_correct": row["two_score_proof_state_beam"]["hits_at_1"],
         "two_score_fixed_correct": row["two_score_fixed_proof_state_beam"]["hits_at_1"],
+        "two_score_wide_correct": row["two_score_wide_proposal_beam"]["hits_at_1"],
         "future_aware_correct": row["future_aware_proof_state_beam"]["hits_at_1"],
         "future_aware_v2_correct": row["future_aware_v2_proof_state_beam"]["hits_at_1"],
         "baseline_top_answer": row["baseline_path_beam"]["top_answer"],
         "proof_state_top_answer": row["soft_proof_state_beam"]["top_answer"],
         "two_score_top_answer": row["two_score_proof_state_beam"]["top_answer"],
         "two_score_fixed_top_answer": row["two_score_fixed_proof_state_beam"]["top_answer"],
+        "two_score_wide_top_answer": row["two_score_wide_proposal_beam"]["top_answer"],
         "future_aware_top_answer": row["future_aware_proof_state_beam"]["top_answer"],
         "future_aware_v2_top_answer": row["future_aware_v2_proof_state_beam"]["top_answer"],
         "baseline_debug_trace": row["baseline_path_beam"].get("debug_trace", []),
         "proof_state_debug_trace": row["soft_proof_state_beam"].get("debug_trace", []),
         "two_score_debug_trace": row["two_score_proof_state_beam"].get("debug_trace", []),
         "two_score_fixed_debug_trace": row["two_score_fixed_proof_state_beam"].get("debug_trace", []),
+        "two_score_wide_debug_trace": row["two_score_wide_proposal_beam"].get("debug_trace", []),
         "future_aware_debug_trace": row["future_aware_proof_state_beam"].get("debug_trace", []),
         "future_aware_v2_debug_trace": row["future_aware_v2_proof_state_beam"].get("debug_trace", []),
         "two_score_constants": TWO_SCORE_CONSTANTS,
         "two_score_fixed_constants": TWO_SCORE_FIXED_CONSTANTS,
+        "two_score_wide_constants": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
         "future_aware_v2_constants": FUTURE_AWARE_V2_CONSTANTS,
         "explanation": proof_state_choice_explanation(row),
         "two_score_explanation": two_score_choice_explanation(row),
         "two_score_fixed_explanation": two_score_fixed_choice_explanation(row),
+        "two_score_wide_explanation": two_score_wide_choice_explanation(row),
         "future_aware_explanation": future_aware_choice_explanation(row),
         "future_aware_v2_explanation": future_aware_v2_choice_explanation(row),
     }
@@ -2764,12 +2974,14 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         proof = row["soft_proof_state_beam"]
         two_score = row["two_score_proof_state_beam"]
         two_score_fixed = row["two_score_fixed_proof_state_beam"]
+        two_score_wide = row["two_score_wide_proposal_beam"]
         future = row["future_aware_proof_state_beam"]
         future_v2 = row["future_aware_v2_proof_state_beam"]
         baseline_top = baseline["top_answer"] or {}
         proof_top = proof["top_answer"] or {}
         two_score_top = two_score["top_answer"] or {}
         two_score_fixed_top = two_score_fixed["top_answer"] or {}
+        two_score_wide_top = two_score_wide["top_answer"] or {}
         future_top = future["top_answer"] or {}
         future_v2_top = future_v2["top_answer"] or {}
         lines.extend(
@@ -2788,6 +3000,8 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"Two-score fixed top final state: {top_path_readable(two_score_fixed_top)}",
                 "",
+                f"Two-score wide top final state: {top_path_readable(two_score_wide_top)}",
+                "",
                 f"Future-aware top final state: {top_path_readable(future_top)}",
                 "",
                 f"Future-aware v2 top final state: {top_path_readable(future_v2_top)}",
@@ -2796,6 +3010,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 f"Proof-state correct: `{proof['hits_at_1']}`",
                 f"Two-score correct: `{two_score['hits_at_1']}`",
                 f"Two-score fixed correct: `{two_score_fixed['hits_at_1']}`",
+                f"Two-score wide correct: `{two_score_wide['hits_at_1']}`",
                 f"Future-aware correct: `{future['hits_at_1']}`",
                 f"Future-aware v2 correct: `{future_v2['hits_at_1']}`",
                 "",
@@ -2811,6 +3026,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Two-Score Fixed Proof-State Hop Trace",
                 "",
                 *two_score_trace_lines(two_score_fixed.get("debug_trace", [])),
+                "### Two-Score Wide-Proposal Proof-State Hop Trace",
+                "",
+                *two_score_trace_lines(two_score_wide.get("debug_trace", [])),
                 "### Future-Aware Proof-State Hop Trace",
                 "",
                 *future_aware_trace_lines(future.get("debug_trace", [])),
@@ -2826,6 +3044,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Why Two-Score Fixed Chose This",
                 "",
                 *two_score_fixed_choice_explanation(row),
+                "### Why Two-Score Wide Chose This",
+                "",
+                *two_score_wide_choice_explanation(row),
                 "### Why Future-Aware Chose This",
                 "",
                 *future_aware_choice_explanation(row),
@@ -3095,6 +3316,16 @@ def two_score_fixed_choice_explanation(row: dict[str, Any]) -> list[str]:
     )
 
 
+def two_score_wide_choice_explanation(row: dict[str, Any]) -> list[str]:
+    return two_score_choice_explanation_for(
+        row,
+        key="two_score_wide_proposal_beam",
+        label="two-score wide proposal",
+        compare_key="two_score_fixed_proof_state_beam",
+        compare_label="two-score fixed",
+    )
+
+
 def two_score_choice_explanation_for(
     row: dict[str, Any],
     key: str,
@@ -3241,7 +3472,27 @@ def escape_md(value: Any) -> str:
 
 
 def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    if kind == "two_score_fixed_over_current":
+    if kind == "two_score_wide_over_two_score_fixed":
+        selected = [
+            row for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["two_score_fixed_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_fixed_over_two_score_wide":
+        selected = [
+            row for row in rows
+            if row["two_score_fixed_proof_state_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_wide_over_baseline":
+        selected = [
+            row for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
+        ]
+    elif kind == "baseline_over_two_score_wide":
+        selected = [
+            row for row in rows
+            if row["baseline_path_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_fixed_over_current":
         selected = [
             row for row in rows
             if row["two_score_fixed_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
@@ -3339,12 +3590,14 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         proof_top = row["soft_proof_state_beam"]["top_answer"] or {}
         two_score_top = row["two_score_proof_state_beam"]["top_answer"] or {}
         two_score_fixed_top = row["two_score_fixed_proof_state_beam"]["top_answer"] or {}
+        two_score_wide_top = row["two_score_wide_proposal_beam"]["top_answer"] or {}
         future_top = row["future_aware_proof_state_beam"]["top_answer"] or {}
         future_v2_top = row["future_aware_v2_proof_state_beam"]["top_answer"] or {}
         baseline_path = top_path_readable(baseline_top)
         proof_path = top_path_readable(proof_top)
         two_score_path = top_path_readable(two_score_top)
         two_score_fixed_path = top_path_readable(two_score_fixed_top)
+        two_score_wide_path = top_path_readable(two_score_wide_top)
         future_path = top_path_readable(future_top)
         future_v2_path = top_path_readable(future_v2_top)
         likely = likely_reason(row)
@@ -3361,6 +3614,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
                 f"- Two-score evidence: {two_score_path}",
                 f"- Two-score fixed top answer: `{two_score_fixed_top.get('answer_label', '')}`",
                 f"- Two-score fixed evidence: {two_score_fixed_path}",
+                f"- Two-score wide top answer: `{two_score_wide_top.get('answer_label', '')}`",
+                f"- Two-score wide evidence: {two_score_wide_path}",
                 f"- Future-aware top answer: `{future_top.get('answer_label', '')}`",
                 f"- Future-aware evidence: {future_path}",
                 f"- Future-aware v2 top answer: `{future_v2_top.get('answer_label', '')}`",
@@ -3398,6 +3653,8 @@ def build_error_overlap(
     summary["diagnostic_future_mode"] = diagnostic_label
     if future_key == "two_score_fixed_proof_state_beam":
         summary["diagnostic_constants"] = TWO_SCORE_FIXED_CONSTANTS
+    elif future_key == "two_score_wide_proposal_beam":
+        summary["diagnostic_constants"] = TWO_SCORE_WIDE_PROPOSAL_CONSTANTS
     elif future_key == "two_score_proof_state_beam":
         summary["diagnostic_constants"] = TWO_SCORE_CONSTANTS
     else:
@@ -3733,6 +3990,8 @@ def build_target_gold_survival_case(
     hop1_all = audit_states_for_hop(audit_trace, 1)
     hop1_selected = audit_selected_states_for_hop(audit_trace, 1)
     hop2_all = audit_states_for_hop(audit_trace, 2)
+    proposal_k = target_relation_proposal_k(target_result, args)
+    relation_survival = gold_relation_survival_diagnostics(graph, row, args, proposal_k, hop1_all, hop1_selected, hop2_all)
     final_gold_candidates = [candidate for candidate in target_result.get("candidate_answers", []) if candidate.get("is_gold")]
     final_gold_candidates.sort(key=lambda item: int(item.get("rank", 999999)))
     gold_hop2_states = [state for state in hop2_all if str(state.get("target_entity", "")) in gold_ids]
@@ -3743,11 +4002,11 @@ def build_target_gold_survival_case(
 
     selected_reaching_hop1 = [
         state for state in hop1_selected
-        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=args.top_k)
+        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=proposal_k)
     ]
     generated_reaching_hop1 = [
         state for state in hop1_all
-        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=args.top_k)
+        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=proposal_k)
     ]
     raw_reaching_hop1 = find_raw_reaching_hop1_states(graph, row, args)
 
@@ -3785,6 +4044,7 @@ def build_target_gold_survival_case(
         "question": row["question"],
         "gold_answers": row["gold_answers"],
         "gold_survival_stage": stage,
+        **relation_survival,
         "target_top_state": top_path_readable_plain(top_candidate),
         "target_top_answer": top_candidate.get("answer_label", ""),
         "target_top_retention_score": top_breakdown["retention_score"],
@@ -4117,6 +4377,79 @@ def find_raw_reaching_hop1_states(graph: KnowledgeGraph, row: dict[str, Any], ar
                 if state_can_reach_gold_next_hop(graph, row, state, args, top_k=None):
                     out.append(state)
     return out
+
+
+def target_relation_proposal_k(target_result: dict[str, Any], args: argparse.Namespace) -> int:
+    for hop_trace in target_result.get("audit_trace", []):
+        if "relation_proposal_k" in hop_trace:
+            return int(hop_trace["relation_proposal_k"])
+        constants = hop_trace.get("constants", {}) or {}
+        if "relation_proposal_k" in constants:
+            return int(float(constants["relation_proposal_k"]))
+    return int(args.top_k)
+
+
+def gold_relation_survival_diagnostics(
+    graph: KnowledgeGraph,
+    row: dict[str, Any],
+    args: argparse.Namespace,
+    proposal_k: int,
+    hop1_all: list[dict[str, Any]],
+    hop1_selected: list[dict[str, Any]],
+    hop2_all: list[dict[str, Any]],
+) -> dict[str, Any]:
+    steps = row.get("gold_relation_steps", [])
+    first = steps[0] if len(steps) >= 1 else {}
+    second = steps[1] if len(steps) >= 2 else {}
+    start_ids = set(str(entity_id) for entity_id in row.get("start_entity", {}).get("entity_ids", []))
+    first_rank = relation_rank_in_frontier(graph, row["question"], start_ids, first, args)
+    first_targets, _ = graph.follow(start_ids, first.get("relation_id", ""), first.get("direction", ""), max_proofs=10000) if first else (set(), [])
+    second_rank = relation_rank_in_frontier(graph, row["question"], first_targets, second, args)
+    first_expanded = relation_step_seen_in_states(hop1_all, first, hop=1)
+    first_selected = relation_step_seen_in_states(hop1_selected, first, hop=1)
+    second_expanded = relation_step_seen_in_states(hop2_all, second, hop=2)
+    return {
+        "relation_proposal_k": proposal_k,
+        "gold_first_hop_relation_rank_before_proposal": first_rank,
+        "was_gold_first_hop_in_relation_proposal": bool(first_rank and first_rank <= proposal_k),
+        "was_gold_first_hop_expanded": first_expanded,
+        "was_gold_first_hop_pruned_by_beam": bool(first_rank and first_rank <= proposal_k and first_expanded and not first_selected),
+        "gold_second_hop_relation_rank_before_proposal": second_rank,
+        "was_gold_second_hop_in_relation_proposal": bool(second_rank and second_rank <= proposal_k),
+        "was_gold_second_hop_expanded": second_expanded,
+        "was_gold_second_hop_pruned_by_beam": bool(second_expanded and not any(str(state.get("target_entity", "")) in set(row["gold_answer_ids"]) for state in hop2_all[:int(args.beam_width)])),
+    }
+
+
+def relation_rank_in_frontier(
+    graph: KnowledgeGraph,
+    question: str,
+    source_ids: set[str],
+    gold_step: dict[str, str],
+    args: argparse.Namespace,
+) -> int | None:
+    if not source_ids or not gold_step:
+        return None
+    frontier = graph.candidate_relations(source_ids, cap=args.relation_cap, sample_entities=args.sample_entities)
+    ranked = rank_relations(question, frontier)
+    for index, candidate in enumerate(ranked, start=1):
+        if candidate["relation_id"] == gold_step.get("relation_id") and candidate["direction"] == gold_step.get("direction"):
+            return index
+    return None
+
+
+def relation_step_seen_in_states(states: list[dict[str, Any]], gold_step: dict[str, str], hop: int) -> bool:
+    if not gold_step:
+        return False
+    for state in states:
+        for step in state.get("evidence", []) or []:
+            if (
+                int(step.get("hop", 0) or 0) == hop
+                and step.get("relation_id") == gold_step.get("relation_id")
+                and step.get("direction") == gold_step.get("direction")
+            ):
+                return True
+    return False
 
 
 def gold_hop1_rank(hop1_all: list[dict[str, Any]], best_gold_state: dict[str, Any] | None) -> int | None:
@@ -4584,15 +4917,22 @@ def build_two_score_code_behavior_audit(
                 "scoring_function": "two_score_fixed_fragment_signals",
                 "final_answer_ranker": "search_result(answer_score_key='final_proof_score')",
             },
+            "two_score_wide_proposal_beam": {
+                "file": "rc_mex/run_proof_state_search_smoke.py",
+                "search_function": "run_two_score_wide_proposal_beam",
+                "scoring_function": "two_score_fixed_fragment_signals",
+                "final_answer_ranker": "search_result(answer_score_key='final_proof_score')",
+            },
         },
         "exact_formulas": two_score_formula_notes(),
         "order_of_operations": {
             **order_of_operations_notes(),
             "two_score_specific": [
+                "Local relation candidates are ranked lexically first. The fixed mode expands ranked[:top_k]; wide-proposal mode expands ranked[:RELATION_PROPOSAL_K].",
                 "Beam retention sorts by cumulative SearchState.score, which is cumulative retention_score.",
                 "Final answer ranking calls search_result(..., answer_score_key='final_proof_score'), so grouped answers are ranked by final proof score.",
                 "Future satisfiability appears in retention as future_retention_bonus but is not a direct positive term in final_proof_score.",
-                f"No hard first-hop diversity pruning is applied in {target_key}.",
+                f"No hard first-hop diversity pruning is applied in {target_key}; wide proposal only changes pre-scoring relation proposal size.",
             ],
         },
         "gate_behavior": two_score_gate_behavior_notes(states),
@@ -4609,7 +4949,7 @@ def build_two_score_code_behavior_audit(
             ),
         },
         "first_hop_diversity": {
-            "implementation": f"No hard first-hop diversity pruning in {target_key}.",
+            "implementation": f"No hard first-hop diversity pruning in {target_key}. Wide proposal keeps beam width fixed and only widens relation proposal before scoring.",
             "relation_family_definition": "relation_family_from_text is used only for soft diversity/drift diagnostics.",
             "family_limit": None,
             "when_applied": "Not applied as pruning.",
@@ -4698,6 +5038,11 @@ def two_score_formula_notes() -> dict[str, dict[str, Any]]:
         "final_proof_score_delta": "0.55*proof_role_coverage + 0.20*answer_type_compatibility + 0.25*current_relevance + useful_convergence + unresolved_need_penalty + hard_loop_penalty + semantic_level_drift_penalty + surface_convergence_penalty + redundancy_penalty",
         "future_in_final_score": "No large future bonus is included in final_proof_score; future is retention-only.",
         "final_answer_score": "search_result sums final_proof_score over retained paths to each answer; best final proof path is tie-breaker",
+    }
+    formulas["two_score_wide_proposal_beam"] = {
+        **formulas["two_score_fixed_proof_state_beam"],
+        "relation_proposal": "At each hop, rank relations lexically as before but expand ranked[:RELATION_PROPOSAL_K] instead of ranked[:top_k]. RELATION_PROPOSAL_K is hard-coded.",
+        "beam_retention": "After fixed two-score retention scoring, keep only beam_width states. Wide proposal does not increase final beam width.",
     }
     return formulas
 
@@ -5574,12 +5919,14 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     proof = row["soft_proof_state_beam"]
     two_score = row["two_score_proof_state_beam"]
     two_score_fixed = row["two_score_fixed_proof_state_beam"]
+    two_score_wide = row["two_score_wide_proposal_beam"]
     future = row["future_aware_proof_state_beam"]
     future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
     proof_top = proof["top_answer"] or {}
     two_score_top = two_score["top_answer"] or {}
     two_score_fixed_top = two_score_fixed["top_answer"] or {}
+    two_score_wide_top = two_score_wide["top_answer"] or {}
     future_top = future["top_answer"] or {}
     future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
@@ -5590,18 +5937,21 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Proof-state top answer: {proof_top.get('answer_label', '<none>')}", flush=True)
     print(f"Two-score top answer: {two_score_top.get('answer_label', '<none>')}", flush=True)
     print(f"Two-score fixed top answer: {two_score_fixed_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Two-score wide top answer: {two_score_wide_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated proof-state: {'yes' if proof['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated two-score: {'yes' if two_score['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated two-score fixed: {'yes' if two_score_fixed['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated two-score wide: {'yes' if two_score_wide['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
     print(f"Proof-state evidence: {top_path_readable(proof_top)}", flush=True)
     print(f"Two-score evidence: {top_path_readable(two_score_top)}", flush=True)
     print(f"Two-score fixed evidence: {top_path_readable(two_score_fixed_top)}", flush=True)
+    print(f"Two-score wide evidence: {top_path_readable(two_score_wide_top)}", flush=True)
     print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
     print(f"Future-aware v2 evidence: {top_path_readable(future_v2_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)
