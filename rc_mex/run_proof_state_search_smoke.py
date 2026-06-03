@@ -136,11 +136,21 @@ def main() -> None:
     error_overlap = build_error_overlap(rows)
     write_json(output_dir / "error_overlap.json", error_overlap)
     (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
+    gold_survival_audit = build_gold_survival_audit(graph, rows, args)
+    behavior_audit = build_behavior_audit(rows, gold_survival_audit)
+    write_json(output_dir / "gold_survival_audit.json", gold_survival_audit)
+    (output_dir / "gold_survival_audit.md").write_text(write_gold_survival_audit_markdown(gold_survival_audit), encoding="utf-8")
+    write_json(output_dir / "behavior_audit.json", behavior_audit)
+    (output_dir / "behavior_audit.md").write_text(write_behavior_audit_markdown(behavior_audit), encoding="utf-8")
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
     log_line("error_overlap.json")
     log_line("error_overlap.md")
+    log_line("gold_survival_audit.json")
+    log_line("gold_survival_audit.md")
+    log_line("behavior_audit.json")
+    log_line("behavior_audit.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -590,6 +600,7 @@ def run_future_aware_v2_proof_state_beam(
     ]
     expansion_count = 0
     trace: list[dict[str, Any]] = []
+    audit_trace: list[dict[str, Any]] = []
     for hop in [1, 2]:
         next_states: list[SearchState] = []
         for state in states:
@@ -647,23 +658,33 @@ def run_future_aware_v2_proof_state_beam(
             )
         else:
             selected_states = next_states[:beam_width]
+        all_summaries = [
+            summarize_future_aware_v2_state(state, rank)
+            for rank, state in enumerate(next_states, start=1)
+        ]
+        selected_summaries = [
+            summarize_future_aware_v2_state(state, rank)
+            for rank, state in enumerate(selected_states, start=1)
+        ]
+        audit_trace.append(
+            {
+                "hop": hop,
+                "all_candidate_states": all_summaries,
+                "selected_states": selected_summaries,
+                "constants": FUTURE_AWARE_V2_CONSTANTS,
+            }
+        )
         if debug_trace:
             trace.append(
                 {
                     "hop": hop,
-                    "top_candidate_states": [
-                        summarize_future_aware_v2_state(state, rank)
-                        for rank, state in enumerate(next_states[:5], start=1)
-                    ],
-                    "selected_states": [
-                        summarize_future_aware_v2_state(state, rank)
-                        for rank, state in enumerate(selected_states[:5], start=1)
-                    ],
+                    "top_candidate_states": all_summaries[:5],
+                    "selected_states": selected_summaries[:5],
                     "constants": FUTURE_AWARE_V2_CONSTANTS,
                 }
             )
         states = selected_states
-    return search_result(
+    result = search_result(
         graph,
         states,
         example.gold_answer_ids,
@@ -671,6 +692,8 @@ def run_future_aware_v2_proof_state_beam(
         mode="future_aware_v2_proof_state_beam",
         debug_trace=trace,
     )
+    result["audit_trace"] = audit_trace
+    return result
 
 
 def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
@@ -1475,11 +1498,16 @@ def summarize_future_aware_state(state: SearchState, rank: int) -> dict[str, Any
 
 
 def summarize_future_aware_v2_state(state: SearchState, rank: int) -> dict[str, Any]:
+    target_entity = next(iter(state.frontier_ids), "")
+    last_step = state.evidence[-1] if state.evidence else {}
     return {
         "rank": rank,
         "hop": state.evidence[-1].get("hop") if state.evidence else None,
         "candidate_evidence_state": " | ".join(step["readable"] for step in state.evidence),
         "fragments": [step["readable"] for step in state.evidence],
+        "evidence": state.evidence,
+        "target_entity": target_entity,
+        "target_label": last_step.get("to_entity", ""),
         "current_relevance": state.soft_signals.get("current_relevance", 0.0),
         "raw_future_bonus": state.soft_signals.get("raw_future_bonus", 0.0),
         "future_bonus_capped": state.soft_signals.get("future_bonus_capped", 0.0),
@@ -1496,7 +1524,6 @@ def summarize_future_aware_v2_state(state: SearchState, rank: int) -> dict[str, 
         "redundancy_penalty": state.soft_signals.get("redundancy_penalty", 0.0),
         "noisy_branch_penalty": state.soft_signals.get("noisy_branch_penalty", 0.0),
         "final_score": state.score,
-        "target_entity": next(iter(state.frontier_ids), ""),
     }
 
 
@@ -2334,6 +2361,588 @@ def error_overlap_case(row: dict[str, Any], future_key: str = "future_aware_proo
         "penalties_tiny_compared_with_positive_terms": penalties_tiny,
         "score_breakdown": score_breakdown,
     }
+
+
+V2_COMPONENT_KEYS = [
+    "current_relevance",
+    "raw_future_bonus",
+    "future_bonus_capped",
+    "role_gate",
+    "non_drift_gate",
+    "non_loop_gate",
+    "gated_future_bonus",
+    "useful_convergence",
+    "type_compatibility",
+    "progress",
+    "surface_convergence_penalty",
+    "loop_penalty",
+    "drift_penalty",
+    "redundancy_penalty",
+    "noisy_branch_penalty",
+    "final_score",
+]
+
+
+def build_behavior_audit(rows: list[dict[str, Any]], gold_survival_audit: dict[str, Any]) -> dict[str, Any]:
+    survival_by_question = {case["question_id"]: case for case in gold_survival_audit.get("cases", [])}
+    cases = []
+    for row in rows:
+        survival = survival_by_question.get(row["question_id"], {})
+        cases.append(build_behavior_case(row, survival))
+    label_counts = Counter(label for case in cases for label in case["behavior_labels"])
+    changed_first_cases = [case for case in cases if not case["same_first_hop_relation_as_baseline"]]
+    summary = {
+        "total_questions": len(cases),
+        "behavior_label_counts": dict(label_counts),
+        "v2_changes_first_hop_away_from_baseline": len(changed_first_cases),
+        "v2_first_hop_change_helps": sum(
+            1 for case in changed_first_cases
+            if case["future_aware_v2_correct"] and not case["baseline_correct"]
+        ),
+        "v2_first_hop_change_hurts": sum(
+            1 for case in changed_first_cases
+            if not case["future_aware_v2_correct"]
+            and (case["baseline_correct"] or case["current_proof_state_correct"] or case["future_aware_v1_correct"])
+        ),
+        "v2_repeats_baseline_mistake": label_counts["repeated_baseline_mistake"],
+        "v2_changes_to_new_wrong_mistake": label_counts["changed_to_new_wrong_drift"],
+        "v2_over_penalizes_valid_convergence": label_counts["over_penalized_valid_convergence"],
+        "v2_under_penalizes_bad_drift": label_counts["under_penalized_generic_branch"],
+        "v2_picks_wrong_sibling_answer": label_counts["picked_wrong_sibling_answer"],
+        "penalties_too_weak": label_counts["under_penalized_generic_branch"] + label_counts["under_penalized_loop"],
+        "penalties_too_strong": label_counts["over_penalized_valid_convergence"] + label_counts["over_penalized_valid_bidirectional_evidence"],
+    }
+    return {
+        "summary": summary,
+        "cases": cases,
+    }
+
+
+def build_behavior_case(row: dict[str, Any], survival: dict[str, Any]) -> dict[str, Any]:
+    overlap = error_overlap_case(row, future_key="future_aware_v2_proof_state_beam")
+    baseline = row["baseline_path_beam"]
+    current = row["soft_proof_state_beam"]
+    future_v1 = row["future_aware_proof_state_beam"]
+    future_v2 = row["future_aware_v2_proof_state_beam"]
+    v2_top = future_v2.get("top_answer") or {}
+    v2_breakdown = full_v2_score_breakdown_from_candidate(v2_top)
+    labels: list[str] = []
+
+    if future_v2["hits_at_1"]:
+        if not baseline["hits_at_1"] and not overlap["same_drift_family_as_baseline"]:
+            labels.append("avoided_baseline_drift")
+        if current["hits_at_1"] or future_v1["hits_at_1"] or baseline["hits_at_1"]:
+            labels.append("kept_good_alternative")
+        if v2_breakdown["gated_future_bonus"] > 0.05:
+            labels.append("preserved_useful_future_path")
+    else:
+        if future_v2["gold_generated"]:
+            labels.append("gold_generated_but_ranked_low")
+        else:
+            labels.append("gold_not_generated")
+        if overlap["future_repeats_baseline_mistake"]:
+            labels.append("repeated_baseline_mistake")
+        elif not baseline["hits_at_1"]:
+            labels.append("changed_to_new_wrong_drift")
+        if future_v1["hits_at_1"]:
+            labels.append("killed_useful_future_path")
+        if survival.get("gold_survival_stage") == "gold_answer_generated_but_ranked_low":
+            labels.append("picked_wrong_sibling_answer")
+
+    diagnoses = set(survival.get("diagnosis", []))
+    if {
+        "loop_penalty_false_positive_on_gold",
+        "surface_convergence_false_positive_on_gold",
+    } & diagnoses:
+        labels.append("over_penalized_valid_convergence")
+    if "loop_penalty_false_positive_on_gold" in diagnoses:
+        labels.append("over_penalized_valid_bidirectional_evidence")
+    if future_v2["hits_at_1"] is False and generic_bad_drift_family(overlap["future_aware_drift_family"]):
+        if v2_breakdown["penalty_to_positive_ratio"] < 0.35 or (
+            v2_breakdown["drift_penalty"] == 0.0 and v2_breakdown["loop_penalty"] == 0.0
+        ):
+            labels.append("under_penalized_generic_branch")
+    if future_v2["hits_at_1"] is False and overlap["future_aware_drift_family"] in {"inverse_loop", "generic_relation_loop"}:
+        if v2_breakdown["loop_penalty"] == 0.0:
+            labels.append("under_penalized_loop")
+    if future_v2["hits_at_1"] is False and (
+        v2_breakdown["gated_future_bonus"] >= 0.18 or v2_breakdown["current_relevance"] >= 0.45
+    ):
+        labels.append("followed_surface_future_match")
+
+    return {
+        "question_id": row["question_id"],
+        "question": row["question"],
+        "gold_answers": row["gold_answers"],
+        "baseline_top_path": top_path_readable_plain(baseline.get("top_answer") or {}),
+        "current_proof_state_top_path": top_path_readable_plain(current.get("top_answer") or {}),
+        "future_aware_v1_top_path": top_path_readable_plain(future_v1.get("top_answer") or {}),
+        "future_aware_v2_top_path": top_path_readable_plain(v2_top),
+        "baseline_correct": baseline["hits_at_1"],
+        "current_proof_state_correct": current["hits_at_1"],
+        "future_aware_v1_correct": future_v1["hits_at_1"],
+        "future_aware_v2_correct": future_v2["hits_at_1"],
+        "future_aware_v2_drift_family": overlap["future_aware_drift_family"],
+        "same_first_hop_relation_as_baseline": overlap["same_first_hop_relation_as_baseline"],
+        "same_relation_sequence_as_baseline": overlap["same_relation_sequence_as_baseline"],
+        "same_drift_family_as_baseline": overlap["same_drift_family_as_baseline"],
+        "gold_survival_stage": survival.get("gold_survival_stage", "unknown"),
+        "score_breakdown": {key: v2_breakdown.get(key, 0.0) for key in V2_COMPONENT_KEYS},
+        "behavior_labels": sorted(set(labels)) or ["unclear"],
+    }
+
+
+def build_gold_survival_audit(graph: KnowledgeGraph, rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    cases = [build_gold_survival_case(graph, row, args) for row in rows]
+    stage_counts = Counter(case["gold_survival_stage"] for case in cases)
+    diagnosis_counts = Counter(label for case in cases for label in case["diagnosis"])
+    summary = {
+        "total_questions": len(cases),
+        "stage_counts": dict(stage_counts),
+        "diagnosis_counts": dict(diagnosis_counts),
+        "number_of_pruning_failures": sum(1 for case in cases if "pruned" in case["gold_survival_stage"] or "removed" in case["gold_survival_stage"]),
+        "number_of_ranking_failures": stage_counts["gold_answer_generated_but_ranked_low"],
+        "number_of_first_hop_failures": sum(1 for case in cases if case["gold_survival_stage"] in {
+            "gold_never_in_local_frontier",
+            "gold_first_hop_available_but_pruned",
+            "gold_first_hop_removed_by_diversity",
+        }),
+        "number_of_second_hop_failures": sum(1 for case in cases if case["gold_survival_stage"] in {
+            "gold_first_hop_kept_but_second_hop_not_generated",
+            "gold_second_hop_generated_but_pruned",
+        }),
+        "number_of_false_positive_penalty_failures": sum(
+            1 for case in cases
+            if {
+                "drift_penalty_false_positive_on_gold",
+                "loop_penalty_false_positive_on_gold",
+                "surface_convergence_false_positive_on_gold",
+            } & set(case["diagnosis"])
+        ),
+        "number_of_bad_state_overreward_failures": sum(
+            1 for case in cases
+            if {
+                "bad_state_future_bonus_too_high",
+                "bad_state_current_relevance_too_high",
+                "bad_state_type_compatibility_too_high",
+            } & set(case["diagnosis"])
+        ),
+        "number_of_sibling_ambiguity_failures": diagnosis_counts["gold_sibling_ranked_lower"],
+    }
+    return {
+        "summary": summary,
+        "cases": cases,
+    }
+
+
+def build_gold_survival_case(graph: KnowledgeGraph, row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    future_v2 = row["future_aware_v2_proof_state_beam"]
+    gold_ids = set(str(entity_id) for entity_id in row["gold_answer_ids"])
+    top_candidate = future_v2.get("top_answer") or {}
+    top_breakdown = full_v2_score_breakdown_from_candidate(top_candidate)
+    audit_trace = future_v2.get("audit_trace", [])
+    hop1_all = audit_states_for_hop(audit_trace, 1)
+    hop1_selected = audit_selected_states_for_hop(audit_trace, 1)
+    hop2_all = audit_states_for_hop(audit_trace, 2)
+    final_gold_candidates = [candidate for candidate in future_v2.get("candidate_answers", []) if candidate.get("is_gold")]
+    final_gold_candidates.sort(key=lambda item: int(item.get("rank", 999999)))
+    gold_hop2_states = [state for state in hop2_all if str(state.get("target_entity", "")) in gold_ids]
+    best_gold_state = max(gold_hop2_states, key=lambda item: float(item.get("final_score", 0.0)), default=None)
+    best_final_gold = final_gold_candidates[0] if final_gold_candidates else None
+    if best_gold_state is None and best_final_gold is not None:
+        best_gold_state = state_summary_from_candidate(best_final_gold)
+
+    selected_reaching_hop1 = [
+        state for state in hop1_selected
+        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=args.top_k)
+    ]
+    generated_reaching_hop1 = [
+        state for state in hop1_all
+        if state_can_reach_gold_next_hop(graph, row, state, args, top_k=args.top_k)
+    ]
+    raw_reaching_hop1 = find_raw_reaching_hop1_states(graph, row, args)
+
+    if future_v2["hits_at_1"]:
+        stage = "gold_answer_top1"
+    elif final_gold_candidates:
+        stage = "gold_answer_generated_but_ranked_low"
+    elif gold_hop2_states:
+        stage = "gold_second_hop_generated_but_pruned"
+    elif selected_reaching_hop1:
+        stage = "gold_first_hop_kept_but_second_hop_not_generated"
+    elif generated_reaching_hop1:
+        first_rank = min(int(state.get("rank", 999999)) for state in generated_reaching_hop1)
+        selected_keys = {state_identity(state) for state in hop1_selected}
+        generated_keys = {state_identity(state) for state in generated_reaching_hop1}
+        if first_rank <= int(args.beam_width) and not (selected_keys & generated_keys):
+            stage = "gold_first_hop_removed_by_diversity"
+        else:
+            stage = "gold_first_hop_available_but_pruned"
+    elif raw_reaching_hop1:
+        stage = "gold_first_hop_available_but_pruned"
+    elif not audit_trace:
+        stage = "unclear"
+    else:
+        stage = "gold_never_in_local_frontier"
+
+    gold_breakdown = full_v2_score_breakdown_from_state(best_gold_state or {})
+    comparison = score_component_comparison(top_breakdown, gold_breakdown)
+    diagnosis = diagnose_gold_survival(
+        row=row,
+        stage=stage,
+        top_candidate=top_candidate,
+        best_gold_state=best_gold_state,
+        top_breakdown=top_breakdown,
+        gold_breakdown=gold_breakdown,
+        generated_reaching_hop1=generated_reaching_hop1,
+        hop1_selected=hop1_selected,
+    )
+    hop1_rank = gold_hop1_rank(hop1_all, best_gold_state)
+    hop2_rank = int(best_gold_state.get("rank", 0)) if best_gold_state else None
+    final_rank = int(best_final_gold.get("rank", 0)) if best_final_gold else None
+    return {
+        "question_id": row["question_id"],
+        "question": row["question"],
+        "gold_answers": row["gold_answers"],
+        "gold_survival_stage": stage,
+        "v2_top_state": top_path_readable_plain(top_candidate),
+        "v2_top_answer": top_candidate.get("answer_label", ""),
+        "v2_top_score": top_breakdown["final_score"],
+        "best_gold_state": state_readable(best_gold_state) if best_gold_state else "",
+        "hop_1_rank": hop1_rank,
+        "hop_2_rank": hop2_rank,
+        "final_rank": final_rank,
+        "final_score": gold_breakdown["final_score"],
+        "gold_candidate_states": [
+            {
+                "rank": state.get("rank"),
+                "path": state_readable(state),
+                "score": float(state.get("final_score", 0.0)),
+                "score_components": full_v2_score_breakdown_from_state(state),
+            }
+            for state in gold_hop2_states[:10]
+        ],
+        "v2_top_score_components": {key: top_breakdown.get(key, 0.0) for key in V2_COMPONENT_KEYS},
+        "best_gold_score_components": {key: gold_breakdown.get(key, 0.0) for key in V2_COMPONENT_KEYS},
+        "score_difference_top_minus_gold": comparison["score_difference_top_minus_gold"],
+        "components_favoring_wrong_top": comparison["components_favoring_wrong_top"],
+        "components_hurting_gold": comparison["components_hurting_gold"],
+        "diagnosis": diagnosis,
+    }
+
+
+def audit_states_for_hop(audit_trace: list[dict[str, Any]], hop: int) -> list[dict[str, Any]]:
+    for item in audit_trace:
+        if item.get("hop") == hop:
+            return list(item.get("all_candidate_states", []) or item.get("top_candidate_states", []))
+    return []
+
+
+def audit_selected_states_for_hop(audit_trace: list[dict[str, Any]], hop: int) -> list[dict[str, Any]]:
+    for item in audit_trace:
+        if item.get("hop") == hop:
+            return list(item.get("selected_states", []))
+    return []
+
+
+def state_identity(state: dict[str, Any]) -> str:
+    return f"{state.get('target_entity', '')}|{state.get('candidate_evidence_state', '')}"
+
+
+def state_can_reach_gold_next_hop(
+    graph: KnowledgeGraph,
+    row: dict[str, Any],
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    top_k: int | None,
+) -> bool:
+    source_id = str(state.get("target_entity", ""))
+    if not source_id:
+        return False
+    gold_ids = set(str(entity_id) for entity_id in row["gold_answer_ids"])
+    frontier = graph.candidate_relations([source_id], cap=args.relation_cap, sample_entities=args.sample_entities)
+    ranked = rank_relations(row["question"], frontier)
+    if top_k is not None:
+        ranked = ranked[:top_k]
+    for candidate in ranked:
+        targets = relation_targets(graph, source_id, candidate, args.max_branch_entities)
+        if gold_ids & set(targets):
+            return True
+    return False
+
+
+def find_raw_reaching_hop1_states(graph: KnowledgeGraph, row: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
+    out = []
+    for source_id in row["start_entity"].get("entity_ids", []):
+        frontier = graph.candidate_relations([source_id], cap=args.relation_cap, sample_entities=args.sample_entities)
+        for candidate in rank_relations(row["question"], frontier):
+            targets = relation_targets(graph, source_id, candidate, args.max_branch_entities)
+            for target_id in targets:
+                state = {
+                    "target_entity": target_id,
+                    "target_label": graph.entity_name(target_id),
+                    "candidate_evidence_state": f"{graph.entity_name(source_id)} --{candidate['relation_id']}[{candidate['direction']}]--> {graph.entity_name(target_id)}",
+                    "rank": len(out) + 1,
+                }
+                if state_can_reach_gold_next_hop(graph, row, state, args, top_k=None):
+                    out.append(state)
+    return out
+
+
+def gold_hop1_rank(hop1_all: list[dict[str, Any]], best_gold_state: dict[str, Any] | None) -> int | None:
+    if not best_gold_state:
+        return None
+    evidence = best_gold_state.get("evidence", []) or []
+    first_targets = {str(step.get("to_entity_id", "")) for step in evidence if step.get("hop") == 1}
+    ranks = [
+        int(state.get("rank", 999999))
+        for state in hop1_all
+        if str(state.get("target_entity", "")) in first_targets
+    ]
+    return min(ranks) if ranks else None
+
+
+def state_summary_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    paths = candidate.get("paths", []) if candidate else []
+    path = paths[0] if paths else {}
+    return {
+        "rank": candidate.get("rank"),
+        "candidate_evidence_state": path.get("readable", ""),
+        "evidence": path.get("evidence", []),
+        "target_entity": candidate.get("answer_id", ""),
+        "target_label": candidate.get("answer_label", ""),
+        "final_score": path.get("path_score", candidate.get("best_path_score", candidate.get("score", 0.0))),
+        **{key: path.get("soft_signals", {}).get(key, 0.0) for key in V2_COMPONENT_KEYS if key != "final_score"},
+    }
+
+
+def full_v2_score_breakdown_from_candidate(candidate: dict[str, Any]) -> dict[str, float]:
+    paths = candidate.get("paths", []) if candidate else []
+    path = paths[0] if paths else {}
+    signals = path.get("soft_signals", {}) if path else {}
+    out = {key: float(signals.get(key, 0.0)) for key in V2_COMPONENT_KEYS}
+    out["final_score"] = float(path.get("path_score", candidate.get("best_path_score", candidate.get("score", 0.0))) or 0.0)
+    out.update(penalty_ratio_fields(out))
+    return out
+
+
+def full_v2_score_breakdown_from_state(state: dict[str, Any]) -> dict[str, float]:
+    out = {key: float(state.get(key, 0.0) or 0.0) for key in V2_COMPONENT_KEYS}
+    out["final_score"] = float(state.get("final_score", 0.0) or 0.0)
+    out.update(penalty_ratio_fields(out))
+    return out
+
+
+def penalty_ratio_fields(values: dict[str, float]) -> dict[str, float]:
+    positive_keys = ["current_relevance", "gated_future_bonus", "useful_convergence", "type_compatibility", "progress"]
+    negative_keys = ["surface_convergence_penalty", "loop_penalty", "drift_penalty", "redundancy_penalty", "noisy_branch_penalty"]
+    positive = sum(max(0.0, values.get(key, 0.0)) for key in positive_keys)
+    negative = sum(abs(min(0.0, values.get(key, 0.0))) for key in negative_keys)
+    return {
+        "positive_score_sum": positive,
+        "negative_penalty_sum": negative,
+        "penalty_to_positive_ratio": negative / positive if positive else 0.0,
+    }
+
+
+def score_component_comparison(top: dict[str, float], gold: dict[str, float]) -> dict[str, Any]:
+    diff = {key: float(top.get(key, 0.0)) - float(gold.get(key, 0.0)) for key in V2_COMPONENT_KEYS}
+    favored_wrong = [
+        {"component": key, "top_minus_gold": value}
+        for key, value in sorted(diff.items(), key=lambda item: -item[1])
+        if value > 0.05
+    ][:5]
+    penalty_keys = ["surface_convergence_penalty", "loop_penalty", "drift_penalty", "redundancy_penalty", "noisy_branch_penalty"]
+    hurt_gold = [
+        {"component": key, "gold_minus_top": float(gold.get(key, 0.0)) - float(top.get(key, 0.0))}
+        for key in penalty_keys
+        if float(gold.get(key, 0.0)) < float(top.get(key, 0.0))
+    ]
+    return {
+        "score_difference_top_minus_gold": diff,
+        "components_favoring_wrong_top": favored_wrong,
+        "components_hurting_gold": hurt_gold,
+    }
+
+
+def diagnose_gold_survival(
+    row: dict[str, Any],
+    stage: str,
+    top_candidate: dict[str, Any],
+    best_gold_state: dict[str, Any] | None,
+    top_breakdown: dict[str, float],
+    gold_breakdown: dict[str, float],
+    generated_reaching_hop1: list[dict[str, Any]],
+    hop1_selected: list[dict[str, Any]],
+) -> list[str]:
+    labels: list[str] = []
+    if stage == "gold_first_hop_removed_by_diversity":
+        labels.append("diversity_pruned_gold_first_hop")
+    if best_gold_state:
+        if gold_breakdown["role_gate"] < max(0.75, top_breakdown["role_gate"] - 0.20):
+            labels.append("role_gate_too_low_on_gold")
+        if gold_breakdown["drift_penalty"] < 0.0:
+            labels.append("drift_penalty_false_positive_on_gold")
+        if gold_breakdown["loop_penalty"] < 0.0:
+            labels.append("loop_penalty_false_positive_on_gold")
+        if gold_breakdown["surface_convergence_penalty"] < 0.0:
+            labels.append("surface_convergence_false_positive_on_gold")
+        if gold_breakdown["gated_future_bonus"] + 0.08 < top_breakdown["gated_future_bonus"]:
+            labels.append("future_bonus_too_low_on_gold")
+    if not row["future_aware_v2_proof_state_beam"]["hits_at_1"]:
+        if top_breakdown["gated_future_bonus"] > gold_breakdown["gated_future_bonus"] + 0.08:
+            labels.append("bad_state_future_bonus_too_high")
+        if top_breakdown["current_relevance"] > gold_breakdown["current_relevance"] + 0.10:
+            labels.append("bad_state_current_relevance_too_high")
+        if top_breakdown["type_compatibility"] > gold_breakdown["type_compatibility"] + 0.50:
+            labels.append("bad_state_type_compatibility_too_high")
+        if stage == "gold_answer_generated_but_ranked_low":
+            labels.append("gold_sibling_ranked_lower")
+        if not guess_answer_type(row["question"]):
+            labels.append("answer_type_wrong_or_missing")
+        if top_breakdown["current_relevance"] >= max(top_breakdown["gated_future_bonus"], top_breakdown["type_compatibility"]):
+            labels.append("relation_label_similarity_dominated")
+    if stage == "gold_first_hop_kept_but_second_hop_not_generated":
+        labels.append("future_bonus_too_low_on_gold")
+    if generated_reaching_hop1 and not {state_identity(state) for state in generated_reaching_hop1} & {state_identity(state) for state in hop1_selected}:
+        labels.append("diversity_pruned_gold_first_hop")
+    return sorted(set(labels)) or ["unknown"]
+
+
+def generic_bad_drift_family(family: str) -> bool:
+    return family in {
+        "geography_drift",
+        "broad_location_or_country_branch",
+        "award_or_fame_drift",
+        "cast_or_film_drift",
+        "organization_parent_subsidiary_loop",
+        "generic_relation_loop",
+        "inverse_loop",
+    }
+
+
+def has_bidirectional_evidence(evidence: list[dict[str, Any]]) -> bool:
+    seen = set()
+    for step in evidence:
+        relation = str(step.get("relation_id", ""))
+        direction = str(step.get("direction", ""))
+        reverse_direction = "backward" if direction == "forward" else "forward"
+        edge = (step.get("from_entity_id"), relation, direction, step.get("to_entity_id"))
+        reverse = (step.get("to_entity_id"), relation, reverse_direction, step.get("from_entity_id"))
+        if reverse in seen:
+            return True
+        seen.add(edge)
+    relation_dirs: dict[str, set[str]] = defaultdict(set)
+    for step in evidence:
+        relation_dirs[str(step.get("relation_id", ""))].add(str(step.get("direction", "")))
+    return any({"forward", "backward"} <= directions for directions in relation_dirs.values())
+
+
+def state_readable(state: dict[str, Any] | None) -> str:
+    if not state:
+        return ""
+    return str(state.get("candidate_evidence_state") or state.get("readable") or "")
+
+
+def write_behavior_audit_markdown(audit: dict[str, Any]) -> str:
+    summary = audit["summary"]
+    lines = [
+        "# Future-Aware V2 Behavior Audit",
+        "",
+        "This is an offline diagnostic. It does not change search, scoring, prompts, or candidate generation.",
+        "",
+        "## Summary",
+        "",
+        "```json",
+        json.dumps(summary, indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Cases",
+        "",
+    ]
+    for case in audit["cases"]:
+        score = case["score_breakdown"]
+        lines.extend(
+            [
+                f"### {case['question_id']} — {', '.join(case['behavior_labels'])}",
+                "",
+                f"- Question: {case['question']}",
+                f"- Gold answer: {case['gold_answers']}",
+                f"- V2 correct: `{case['future_aware_v2_correct']}`",
+                f"- V2 drift family: `{case['future_aware_v2_drift_family']}`",
+                f"- Gold survival stage: `{case['gold_survival_stage']}`",
+                f"- Baseline top path: `{case['baseline_top_path']}`",
+                f"- Current proof-state top path: `{case['current_proof_state_top_path']}`",
+                f"- Future-aware v1 top path: `{case['future_aware_v1_top_path']}`",
+                f"- Future-aware v2 top path: `{case['future_aware_v2_top_path']}`",
+                "",
+                "| Component | Value |",
+                "|---|---:|",
+            ]
+        )
+        for key in V2_COMPONENT_KEYS:
+            lines.append(f"| `{key}` | {float(score.get(key, 0.0)):.4f} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_gold_survival_audit_markdown(audit: dict[str, Any]) -> str:
+    summary = audit["summary"]
+    lines = [
+        "# Future-Aware V2 Gold Survival Audit",
+        "",
+        "This is an offline diagnostic. Gold answers are used only after search finishes to locate where useful paths died.",
+        "",
+        "## Summary",
+        "",
+        "```json",
+        json.dumps(summary, indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Cases",
+        "",
+    ]
+    for case in audit["cases"]:
+        lines.extend(
+            [
+                f"### {case['question_id']} — {case['gold_survival_stage']}",
+                "",
+                f"- Question: {case['question']}",
+                f"- Gold answer: {case['gold_answers']}",
+                f"- Diagnosis: {', '.join(case['diagnosis'])}",
+                f"- V2 top state: `{case['v2_top_state']}`",
+                f"- Best gold state: `{case['best_gold_state']}`",
+                f"- Hop 1 rank: `{case['hop_1_rank']}`",
+                f"- Hop 2 rank: `{case['hop_2_rank']}`",
+                f"- Final rank: `{case['final_rank']}`",
+                f"- Gold final score: `{float(case['final_score']):.4f}`",
+                "",
+                "#### Components Favoring Wrong Top",
+                "",
+            ]
+        )
+        favored = case.get("components_favoring_wrong_top", [])
+        if favored:
+            for item in favored:
+                lines.append(f"- `{item['component']}`: top minus gold = `{float(item['top_minus_gold']):.4f}`")
+        else:
+            lines.append("- _None._")
+        lines.extend(["", "#### Components Hurting Gold", ""])
+        hurt = case.get("components_hurting_gold", [])
+        if hurt:
+            for item in hurt:
+                lines.append(f"- `{item['component']}`: gold minus top = `{float(item['gold_minus_top']):.4f}`")
+        else:
+            lines.append("- _None._")
+        lines.extend(["", "#### Gold Candidates", ""])
+        candidates = case.get("gold_candidate_states", [])
+        if candidates:
+            for item in candidates[:5]:
+                lines.append(f"- rank `{item['rank']}` score `{float(item['score']):.4f}`: `{item['path']}`")
+        else:
+            lines.append("- _No gold-reaching candidate state recorded._")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def select_overlap_examples(cases: list[dict[str, Any]], flag: str, limit: int = 5) -> list[dict[str, Any]]:
