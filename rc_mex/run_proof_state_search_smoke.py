@@ -138,10 +138,13 @@ def main() -> None:
     (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
     gold_survival_audit = build_gold_survival_audit(graph, rows, args)
     behavior_audit = build_behavior_audit(rows, gold_survival_audit)
+    code_behavior_audit = build_code_behavior_audit(rows, gold_survival_audit)
     write_json(output_dir / "gold_survival_audit.json", gold_survival_audit)
     (output_dir / "gold_survival_audit.md").write_text(write_gold_survival_audit_markdown(gold_survival_audit), encoding="utf-8")
     write_json(output_dir / "behavior_audit.json", behavior_audit)
     (output_dir / "behavior_audit.md").write_text(write_behavior_audit_markdown(behavior_audit), encoding="utf-8")
+    write_json(output_dir / "code_behavior_audit.json", code_behavior_audit)
+    (output_dir / "code_behavior_audit.md").write_text(write_code_behavior_audit_markdown(code_behavior_audit), encoding="utf-8")
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
@@ -151,6 +154,8 @@ def main() -> None:
     log_line("gold_survival_audit.md")
     log_line("behavior_audit.json")
     log_line("behavior_audit.md")
+    log_line("code_behavior_audit.json")
+    log_line("code_behavior_audit.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -2943,6 +2948,532 @@ def write_gold_survival_audit_markdown(audit: dict[str, Any]) -> str:
             lines.append("- _No gold-reaching candidate state recorded._")
         lines.append("")
     return "\n".join(lines)
+
+
+def build_code_behavior_audit(rows: list[dict[str, Any]], gold_survival_audit: dict[str, Any]) -> dict[str, Any]:
+    v2_states = collect_v2_audit_states(rows)
+    breakouts = [full_v2_score_breakdown_from_state(state) for state in v2_states]
+    positive_values = [item["positive_score_sum"] for item in breakouts]
+    negative_values = [item["negative_penalty_sum"] for item in breakouts]
+    ratio_values = [item["penalty_to_positive_ratio"] for item in breakouts if item["positive_score_sum"] > 0.0]
+    role_values = [float(state.get("role_gate", 0.0)) for state in v2_states]
+    drift_gate_values = [float(state.get("non_drift_gate", 0.0)) for state in v2_states]
+    loop_gate_values = [float(state.get("non_loop_gate", 0.0)) for state in v2_states]
+    gate_product_values = [
+        float(state.get("role_gate", 0.0))
+        * float(state.get("non_drift_gate", 0.0))
+        * float(state.get("non_loop_gate", 0.0))
+        for state in v2_states
+    ]
+    diversity_cases = [
+        case
+        for case in gold_survival_audit.get("cases", [])
+        if case.get("gold_survival_stage") == "gold_first_hop_removed_by_diversity"
+    ]
+    penalty_tiny_cases = sorted(
+        [
+            code_behavior_state_case(state, breakdown)
+            for state, breakdown in zip(v2_states, breakouts)
+            if breakdown["positive_score_sum"] > 0.0 and breakdown["penalty_to_positive_ratio"] < 0.15
+        ],
+        key=lambda item: (-item["score_breakdown"]["positive_score_sum"], str(item["question_id"])),
+    )[:10]
+    penalty_strong_cases = sorted(
+        [
+            code_behavior_state_case(state, breakdown)
+            for state, breakdown in zip(v2_states, breakouts)
+            if breakdown["positive_score_sum"] > 0.0 and breakdown["penalty_to_positive_ratio"] > 0.85
+        ],
+        key=lambda item: (-item["score_breakdown"]["penalty_to_positive_ratio"], str(item["question_id"])),
+    )[:10]
+    return {
+        "summary": {
+            "num_questions": len(rows),
+            "num_future_aware_v2_audit_states": len(v2_states),
+            "average_positive_score_sum": avg(positive_values),
+            "average_negative_penalty_sum": avg(negative_values),
+            "average_penalty_to_positive_ratio": avg(ratio_values),
+            "penalty_tiny_case_count": sum(1 for value in ratio_values if value < 0.15),
+            "penalty_strong_case_count": sum(1 for value in ratio_values if value > 0.85),
+            "role_gate_min": min(role_values) if role_values else 0.0,
+            "role_gate_max": max(role_values) if role_values else 0.0,
+            "non_drift_gate_values_observed": sorted({round(value, 6) for value in drift_gate_values}),
+            "non_loop_gate_values_observed": sorted({round(value, 6) for value in loop_gate_values}),
+            "max_gate_product_observed": max(gate_product_values) if gate_product_values else 0.0,
+            "gates_can_amplify_observed": any(value > 1.0 for value in gate_product_values),
+            "gold_removed_by_first_hop_diversity_count": len(diversity_cases),
+        },
+        "scorer_locations": scorer_locations(),
+        "exact_formulas": scorer_formula_notes(),
+        "order_of_operations": order_of_operations_notes(),
+        "gate_behavior": gate_behavior_notes(v2_states),
+        "penalty_scale": {
+            "average_positive_score_sum": avg(positive_values),
+            "average_negative_penalty_sum": avg(negative_values),
+            "average_penalty_to_positive_ratio": avg(ratio_values),
+            "cases_where_penalties_are_tiny": penalty_tiny_cases,
+            "cases_where_penalties_are_strong": penalty_strong_cases,
+            "interpretation": (
+                "These values are computed from v2 audit candidate states. Because soft signals are merged across hops, "
+                "the numbers are state-level accumulated components, not isolated per-edge terms."
+            ),
+        },
+        "first_hop_diversity": {
+            "implementation": "diversify_first_hop_states(next_states, beam_width, family_limit=FUTURE_AWARE_V2_CONSTANTS['first_hop_relation_family_limit'])",
+            "relation_family_definition": "first_hop_relation_family(state) maps the first hop relation_id through relation_family_from_text().",
+            "family_limit": FUTURE_AWARE_V2_CONSTANTS["first_hop_relation_family_limit"],
+            "when_applied": "Only in future_aware_v2_proof_state_beam, after all hop-1 candidates are scored and sorted, before hop-1 beam retention and before hop 2 generation.",
+            "candidate_order": "The first candidate per relation family is kept in descending score order; extra same-family candidates are deferred and only used if the beam is not full.",
+            "can_remove_gold_before_hop2": True,
+            "gold_removed_examples": [
+                {
+                    "question_id": case.get("question_id"),
+                    "question": case.get("question"),
+                    "gold_answer": case.get("gold_answers"),
+                    "stage": case.get("gold_survival_stage"),
+                    "diagnosis": case.get("diagnosis", []),
+                    "v2_top_path": case.get("v2_top_state"),
+                    "best_gold_path": case.get("best_gold_state"),
+                }
+                for case in diversity_cases[:10]
+            ],
+        },
+        "mismatch_table": code_behavior_mismatch_table(),
+    }
+
+
+def collect_v2_audit_states(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for row in rows:
+        question_id = row.get("question_id", "")
+        question = row.get("question", "")
+        v2 = row.get("future_aware_v2_proof_state_beam", {})
+        for hop_trace in v2.get("audit_trace", []):
+            hop = hop_trace.get("hop")
+            for state in hop_trace.get("all_candidate_states", []):
+                item = dict(state)
+                item["question_id"] = question_id
+                item["question"] = question
+                item["hop"] = hop
+                states.append(item)
+    return states
+
+
+def code_behavior_state_case(state: dict[str, Any], breakdown: dict[str, float]) -> dict[str, Any]:
+    return {
+        "question_id": state.get("question_id", ""),
+        "question": state.get("question", ""),
+        "hop": state.get("hop"),
+        "rank": state.get("rank"),
+        "path": state_readable(state),
+        "target_label": state.get("target_label", ""),
+        "score_breakdown": {
+            key: breakdown.get(key, 0.0)
+            for key in [
+                "current_relevance",
+                "gated_future_bonus",
+                "useful_convergence",
+                "type_compatibility",
+                "progress",
+                "surface_convergence_penalty",
+                "loop_penalty",
+                "drift_penalty",
+                "redundancy_penalty",
+                "noisy_branch_penalty",
+                "positive_score_sum",
+                "negative_penalty_sum",
+                "penalty_to_positive_ratio",
+                "final_score",
+            ]
+        },
+    }
+
+
+def scorer_locations() -> dict[str, dict[str, str]]:
+    path = "rc_mex/run_proof_state_search_smoke.py"
+    return {
+        "baseline_path_beam": {
+            "file": path,
+            "search_function": "run_baseline_path_beam",
+            "relation_ranker": "rank_relations",
+            "final_answer_ranker": "search_result",
+        },
+        "soft_proof_state_beam": {
+            "file": path,
+            "search_function": "run_soft_proof_state_beam",
+            "scoring_function": "soft_fragment_signals",
+            "relation_ranker": "rank_relations",
+            "final_answer_ranker": "search_result",
+        },
+        "future_aware_proof_state_beam": {
+            "file": path,
+            "search_function": "run_future_aware_proof_state_beam",
+            "scoring_function": "future_aware_fragment_signals",
+            "future_signal": "future_satisfiability",
+            "final_answer_ranker": "search_result",
+        },
+        "future_aware_v2_proof_state_beam": {
+            "file": path,
+            "search_function": "run_future_aware_v2_proof_state_beam",
+            "scoring_function": "future_aware_v2_fragment_signals",
+            "future_signal": "future_satisfiability",
+            "first_hop_diversity": "diversify_first_hop_states",
+            "final_answer_ranker": "search_result",
+        },
+    }
+
+
+def scorer_formula_notes() -> dict[str, dict[str, Any]]:
+    return {
+        "shared_relation_ranking": {
+            "formula": "label_score = char_ngram_similarity(question, relation_label_with_direction) + 0.03 * min(1.0, relation.frequency / 5.0)",
+            "relation_label_with_direction": "f\"{predicate.replace('_', ' ')} {direction}\"",
+            "sort": "descending label_score, then relation_id, then direction",
+        },
+        "baseline_path_beam": {
+            "state_delta": "candidate['label_score']",
+            "state_score": "sum(label_score over selected hops)",
+            "final_answer_score": "sum(state.score for all retained final states reaching that answer)",
+            "best_path_score_tiebreak": "max(state.score for retained final states reaching that answer)",
+            "unused_components": [
+                "current_relevance",
+                "raw_future_bonus",
+                "future_bonus_capped",
+                "role_gate",
+                "non_drift_gate",
+                "non_loop_gate",
+                "gated_future_bonus",
+                "convergence/useful_convergence",
+                "type_compatibility",
+                "progress",
+                "surface_convergence_penalty",
+                "loop_penalty",
+                "drift_penalty",
+                "redundancy_penalty",
+                "noisy_branch_penalty",
+            ],
+        },
+        "soft_proof_state_beam": {
+            "best_label_similarity": "max(step['relation_label_score'] for step in grouped steps to same target)",
+            "avg_label_similarity": "mean(step['relation_label_score'] for step in grouped steps to same target)",
+            "convergence_bonus": "0.18 * max(0, len(steps) - 1)",
+            "type_compatibility": "type_compatibility(graph, target_id, answer_type) if hop == 2 else 0.0",
+            "progress": "plausible_progress(question, graph, target_id, steps, hop)",
+            "uncertainty_floor": "0.03 if best_label < 0.08 and noisy_branch_penalty == 0.0 and redundancy_penalty == 0.0 else 0.0",
+            "noisy_branch_penalty": "-0.18 if branch_size >= noisy_branch_threshold else 0.0",
+            "redundancy_penalty": "-0.10 if repeats_relation_pattern(state, steps) else 0.0",
+            "total_delta": "0.65*best_label + 0.20*avg_label + convergence_bonus + 0.16*type_compatibility + progress + uncertainty_floor + noisy_branch_penalty + redundancy_penalty",
+            "state_score": "previous state.score + total_delta",
+            "final_answer_score": "sum(state.score for retained final states reaching that answer)",
+        },
+        "future_aware_proof_state_beam": {
+            "current_relevance": "max(step['relation_label_score'] for step in grouped steps)",
+            "raw_future_bonus": "future_satisfiability(...), stored as future_satisfiability",
+            "future_bonus_capped": "not used",
+            "role_gate": "not used",
+            "non_drift_gate": "not used",
+            "non_loop_gate": "not used",
+            "gated_future_bonus": "not used; raw future is weighted directly",
+            "useful_convergence": "useful_convergence_bonus(...): 0.16 + 0.04*min(2, len(steps)-2) if len(steps)>=2 and future>0.12 or type_score>0 or relation labels differ; else 0",
+            "type_compatibility": "type_compatibility(graph, target_id, answer_type) if hop == 2 else 0.0",
+            "progress": "plausible_progress(question, graph, target_id, steps, hop)",
+            "surface_convergence_penalty": "surface_convergence_penalty(...) can subtract 0.16, 0.18, 0.08, 0.08 depending on surface/no-future/loop/type mismatch rules",
+            "loop_penalty": "not separately used; inverse loop is folded into surface_convergence_penalty",
+            "drift_penalty": "drift_penalty(...): -0.14 for hop-2 answer-type mismatch with low future and low target match; -0.10 for generic drift with low future and low target match; else 0",
+            "redundancy_penalty": "-0.12 if repeats_relation_pattern(state, steps) else 0.0",
+            "noisy_branch_penalty": "-0.20 if branch_size >= noisy_branch_threshold else 0.0",
+            "total_delta": "0.58*current_relevance + 0.34*future_satisfiability + useful_convergence + 0.14*type_compatibility + progress + surface_convergence_penalty + redundancy_penalty + drift_penalty + noisy_branch_penalty",
+            "state_score": "previous state.score + total_delta",
+            "final_answer_score": "sum(state.score for retained final states reaching that answer)",
+        },
+        "future_aware_v2_proof_state_beam": {
+            "current_relevance": "max(step['relation_label_score'] for grouped steps)",
+            "raw_future_bonus": "future_satisfiability(...)",
+            "future_bonus_capped": "min(raw_future_bonus, FUTURE_AWARE_V2_CONSTANTS['future_cap'])",
+            "role_gate": "role_semantic_gate(...), currently returns one of 0.35/0.40/0.45/0.65/0.75/0.85/1.0 depending on question/target/future labels",
+            "non_drift_gate": "0.35 if stronger_drift_penalty(...) < 0.0 else 1.0",
+            "non_loop_gate": "0.20 if strong_loop_penalty(...) < 0.0 else 1.0",
+            "gated_future_bonus": "future_bonus_capped * role_gate * non_drift_gate * non_loop_gate",
+            "useful_convergence": "useful_convergence_bonus_v2(...): 0.14 if len(steps)>=2 and (gated_future_bonus>0.08 or type_score>0 or relation_diverse and not inverse duplicate); else 0",
+            "type_compatibility": "type_compatibility(graph, target_id, answer_type) if hop == 2 else 0.0",
+            "progress": "plausible_progress(question, graph, target_id, steps, hop)",
+            "surface_convergence_penalty": "surface_convergence_penalty_v2(...): -0.25 for multi-step convergence if useful_convergence<=0 or gated_future_bonus<0.04, or if all converging steps use same relation name; else 0",
+            "loop_penalty": "strong_loop_penalty(...): adds -0.45 for inverse/repeated-entity loop, -0.45 for returning to start at hop 2, and -0.45 for same-relation out-and-back",
+            "drift_penalty": "stronger_drift_penalty(...): -0.30 for detected geography/film/award/org drift not needed by question, or hop-2 type mismatch with raw_future<0.08; else 0",
+            "redundancy_penalty": "-0.18 if repeats_relation_pattern(state, steps) else 0.0",
+            "noisy_branch_penalty": "-0.30 if branch_size >= noisy_branch_threshold else 0.0",
+            "total_delta": "0.55*current_relevance + 1.0*gated_future_bonus + useful_convergence + 0.16*type_compatibility + progress + surface_convergence_penalty + loop_penalty + drift_penalty + redundancy_penalty + noisy_branch_penalty",
+            "state_score": "previous state.score + total_delta",
+            "final_answer_score": "sum(state.score for retained final states reaching that answer)",
+        },
+        "future_satisfiability": {
+            "formula": "min(1.0, 0.70*best_remaining + 0.30*best_question)",
+            "best_remaining": "max token overlap between remaining question terms and each future relation label from target entity",
+            "best_question": "max char_ngram_similarity(question, each future relation label from target entity)",
+        },
+    }
+
+
+def order_of_operations_notes() -> dict[str, Any]:
+    return {
+        "candidate_generation": [
+            "Initialize states from the gold topic entity/entities selected for this controlled smoke test.",
+            "For each hop in [1, 2], for each retained state, iterate source entities in the current frontier.",
+            "Call graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities).",
+            "Rank local relation+direction candidates with rank_relations(question, frontier).",
+            "Expand only ranked[:top_k].",
+            "For each selected relation+direction, call relation_targets(...), capped by max_branch_entities.",
+        ],
+        "score_computation": [
+            "Baseline scores every target by adding the relation label_score.",
+            "Proof-state modes group fragments by target_id, then compute one score delta per target evidence state.",
+            "Score deltas are added to the previous state.score.",
+            "soft_signals are merged by summing previous and current signal values.",
+        ],
+        "first_hop_diversity": [
+            "Only future_aware_v2 applies first-hop diversity.",
+            "It happens after all hop-1 candidates are scored and sorted.",
+            "It happens before hop-1 beam retention and therefore before hop 2 candidate generation.",
+        ],
+        "pruning": [
+            "Per-source relation pruning happens at ranked[:top_k].",
+            "Per-relation target pruning happens in relation_targets(...)[ : max_branch_entities ].",
+            "Beam pruning happens after scoring each hop.",
+            "For v2 only, diversity pruning can remove same-family first-hop candidates before hop 2.",
+        ],
+        "gold_like_path_risk": [
+            "A gold-like path can be removed before hop 2 if its first relation is outside top_k, its target is outside max_branch_entities, its state score falls outside beam_width, or v2 diversity defers it behind an already-full beam.",
+            "A gold-like path can be generated at hop 2 but still ranked below another final answer because final answer ranking groups retained paths by answer and sums scores.",
+        ],
+        "final_answer_ranking": [
+            "search_result groups retained final states by answer entity.",
+            "candidate['score'] is the sum of state.score over retained paths to that answer.",
+            "candidate['best_path_score'] is max state.score for that answer.",
+            "Final candidates sort by -score, then -best_path_score, then answer label/id.",
+            "So final answer ranking uses the same state scores as beam retention, but aggregates them by answer; it is not identical to selecting the single top final state.",
+        ],
+    }
+
+
+def gate_behavior_notes(v2_states: list[dict[str, Any]]) -> dict[str, Any]:
+    role_values = sorted({round(float(state.get("role_gate", 0.0)), 6) for state in v2_states})
+    drift_gate_values = sorted({round(float(state.get("non_drift_gate", 0.0)), 6) for state in v2_states})
+    loop_gate_values = sorted({round(float(state.get("non_loop_gate", 0.0)), 6) for state in v2_states})
+    gate_products = [
+        float(state.get("role_gate", 0.0))
+        * float(state.get("non_drift_gate", 0.0))
+        * float(state.get("non_loop_gate", 0.0))
+        for state in v2_states
+    ]
+    return {
+        "role_gate": {
+            "code_logic": [
+                "If question mentions legal form, return 1.0 if future relation labels include legal form else 0.35.",
+                "If question asks occupation/job/position, return 1.0 for occupational future labels, 0.85 for person/player/athlete target text, else 0.35.",
+                "If question asks county/city/state/province, return 1.0 for matching target text, 0.35 for country when question does not ask country, else 0.65.",
+                "If answer_type == person, return 1.0 for human/person target text, 0.85 for person-like future labels, 0.40 for generic hubs.",
+                "If answer_type == organization, return 1.0 for organization/company/institution/team target text, 0.85 for organization-like future labels.",
+                "If target is a generic hub and question does not need generic geography/org family, return 0.45.",
+                "Default return 0.75.",
+            ],
+            "possible_values_from_code": [0.35, 0.40, 0.45, 0.65, 0.75, 0.85, 1.0],
+            "observed_values": role_values,
+        },
+        "non_drift_gate": {
+            "code_logic": "0.35 if stronger_drift_penalty(...) is negative, else 1.0.",
+            "possible_values_from_code": [0.35, 1.0],
+            "observed_values": drift_gate_values,
+        },
+        "non_loop_gate": {
+            "code_logic": "0.20 if strong_loop_penalty(...) is negative, else 1.0.",
+            "possible_values_from_code": [0.20, 1.0],
+            "observed_values": loop_gate_values,
+        },
+        "combined_gate": {
+            "formula": "gated_future_bonus = min(raw_future_bonus, 0.25) * role_gate * non_drift_gate * non_loop_gate",
+            "max_observed_gate_product": max(gate_products) if gate_products else 0.0,
+            "can_amplify_with_current_code": False,
+            "observed_amplification_above_cap": any(value > 1.0 for value in gate_products),
+            "note": "Current gate values are <= 1, so they do not amplify above the capped future bonus. If any gate value is changed above 1 later, this formula would amplify rather than merely gate.",
+        },
+    }
+
+
+def code_behavior_mismatch_table() -> list[dict[str, str]]:
+    return [
+        {
+            "intended_behavior": "Future bonus should be gated.",
+            "actual_code_behavior": "Future bonus is capped at 0.25 and multiplied by role_gate, non_drift_gate, and non_loop_gate. Current gate values are all <= 1.",
+            "possible_issue": "No observed amplification today, but the formula would amplify if any gate value were later set above 1.",
+        },
+        {
+            "intended_behavior": "Loop penalty should kill inverse loops.",
+            "actual_code_behavior": "Loop penalties are additive negative terms. A loop can still survive if current relevance, gated future, convergence, type, or progress outweigh the penalty.",
+            "possible_issue": "The penalty suppresses rather than forbids loops, so high positive lexical/future scores can still rank loop states highly.",
+        },
+        {
+            "intended_behavior": "Convergence should be useful, not just surface-level.",
+            "actual_code_behavior": "v2 gives useful_convergence only under gated future/type/diverse-relation conditions, then applies -0.25 if convergence lacks those signals or uses one relation name.",
+            "possible_issue": "Valid bidirectional or same-relation evidence can be penalized when it is semantically valid but looks surface-redundant.",
+        },
+        {
+            "intended_behavior": "First-hop diversity should preserve alternatives.",
+            "actual_code_behavior": "v2 keeps at most one state per coarse relation family in score order until beam is full, then fills from deferred states only if space remains.",
+            "possible_issue": "Multiple valid candidates in the same broad family can be removed before hop 2.",
+        },
+        {
+            "intended_behavior": "Penalties should suppress bad drift.",
+            "actual_code_behavior": "Drift detection is based on coarse string families and question keyword tests.",
+            "possible_issue": "Bad generic branches can survive when not recognized by family rules; valid branches can be penalized when keywords misfire.",
+        },
+        {
+            "intended_behavior": "Final answer should reflect the best proof.",
+            "actual_code_behavior": "Final answer score sums all retained path scores to the same answer; best path score is only a tie-breaker.",
+            "possible_issue": "An answer with several mediocre paths can outrank an answer with one better proof state.",
+        },
+        {
+            "intended_behavior": "Future satisfiability should estimate useful remaining constraints.",
+            "actual_code_behavior": "It uses lexical overlap between remaining question terms and one-hop future relation labels from the current target.",
+            "possible_issue": "Surface future matches can reward wrong branches, while semantically correct but differently worded future relations may get low bonus.",
+        },
+    ]
+
+
+def write_code_behavior_audit_markdown(audit: dict[str, Any]) -> str:
+    summary = audit.get("summary", {})
+    lines = [
+        "# Code-Behavior Alignment Audit",
+        "",
+        "This audit describes the current scoring implementation as coded. It does not propose or apply a scorer change.",
+        "",
+        "## Summary",
+        "",
+        f"- Questions: `{summary.get('num_questions', 0)}`",
+        f"- Future-aware v2 audit states: `{summary.get('num_future_aware_v2_audit_states', 0)}`",
+        f"- Average positive score sum: `{float(summary.get('average_positive_score_sum', 0.0)):.4f}`",
+        f"- Average negative penalty sum: `{float(summary.get('average_negative_penalty_sum', 0.0)):.4f}`",
+        f"- Average penalty/positive ratio: `{float(summary.get('average_penalty_to_positive_ratio', 0.0)):.4f}`",
+        f"- Gates amplify above cap in observed states: `{summary.get('gates_can_amplify_observed', False)}`",
+        f"- Max observed gate product: `{float(summary.get('max_gate_product_observed', 0.0)):.4f}`",
+        f"- Gold removed by first-hop diversity: `{summary.get('gold_removed_by_first_hop_diversity_count', 0)}`",
+        "",
+        "## Scorer Locations",
+        "",
+        "| Mode | File | Functions |",
+        "|---|---|---|",
+    ]
+    for mode, location in audit.get("scorer_locations", {}).items():
+        functions = ", ".join(f"`{value}`" for key, value in location.items() if key != "file")
+        lines.append(f"| `{mode}` | `{location.get('file', '')}` | {functions} |")
+    lines.extend(["", "## Exact Formulas From Code", ""])
+    formulas = audit.get("exact_formulas", {})
+    for mode in [
+        "shared_relation_ranking",
+        "baseline_path_beam",
+        "soft_proof_state_beam",
+        "future_aware_proof_state_beam",
+        "future_aware_v2_proof_state_beam",
+        "future_satisfiability",
+    ]:
+        lines.extend([f"### {mode}", ""])
+        for key, value in formulas.get(mode, {}).items():
+            if isinstance(value, list):
+                lines.append(f"- `{key}`: {', '.join(f'`{item}`' for item in value)}")
+            else:
+                lines.append(f"- `{key}`: {value}")
+        lines.append("")
+    lines.extend(["## Order Of Operations", ""])
+    for section, items in audit.get("order_of_operations", {}).items():
+        lines.append(f"### {section}")
+        for item in items:
+            lines.append(f"- {item}")
+        lines.append("")
+    lines.extend(["## Gate Behavior", ""])
+    gates = audit.get("gate_behavior", {})
+    for gate_name in ["role_gate", "non_drift_gate", "non_loop_gate"]:
+        gate = gates.get(gate_name, {})
+        lines.extend([f"### {gate_name}", ""])
+        logic = gate.get("code_logic", [])
+        if isinstance(logic, list):
+            for item in logic:
+                lines.append(f"- {item}")
+        else:
+            lines.append(f"- {logic}")
+        lines.append(f"- Possible values from code: `{gate.get('possible_values_from_code', [])}`")
+        lines.append(f"- Observed values: `{gate.get('observed_values', [])}`")
+        lines.append("")
+    combined = gates.get("combined_gate", {})
+    lines.extend([
+        "### combined gate",
+        "",
+        f"- Formula: `{combined.get('formula', '')}`",
+        f"- Max observed gate product: `{float(combined.get('max_observed_gate_product', 0.0)):.4f}`",
+        f"- Can amplify with current code: `{combined.get('can_amplify_with_current_code', False)}`",
+        f"- Observed amplification above cap: `{combined.get('observed_amplification_above_cap', False)}`",
+        f"- Note: {combined.get('note', '')}",
+        "",
+        "## Penalty Scale",
+        "",
+    ])
+    penalty = audit.get("penalty_scale", {})
+    lines.extend([
+        f"- Average positive score sum: `{float(penalty.get('average_positive_score_sum', 0.0)):.4f}`",
+        f"- Average negative penalty sum: `{float(penalty.get('average_negative_penalty_sum', 0.0)):.4f}`",
+        f"- Average penalty/positive ratio: `{float(penalty.get('average_penalty_to_positive_ratio', 0.0)):.4f}`",
+        f"- Interpretation: {penalty.get('interpretation', '')}",
+        "",
+        "### Cases Where Penalties Are Tiny",
+        "",
+    ])
+    for case in penalty.get("cases_where_penalties_are_tiny", [])[:10]:
+        score = case.get("score_breakdown", {})
+        lines.append(
+            f"- `{case.get('question_id')}` hop `{case.get('hop')}` rank `{case.get('rank')}` "
+            f"ratio `{float(score.get('penalty_to_positive_ratio', 0.0)):.4f}` "
+            f"positive `{float(score.get('positive_score_sum', 0.0)):.4f}` negative `{float(score.get('negative_penalty_sum', 0.0)):.4f}`: "
+            f"`{case.get('path', '')}`"
+        )
+    lines.extend(["", "### Cases Where Penalties Are Strong", ""])
+    for case in penalty.get("cases_where_penalties_are_strong", [])[:10]:
+        score = case.get("score_breakdown", {})
+        lines.append(
+            f"- `{case.get('question_id')}` hop `{case.get('hop')}` rank `{case.get('rank')}` "
+            f"ratio `{float(score.get('penalty_to_positive_ratio', 0.0)):.4f}` "
+            f"positive `{float(score.get('positive_score_sum', 0.0)):.4f}` negative `{float(score.get('negative_penalty_sum', 0.0)):.4f}`: "
+            f"`{case.get('path', '')}`"
+        )
+    diversity = audit.get("first_hop_diversity", {})
+    lines.extend([
+        "",
+        "## First-Hop Diversity",
+        "",
+        f"- Implementation: `{diversity.get('implementation', '')}`",
+        f"- Relation family definition: {diversity.get('relation_family_definition', '')}",
+        f"- Limit value: `{diversity.get('family_limit', '')}`",
+        f"- When applied: {diversity.get('when_applied', '')}",
+        f"- Candidate order: {diversity.get('candidate_order', '')}",
+        f"- Can remove gold before hop 2: `{diversity.get('can_remove_gold_before_hop2', False)}`",
+        "",
+        "### Possible Gold/Useful Candidate Removals",
+        "",
+    ])
+    for example in diversity.get("gold_removed_examples", [])[:10]:
+        lines.append(
+            f"- `{example.get('question_id')}` stage `{example.get('stage')}` diagnosis `{example.get('diagnosis', [])}`: "
+            f"v2 top `{example.get('v2_top_path', '')}` vs gold `{example.get('best_gold_path', '')}`"
+        )
+    lines.extend([
+        "",
+        "## Mismatch Table",
+        "",
+        "| Intended behavior | Actual code behavior | Possible issue |",
+        "|---|---|---|",
+    ])
+    for row in audit.get("mismatch_table", []):
+        lines.append(
+            f"| {row.get('intended_behavior', '')} | {row.get('actual_code_behavior', '')} | {row.get('possible_issue', '')} |"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def select_overlap_examples(cases: list[dict[str, Any]], flag: str, limit: int = 5) -> list[dict[str, Any]]:
