@@ -11,6 +11,12 @@ from typing import Any
 from cigr_d_mvp1.io_utils import ensure_dir, load_json, write_json, write_jsonl
 from cigr_d_mvp1.kg import KnowledgeGraph
 
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "in", "is",
+    "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "what", "when", "where",
+    "which", "who", "whose", "with", "tell", "me", "give", "show", "list", "does", "did",
+}
+
 
 @dataclass
 class SmokeExample:
@@ -49,7 +55,7 @@ def main() -> None:
     log_line(f"Skipped unsupported: {selection_stats.get('unsupported_program', 0)}")
     log_line(f"Skipped empty gold execution: {selection_stats.get('empty_gold_execution', 0)}")
 
-    log_stage(3, 4, "Running baseline path beam and soft proof-state beam")
+    log_stage(3, 4, "Running baseline, soft proof-state, and future-aware proof-state beams")
     rows = []
     for index, example in enumerate(examples, start=1):
         baseline = run_baseline_path_beam(
@@ -73,7 +79,18 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state)
+        future_aware = run_future_aware_proof_state_beam(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
+        row = build_prediction_row(graph, example, baseline, proof_state, future_aware)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -425,6 +442,98 @@ def run_soft_proof_state_beam(
     )
 
 
+def run_future_aware_proof_state_beam(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    answer_type = guess_answer_type(example.question)
+    states = [
+        SearchState(
+            frontier_ids=set(example.start_entity_ids),
+            score=0.0,
+            entity_sequences=[[graph.entity_name(entity_id)] for entity_id in sorted(example.start_entity_ids)],
+            relation_sequences=[[]],
+            soft_signals={"answer_type_known": 1.0 if answer_type else 0.0},
+        )
+    ]
+    expansion_count = 0
+    trace: list[dict[str, Any]] = []
+    for hop in [1, 2]:
+        next_states: list[SearchState] = []
+        for state in states:
+            expansion_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for source_id in sorted(state.frontier_ids):
+                frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
+                ranked = rank_relations(example.question, frontier)
+                for candidate in ranked[:top_k]:
+                    targets = relation_targets(graph, source_id, candidate, max_branch_entities)
+                    expansion_count += 1
+                    for target_id in targets:
+                        expansion_groups[target_id].append(
+                            {
+                                "source_id": source_id,
+                                "candidate": candidate,
+                                "branch_size": len(targets),
+                            }
+                        )
+            for target_id, fragments in expansion_groups.items():
+                steps = [
+                    evidence_step(graph, fragment["source_id"], fragment["candidate"], target_id, hop, fragment["branch_size"])
+                    for fragment in fragments
+                ]
+                signals = future_aware_fragment_signals(
+                    graph=graph,
+                    question=example.question,
+                    answer_type=answer_type,
+                    state=state,
+                    target_id=target_id,
+                    steps=steps,
+                    hop=hop,
+                    relation_cap=relation_cap,
+                    sample_entities=sample_entities,
+                    noisy_branch_threshold=noisy_branch_threshold,
+                )
+                relation_sequences = extend_relation_sequences(state.relation_sequences, steps)
+                entity_sequences = extend_entity_sequences(graph, state.entity_sequences, steps)
+                next_states.append(
+                    SearchState(
+                        frontier_ids={target_id},
+                        score=state.score + signals["total_delta"],
+                        evidence=state.evidence + steps,
+                        relation_sequences=relation_sequences,
+                        entity_sequences=entity_sequences,
+                        soft_signals=merge_signal_dicts(state.soft_signals, signals),
+                    )
+                )
+        next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": [
+                        summarize_future_aware_state(state, rank)
+                        for rank, state in enumerate(next_states[:5], start=1)
+                    ],
+                }
+            )
+        states = next_states[:beam_width]
+    return search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="future_aware_proof_state_beam",
+        debug_trace=trace,
+    )
+
+
 def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
     ranked = []
     for relation in frontier:
@@ -523,6 +632,180 @@ def soft_fragment_signals(
         "redundancy_penalty": redundancy,
         "total_delta": total,
     }
+
+
+def future_aware_fragment_signals(
+    graph: KnowledgeGraph,
+    question: str,
+    answer_type: str,
+    state: SearchState,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    hop: int,
+    relation_cap: int,
+    sample_entities: int,
+    noisy_branch_threshold: int,
+) -> dict[str, float]:
+    relation_text = " ".join(step["relation_id"].replace("_", " ") for step in state.evidence + steps)
+    remaining_terms = remaining_question_terms(question, relation_text)
+    current_relevance = max((float(step["relation_label_score"]) for step in steps), default=0.0)
+    future = future_satisfiability(
+        graph=graph,
+        question=question,
+        remaining_terms=remaining_terms,
+        entity_id=target_id,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+    )
+    type_score = type_compatibility(graph, target_id, answer_type) if hop == 2 else 0.0
+    progress = plausible_progress(question, graph, target_id, steps, hop)
+    useful_convergence = useful_convergence_bonus(
+        graph=graph,
+        target_id=target_id,
+        steps=steps,
+        future_satisfiability_score=future,
+        type_score=type_score,
+    )
+    surface_penalty = surface_convergence_penalty(
+        graph=graph,
+        state=state,
+        target_id=target_id,
+        steps=steps,
+        future_satisfiability_score=future,
+        answer_type=answer_type,
+    )
+    redundancy = -0.12 if repeats_relation_pattern(state, steps) else 0.0
+    branch_size = max((int(step["branch_size"]) for step in steps), default=1)
+    noisy_penalty = -0.20 if branch_size >= noisy_branch_threshold else 0.0
+    drift = drift_penalty(
+        graph=graph,
+        question=question,
+        answer_type=answer_type,
+        target_id=target_id,
+        remaining_terms=remaining_terms,
+        future_satisfiability_score=future,
+        hop=hop,
+    )
+    total = (
+        0.58 * current_relevance
+        + 0.34 * future
+        + useful_convergence
+        + 0.14 * type_score
+        + progress
+        + surface_penalty
+        + redundancy
+        + drift
+        + noisy_penalty
+    )
+    return {
+        "current_relevance": current_relevance,
+        "future_satisfiability": future,
+        "useful_convergence": useful_convergence,
+        "type_compatibility": type_score,
+        "progress": progress,
+        "surface_convergence_penalty": surface_penalty,
+        "redundancy_penalty": redundancy,
+        "drift_penalty": drift,
+        "noisy_branch_penalty": noisy_penalty,
+        "remaining_terms_count": float(len(remaining_terms)),
+        "total_delta": total,
+    }
+
+
+def future_satisfiability(
+    graph: KnowledgeGraph,
+    question: str,
+    remaining_terms: set[str],
+    entity_id: str,
+    relation_cap: int,
+    sample_entities: int,
+) -> float:
+    frontier = graph.candidate_relations([entity_id], cap=relation_cap, sample_entities=sample_entities)
+    if not frontier:
+        return 0.0
+    remaining_text = " ".join(sorted(remaining_terms))
+    best_remaining = 0.0
+    best_question = 0.0
+    for relation in frontier:
+        label = relation.predicate.replace("_", " ")
+        best_question = max(best_question, char_ngram_similarity(question, label))
+        if remaining_text:
+            best_remaining = max(best_remaining, token_overlap_score(remaining_terms, tokenize_content(label)))
+    return min(1.0, 0.70 * best_remaining + 0.30 * best_question)
+
+
+def useful_convergence_bonus(
+    graph: KnowledgeGraph,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    future_satisfiability_score: float,
+    type_score: float,
+) -> float:
+    if len(steps) < 2:
+        return 0.0
+    relation_labels = {step["relation_id"] for step in steps}
+    different_relations = len(relation_labels) > 1
+    future_helpful = future_satisfiability_score > 0.12
+    type_helpful = type_score > 0.0
+    if future_helpful or type_helpful or different_relations:
+        return 0.16 + 0.04 * min(2, len(steps) - 2)
+    return 0.0
+
+
+def surface_convergence_penalty(
+    graph: KnowledgeGraph,
+    state: SearchState,
+    target_id: str,
+    steps: list[dict[str, Any]],
+    future_satisfiability_score: float,
+    answer_type: str,
+) -> float:
+    penalty = 0.0
+    if len(steps) >= 2 and future_satisfiability_score < 0.08:
+        penalty -= 0.16
+    if has_inverse_loop(state, steps):
+        penalty -= 0.18
+    relation_labels = [step["relation_id"] for step in steps]
+    if len(steps) >= 2 and len(set(relation_labels)) == 1:
+        penalty -= 0.08
+    target_text = " ".join([graph.entity_name(target_id), *graph.entity_type_names(target_id)]).casefold()
+    if answer_type in {"person", "work"} and any(word in target_text for word in ["country", "organization", "location"]):
+        penalty -= 0.08
+    return penalty
+
+
+def drift_penalty(
+    graph: KnowledgeGraph,
+    question: str,
+    answer_type: str,
+    target_id: str,
+    remaining_terms: set[str],
+    future_satisfiability_score: float,
+    hop: int,
+) -> float:
+    target_text = " ".join([graph.entity_name(target_id), *graph.entity_type_names(target_id)]).casefold()
+    generic_terms = ["country", "diplomatic", "time zone", "located in", "administrative", "language"]
+    generic = any(term in target_text for term in generic_terms)
+    expected = type_compatibility(graph, target_id, answer_type) > 0.0 if answer_type else False
+    needed_text = " ".join(sorted(remaining_terms))
+    target_match = char_ngram_similarity(needed_text, target_text) if needed_text else 0.0
+    if hop == 2 and answer_type and not expected and future_satisfiability_score < 0.06 and target_match < 0.05:
+        return -0.14
+    if generic and future_satisfiability_score < 0.08 and target_match < 0.08:
+        return -0.10
+    return 0.0
+
+
+def has_inverse_loop(state: SearchState, steps: list[dict[str, Any]]) -> bool:
+    previous_edges = {
+        (step["from_entity_id"], step["relation_id"], step["to_entity_id"])
+        for step in state.evidence
+    }
+    for step in steps:
+        reverse = (step["to_entity_id"], step["relation_id"], step["from_entity_id"])
+        if reverse in previous_edges:
+            return True
+    return False
 
 
 def plausible_progress(question: str, graph: KnowledgeGraph, target_id: str, steps: list[dict[str, Any]], hop: int) -> float:
@@ -710,23 +993,47 @@ def summarize_proof_state(state: SearchState, rank: int) -> dict[str, Any]:
     }
 
 
+def summarize_future_aware_state(state: SearchState, rank: int) -> dict[str, Any]:
+    return {
+        "rank": rank,
+        "hop": state.evidence[-1].get("hop") if state.evidence else None,
+        "candidate_evidence_state": " | ".join(step["readable"] for step in state.evidence),
+        "fragments": [step["readable"] for step in state.evidence],
+        "current_relevance": state.soft_signals.get("current_relevance", 0.0),
+        "future_satisfiability": state.soft_signals.get("future_satisfiability", 0.0),
+        "useful_convergence": state.soft_signals.get("useful_convergence", 0.0),
+        "type_compatibility": state.soft_signals.get("type_compatibility", 0.0),
+        "progress": state.soft_signals.get("progress", 0.0),
+        "surface_convergence_penalty": state.soft_signals.get("surface_convergence_penalty", 0.0),
+        "redundancy_penalty": state.soft_signals.get("redundancy_penalty", 0.0),
+        "drift_penalty": state.soft_signals.get("drift_penalty", 0.0),
+        "noisy_branch_penalty": state.soft_signals.get("noisy_branch_penalty", 0.0),
+        "final_score": state.score,
+        "target_entity": next(iter(state.frontier_ids), ""),
+    }
+
+
 def build_prediction_row(
     graph: KnowledgeGraph,
     example: SmokeExample,
     baseline: dict[str, Any],
     proof_state: dict[str, Any],
+    future_aware: dict[str, Any],
 ) -> dict[str, Any]:
     baseline_correct = baseline["hits_at_1"]
     proof_correct = proof_state["hits_at_1"]
-    if baseline_correct and proof_correct:
+    future_correct = future_aware["hits_at_1"]
+    if baseline_correct and proof_correct and future_correct:
         failure_type = "both_correct"
+    elif future_correct and not proof_correct:
+        failure_type = "future_aware_correct"
     elif proof_correct:
         failure_type = "proof_state_correct"
     elif baseline_correct:
         failure_type = "baseline_correct"
-    elif not baseline["gold_generated"] and not proof_state["gold_generated"]:
+    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not future_aware["gold_generated"]:
         failure_type = "gold_not_generated"
-    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"]:
+    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not future_aware["candidate_answers"]:
         failure_type = "empty_frontier"
     else:
         failure_type = "both_fail"
@@ -743,6 +1050,7 @@ def build_prediction_row(
         },
         "baseline_path_beam": baseline,
         "soft_proof_state_beam": proof_state,
+        "future_aware_proof_state_beam": future_aware,
         "failure_type": failure_type,
     }
 
@@ -750,22 +1058,30 @@ def build_prediction_row(
 def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     baseline = [row["baseline_path_beam"] for row in rows]
     proof = [row["soft_proof_state_beam"] for row in rows]
+    future = [row["future_aware_proof_state_beam"] for row in rows]
     return {
         "number_of_selected_questions": len(rows),
         "baseline_hits_at_1": avg_bool(item["hits_at_1"] for item in baseline),
         "proof_state_hits_at_1": avg_bool(item["hits_at_1"] for item in proof),
+        "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
         "proof_state_exact_match": avg_bool(item["exact_match"] for item in proof),
+        "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
         "proof_state_final_answer_f1": avg(item["final_answer_f1"] for item in proof),
+        "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
         "proof_state_gold_generated_rate": avg_bool(item["gold_generated"] for item in proof),
+        "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
         "average_candidate_count_proof_state": avg(item["candidate_count"] for item in proof),
+        "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
         "average_expansion_count_proof_state": avg(item["expansion_count"] for item in proof),
+        "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
         "average_final_result_size_proof_state": avg(item["final_result_size"] for item in proof),
+        "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "proof_state_wins": sum(
             1 for row in rows
             if row["soft_proof_state_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
@@ -774,8 +1090,35 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
         ),
-        "both_correct": sum(1 for row in rows if row["baseline_path_beam"]["hits_at_1"] and row["soft_proof_state_beam"]["hits_at_1"]),
-        "both_fail": sum(1 for row in rows if not row["baseline_path_beam"]["hits_at_1"] and not row["soft_proof_state_beam"]["hits_at_1"]),
+        "future_aware_wins_over_current_proof_state": sum(
+            1 for row in rows
+            if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
+        ),
+        "current_proof_state_wins_over_future_aware": sum(
+            1 for row in rows
+            if row["soft_proof_state_beam"]["final_answer_f1"] > row["future_aware_proof_state_beam"]["final_answer_f1"]
+        ),
+        "both_correct": sum(
+            1 for row in rows
+            if row["baseline_path_beam"]["hits_at_1"]
+            and row["soft_proof_state_beam"]["hits_at_1"]
+            and row["future_aware_proof_state_beam"]["hits_at_1"]
+        ),
+        "both_fail": sum(
+            1 for row in rows
+            if not row["baseline_path_beam"]["hits_at_1"]
+            and not row["soft_proof_state_beam"]["hits_at_1"]
+            and not row["future_aware_proof_state_beam"]["hits_at_1"]
+        ),
+        "future_aware_avoids_surface_convergence": sum(
+            1 for row in rows
+            if future_top_surface_penalty(row) < 0.0
+            and row["future_aware_proof_state_beam"]["final_answer_f1"] >= row["soft_proof_state_beam"]["final_answer_f1"]
+        ),
+        "future_aware_hurts_current_proof_state": sum(
+            1 for row in rows
+            if row["soft_proof_state_beam"]["hits_at_1"] and not row["future_aware_proof_state_beam"]["hits_at_1"]
+        ),
         "failure_counts": dict(Counter(row["failure_type"] for row in rows)),
     }
 
@@ -788,11 +1131,26 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         "",
         "No gold relation IDs, gold prefixes, relation cards, LLM constraint extraction, ToG/Freebase, or quantum-inspired scoring are used during search.",
         "",
+        "This run compares three modes: `baseline_path_beam`, current `soft_proof_state_beam`, and `future_aware_proof_state_beam`.",
+        "",
         "## Metrics",
         "",
         "```json",
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
+        "",
+        "## Future-Aware Wins Over Current Proof-State",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "future"), limit=5),
+        "## Current Proof-State Wins Over Future-Aware",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "current_over_future"), limit=5),
+        "## Future-Aware Surface-Convergence Avoidance Cases",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "surface_avoidance"), limit=5),
+        "## Future-Aware Hurts Current Proof-State Cases",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "future_hurts"), limit=5),
         "",
         "## Proof-State Wins",
         "",
@@ -810,7 +1168,7 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
 def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for kind in ["proof", "baseline", "both_fail"]:
+    for kind in ["future", "current_over_future", "surface_avoidance", "future_hurts", "proof", "baseline", "both_fail"]:
         for row in select_debug_rows(rows, kind):
             key = str(row["question_id"])
             if key not in seen:
@@ -828,6 +1186,14 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
     return selected
 
 
+def future_top_surface_penalty(row: dict[str, Any]) -> float:
+    top = row["future_aware_proof_state_beam"].get("top_answer") or {}
+    paths = top.get("paths", []) if top else []
+    if not paths:
+        return 0.0
+    return float(paths[0].get("soft_signals", {}).get("surface_convergence_penalty", 0.0))
+
+
 def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "question_id": row["question_id"],
@@ -838,11 +1204,15 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "failure_type": row["failure_type"],
         "baseline_correct": row["baseline_path_beam"]["hits_at_1"],
         "proof_state_correct": row["soft_proof_state_beam"]["hits_at_1"],
+        "future_aware_correct": row["future_aware_proof_state_beam"]["hits_at_1"],
         "baseline_top_answer": row["baseline_path_beam"]["top_answer"],
         "proof_state_top_answer": row["soft_proof_state_beam"]["top_answer"],
+        "future_aware_top_answer": row["future_aware_proof_state_beam"]["top_answer"],
         "baseline_debug_trace": row["baseline_path_beam"].get("debug_trace", []),
         "proof_state_debug_trace": row["soft_proof_state_beam"].get("debug_trace", []),
+        "future_aware_debug_trace": row["future_aware_proof_state_beam"].get("debug_trace", []),
         "explanation": proof_state_choice_explanation(row),
+        "future_aware_explanation": future_aware_choice_explanation(row),
     }
 
 
@@ -858,8 +1228,10 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         baseline = row["baseline_path_beam"]
         proof = row["soft_proof_state_beam"]
+        future = row["future_aware_proof_state_beam"]
         baseline_top = baseline["top_answer"] or {}
         proof_top = proof["top_answer"] or {}
+        future_top = future["top_answer"] or {}
         lines.extend(
             [
                 f"## {row['question_id']}",
@@ -872,8 +1244,11 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"Proof-state top final state: {top_path_readable(proof_top)}",
                 "",
+                f"Future-aware top final state: {top_path_readable(future_top)}",
+                "",
                 f"Baseline correct: `{baseline['hits_at_1']}`",
                 f"Proof-state correct: `{proof['hits_at_1']}`",
+                f"Future-aware correct: `{future['hits_at_1']}`",
                 "",
                 "### Baseline Hop Trace",
                 "",
@@ -881,9 +1256,15 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Proof-State Hop Trace",
                 "",
                 *proof_trace_lines(proof.get("debug_trace", [])),
+                "### Future-Aware Proof-State Hop Trace",
+                "",
+                *future_aware_trace_lines(future.get("debug_trace", [])),
                 "### Why Proof-State Chose This Over Baseline",
                 "",
                 *proof_state_choice_explanation(row),
+                "### Why Future-Aware Chose This",
+                "",
+                *future_aware_choice_explanation(row),
                 "",
             ]
         )
@@ -946,6 +1327,38 @@ def proof_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def future_aware_trace_lines(trace: list[dict[str, Any]]) -> list[str]:
+    if not trace:
+        return ["_No future-aware proof-state trace captured._", ""]
+    lines: list[str] = []
+    for hop in trace:
+        lines.append(f"#### Hop {hop['hop']}")
+        lines.append("")
+        lines.append(
+            "| Rank | Candidate evidence state | Current | Future | Convergence | Type | Progress | Surface | Redundant | Drift | Noisy | Final score |"
+        )
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for state in hop.get("top_candidate_states", []):
+            lines.append(
+                "| {rank} | {path} | {cur:.4f} | {future:.4f} | {conv:.4f} | {typ:.4f} | {prog:.4f} | {surf:.4f} | {red:.4f} | {drift:.4f} | {noisy:.4f} | {score:.4f} |".format(
+                    rank=state["rank"],
+                    path=escape_md(state.get("candidate_evidence_state", "")),
+                    cur=float(state.get("current_relevance", 0.0)),
+                    future=float(state.get("future_satisfiability", 0.0)),
+                    conv=float(state.get("useful_convergence", 0.0)),
+                    typ=float(state.get("type_compatibility", 0.0)),
+                    prog=float(state.get("progress", 0.0)),
+                    surf=float(state.get("surface_convergence_penalty", 0.0)),
+                    red=float(state.get("redundancy_penalty", 0.0)),
+                    drift=float(state.get("drift_penalty", 0.0)),
+                    noisy=float(state.get("noisy_branch_penalty", 0.0)),
+                    score=float(state.get("final_score", 0.0)),
+                )
+            )
+        lines.append("")
+    return lines
+
+
 def proof_state_choice_explanation(row: dict[str, Any]) -> list[str]:
     proof_top = row["soft_proof_state_beam"].get("top_answer") or {}
     paths = proof_top.get("paths", []) if proof_top else []
@@ -988,12 +1401,70 @@ def proof_state_choice_explanation(row: dict[str, Any]) -> list[str]:
     return lines
 
 
+def future_aware_choice_explanation(row: dict[str, Any]) -> list[str]:
+    future_top = row["future_aware_proof_state_beam"].get("top_answer") or {}
+    paths = future_top.get("paths", []) if future_top else []
+    signals = paths[0].get("soft_signals", {}) if paths else {}
+    positive_components = {
+        key: float(signals.get(key, 0.0))
+        for key in ["current_relevance", "future_satisfiability", "useful_convergence", "type_compatibility", "progress"]
+    }
+    negative_components = {
+        key: float(signals.get(key, 0.0))
+        for key in ["surface_convergence_penalty", "redundancy_penalty", "drift_penalty", "noisy_branch_penalty"]
+    }
+    strongest = max(positive_components.items(), key=lambda item: item[1], default=("", 0.0))
+    lines = [
+        f"- Strongest positive component: `{strongest[0] or 'none'}` = `{strongest[1]:.4f}`",
+        f"- Future satisfiability helped: `{positive_components.get('future_satisfiability', 0.0) > 0.0}` "
+        f"(score `{positive_components.get('future_satisfiability', 0.0):.4f}`)",
+        f"- Useful convergence helped: `{positive_components.get('useful_convergence', 0.0) > 0.0}` "
+        f"(bonus `{positive_components.get('useful_convergence', 0.0):.4f}`)",
+        f"- Surface convergence penalty applied: `{negative_components.get('surface_convergence_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('surface_convergence_penalty', 0.0):.4f}`)",
+        f"- Drift penalty applied: `{negative_components.get('drift_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('drift_penalty', 0.0):.4f}`)",
+        f"- Noisy branch penalty applied: `{negative_components.get('noisy_branch_penalty', 0.0) < 0.0}` "
+        f"(penalty `{negative_components.get('noisy_branch_penalty', 0.0):.4f}`)",
+    ]
+    if row["future_aware_proof_state_beam"]["hits_at_1"] and not row["soft_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: future-aware beat current proof-state on this question.")
+    elif row["soft_proof_state_beam"]["hits_at_1"] and not row["future_aware_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: future-aware hurt a case current proof-state got right.")
+    elif row["future_aware_proof_state_beam"]["hits_at_1"] and row["soft_proof_state_beam"]["hits_at_1"]:
+        lines.append("- Outcome: both proof-state variants were correct.")
+    else:
+        lines.append("- Outcome: both proof-state variants failed.")
+    return lines
+
+
 def escape_md(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    if kind == "proof":
+    if kind == "future":
+        selected = [
+            row for row in rows
+            if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "current_over_future":
+        selected = [
+            row for row in rows
+            if row["soft_proof_state_beam"]["final_answer_f1"] > row["future_aware_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "surface_avoidance":
+        selected = [
+            row for row in rows
+            if future_top_surface_penalty(row) < 0.0
+            and row["future_aware_proof_state_beam"]["final_answer_f1"] >= row["soft_proof_state_beam"]["final_answer_f1"]
+        ]
+    elif kind == "future_hurts":
+        selected = [
+            row for row in rows
+            if row["soft_proof_state_beam"]["hits_at_1"] and not row["future_aware_proof_state_beam"]["hits_at_1"]
+        ]
+    elif kind == "proof":
         selected = [
             row for row in rows
             if row["soft_proof_state_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
@@ -1018,8 +1489,10 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
     for row in rows[:limit]:
         baseline_top = row["baseline_path_beam"]["top_answer"] or {}
         proof_top = row["soft_proof_state_beam"]["top_answer"] or {}
+        future_top = row["future_aware_proof_state_beam"]["top_answer"] or {}
         baseline_path = top_path_readable(baseline_top)
         proof_path = top_path_readable(proof_top)
+        future_path = top_path_readable(future_top)
         likely = likely_reason(row)
         lines.extend(
             [
@@ -1030,6 +1503,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
                 f"- Baseline top path: {baseline_path}",
                 f"- Proof-state top answer: `{proof_top.get('answer_label', '')}`",
                 f"- Proof-state evidence: {proof_path}",
+                f"- Future-aware top answer: `{future_top.get('answer_label', '')}`",
+                f"- Future-aware evidence: {future_path}",
                 f"- Likely reason: {likely}",
                 "",
             ]
@@ -1059,18 +1534,23 @@ def likely_reason(row: dict[str, Any]) -> str:
 def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     baseline = row["baseline_path_beam"]
     proof = row["soft_proof_state_beam"]
+    future = row["future_aware_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
     proof_top = proof["top_answer"] or {}
+    future_top = future["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
     print(f"Q: {row['question']}", flush=True)
     print(f"Gold answer: {row['gold_answers']}", flush=True)
     print(f"Start entity: {row['start_entity']['name']} {row['start_entity']['labels']}", flush=True)
     print(f"Baseline top answer: {baseline_top.get('answer_label', '<none>')}", flush=True)
     print(f"Proof-state top answer: {proof_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated proof-state: {'yes' if proof['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
     print(f"Proof-state evidence: {top_path_readable(proof_top)}", flush=True)
+    print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)
 
 
@@ -1135,6 +1615,27 @@ def char_ngram_vector(text: str, n: int) -> dict[str, int]:
 def normalize_for_similarity(text: str) -> str:
     text = str(text).casefold().replace("_", " ")
     return " ".join(token for token in re.split(r"[^a-z0-9]+", text) if token)
+
+
+def tokenize_content(text: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(text).casefold().replace("_", " "))
+        if len(token) > 2 and token not in STOPWORDS
+    }
+
+
+def remaining_question_terms(question: str, matched_relation_text: str) -> set[str]:
+    question_terms = tokenize_content(question)
+    matched_terms = tokenize_content(matched_relation_text)
+    remaining = question_terms - matched_terms
+    return remaining or question_terms
+
+
+def token_overlap_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, len(left))
 
 
 def parse_args() -> argparse.Namespace:
