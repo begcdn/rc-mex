@@ -105,9 +105,14 @@ def main() -> None:
     write_jsonl(output_dir / "predictions.jsonl", rows)
     write_json(output_dir / "metrics.json", summary)
     (output_dir / "report.md").write_text(write_report(metrics, rows), encoding="utf-8")
+    error_overlap = build_error_overlap(rows)
+    write_json(output_dir / "error_overlap.json", error_overlap)
+    (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
+    log_line("error_overlap.json")
+    log_line("error_overlap.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -1510,6 +1515,324 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
             ]
         )
     return lines
+
+
+def build_error_overlap(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cases = [error_overlap_case(row) for row in rows]
+    summary_keys = [
+        "same_top_answer_as_baseline",
+        "same_top_answer_as_current_proof_state",
+        "same_first_hop_relation_as_baseline",
+        "same_first_hop_relation_as_current_proof_state",
+        "same_second_hop_relation_as_baseline",
+        "same_relation_sequence_as_baseline",
+        "same_drift_family_as_baseline",
+        "future_repeats_baseline_mistake",
+        "future_repeats_baseline_first_hop_different_final",
+        "future_loses_current_proof_state_win",
+        "future_avoids_surface_convergence_successfully",
+        "penalties_tiny_compared_with_positive_terms",
+    ]
+    summary = {key: sum(1 for case in cases if case[key]) for key in summary_keys}
+    summary["total_questions"] = len(cases)
+    summary["drift_family_counts_baseline"] = dict(Counter(case["baseline_drift_family"] for case in cases))
+    summary["drift_family_counts_future_aware"] = dict(Counter(case["future_aware_drift_family"] for case in cases))
+    return {
+        "summary": summary,
+        "cases": cases,
+        "examples": {
+            "future_repeats_baseline_mistakes": select_overlap_examples(cases, "future_repeats_baseline_mistake"),
+            "future_avoids_baseline_mistakes": select_overlap_examples(cases, "future_avoids_baseline_mistake"),
+            "future_loses_to_current_proof_state": select_overlap_examples(cases, "future_loses_current_proof_state_win"),
+        },
+    }
+
+
+def error_overlap_case(row: dict[str, Any]) -> dict[str, Any]:
+    baseline = row["baseline_path_beam"]
+    current = row["soft_proof_state_beam"]
+    future = row["future_aware_proof_state_beam"]
+    baseline_top = baseline.get("top_answer") or {}
+    current_top = current.get("top_answer") or {}
+    future_top = future.get("top_answer") or {}
+    baseline_evidence = top_evidence(baseline_top)
+    current_evidence = top_evidence(current_top)
+    future_evidence = top_evidence(future_top)
+    baseline_first = hop_relation_set(baseline_evidence, 1)
+    current_first = hop_relation_set(current_evidence, 1)
+    future_first = hop_relation_set(future_evidence, 1)
+    baseline_second = hop_relation_set(baseline_evidence, 2)
+    future_second = hop_relation_set(future_evidence, 2)
+    baseline_sequence = relation_sequence(baseline_evidence)
+    future_sequence = relation_sequence(future_evidence)
+    baseline_family = drift_family(baseline_top)
+    future_family = drift_family(future_top)
+    score_breakdown = future_score_breakdown(future_top)
+    same_top_as_baseline = same_answer_id(future_top, baseline_top)
+    same_top_as_current = same_answer_id(future_top, current_top)
+    same_first_as_baseline = bool(future_first & baseline_first)
+    same_first_as_current = bool(future_first & current_first)
+    same_second_as_baseline = bool(future_second & baseline_second)
+    same_sequence_as_baseline = bool(future_sequence) and future_sequence == baseline_sequence
+    same_family_as_baseline = future_family == baseline_family and future_family != "unknown"
+    future_repeats_baseline_mistake = (
+        not baseline.get("hits_at_1", False)
+        and not future.get("hits_at_1", False)
+        and (same_top_as_baseline or same_sequence_as_baseline or same_family_as_baseline)
+    )
+    future_repeats_first_hop_different_final = (
+        not baseline.get("hits_at_1", False)
+        and not future.get("hits_at_1", False)
+        and same_first_as_baseline
+        and not same_top_as_baseline
+    )
+    future_loses_current = current.get("hits_at_1", False) and not future.get("hits_at_1", False)
+    future_avoids_baseline_mistake = not baseline.get("hits_at_1", False) and future.get("hits_at_1", False)
+    future_avoids_surface = (
+        future.get("hits_at_1", False)
+        and not baseline.get("hits_at_1", False)
+        and (
+            score_breakdown["surface_convergence_penalty"] < 0.0
+            or (same_family_as_baseline is False and baseline_family != "unknown")
+        )
+    )
+    penalties_tiny = (
+        score_breakdown["positive_score_sum"] > 0.0
+        and score_breakdown["penalty_to_positive_ratio"] < 0.15
+        and not future.get("hits_at_1", False)
+    )
+    return {
+        "question_id": row["question_id"],
+        "question": row["question"],
+        "gold_answers": row["gold_answers"],
+        "baseline_top_answer": baseline_top.get("answer_label", ""),
+        "current_proof_state_top_answer": current_top.get("answer_label", ""),
+        "future_aware_top_answer": future_top.get("answer_label", ""),
+        "baseline_correct": baseline.get("hits_at_1", False),
+        "current_proof_state_correct": current.get("hits_at_1", False),
+        "future_aware_correct": future.get("hits_at_1", False),
+        "baseline_top_path": top_path_readable_plain(baseline_top),
+        "current_proof_state_top_path": top_path_readable_plain(current_top),
+        "future_aware_top_path": top_path_readable_plain(future_top),
+        "baseline_first_hop_relations": sorted(format_relation_set(baseline_first)),
+        "current_proof_state_first_hop_relations": sorted(format_relation_set(current_first)),
+        "future_aware_first_hop_relations": sorted(format_relation_set(future_first)),
+        "baseline_second_hop_relations": sorted(format_relation_set(baseline_second)),
+        "future_aware_second_hop_relations": sorted(format_relation_set(future_second)),
+        "baseline_relation_sequence": [f"{relation}/{direction}" for relation, direction in baseline_sequence],
+        "future_aware_relation_sequence": [f"{relation}/{direction}" for relation, direction in future_sequence],
+        "baseline_drift_family": baseline_family,
+        "future_aware_drift_family": future_family,
+        "same_top_answer_as_baseline": same_top_as_baseline,
+        "same_top_answer_as_current_proof_state": same_top_as_current,
+        "same_first_hop_relation_as_baseline": same_first_as_baseline,
+        "same_first_hop_relation_as_current_proof_state": same_first_as_current,
+        "same_second_hop_relation_as_baseline": same_second_as_baseline,
+        "same_relation_sequence_as_baseline": same_sequence_as_baseline,
+        "same_drift_family_as_baseline": same_family_as_baseline,
+        "future_repeats_baseline_mistake": future_repeats_baseline_mistake,
+        "future_repeats_baseline_first_hop_different_final": future_repeats_first_hop_different_final,
+        "future_loses_current_proof_state_win": future_loses_current,
+        "future_avoids_baseline_mistake": future_avoids_baseline_mistake,
+        "future_avoids_surface_convergence_successfully": future_avoids_surface,
+        "penalties_tiny_compared_with_positive_terms": penalties_tiny,
+        "score_breakdown": score_breakdown,
+    }
+
+
+def select_overlap_examples(cases: list[dict[str, Any]], flag: str, limit: int = 5) -> list[dict[str, Any]]:
+    return [case for case in cases if case.get(flag)][:limit]
+
+
+def write_error_overlap_markdown(error_overlap: dict[str, Any]) -> str:
+    summary = error_overlap["summary"]
+    lines = [
+        "# Future-Aware Error Overlap Diagnostic",
+        "",
+        "This diagnostic compares `baseline_path_beam`, current `soft_proof_state_beam`, and `future_aware_proof_state_beam` on the same selected questions.",
+        "",
+        "It does not change search, scoring, prompts, or candidate generation.",
+        "",
+        "## Summary Counts",
+        "",
+        "| Diagnostic | Count |",
+        "|---|---:|",
+    ]
+    for key, value in summary.items():
+        if isinstance(value, dict):
+            continue
+        lines.append(f"| `{key}` | {value} |")
+    lines.extend(
+        [
+            "",
+            "### Drift Families",
+            "",
+            "**Baseline**",
+            "",
+            "```json",
+            json.dumps(summary.get("drift_family_counts_baseline", {}), indent=2, sort_keys=True),
+            "```",
+            "",
+            "**Future-aware**",
+            "",
+            "```json",
+            json.dumps(summary.get("drift_family_counts_future_aware", {}), indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Future-Aware Repeats Baseline Mistakes",
+            "",
+            *overlap_example_lines(error_overlap["examples"]["future_repeats_baseline_mistakes"]),
+            "## Future-Aware Avoids Baseline Mistakes",
+            "",
+            *overlap_example_lines(error_overlap["examples"]["future_avoids_baseline_mistakes"]),
+            "## Future-Aware Loses To Current Proof-State",
+            "",
+            *overlap_example_lines(error_overlap["examples"]["future_loses_to_current_proof_state"]),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def overlap_example_lines(cases: list[dict[str, Any]]) -> list[str]:
+    if not cases:
+        return ["_None._", ""]
+    lines: list[str] = []
+    for case in cases[:5]:
+        score = case["score_breakdown"]
+        lines.extend(
+            [
+                f"### {case['question_id']}",
+                f"- Question: {case['question']}",
+                f"- Gold answer: {case['gold_answers']}",
+                f"- Baseline top: `{case['baseline_top_answer']}`",
+                f"- Baseline path: `{case['baseline_top_path']}`",
+                f"- Current proof-state top: `{case['current_proof_state_top_answer']}`",
+                f"- Current proof-state path: `{case['current_proof_state_top_path']}`",
+                f"- Future-aware top: `{case['future_aware_top_answer']}`",
+                f"- Future-aware path: `{case['future_aware_top_path']}`",
+                f"- Same top as baseline: `{case['same_top_answer_as_baseline']}`",
+                f"- Same first hop as baseline: `{case['same_first_hop_relation_as_baseline']}`",
+                f"- Same second hop as baseline: `{case['same_second_hop_relation_as_baseline']}`",
+                f"- Baseline drift family: `{case['baseline_drift_family']}`",
+                f"- Future-aware drift family: `{case['future_aware_drift_family']}`",
+                "- Future-aware score breakdown:",
+                f"  - future_bonus_total: `{score['future_bonus_total']:.4f}`",
+                f"  - useful_convergence: `{score['useful_convergence']:.4f}`",
+                f"  - surface_convergence_penalty: `{score['surface_convergence_penalty']:.4f}`",
+                f"  - redundancy_penalty: `{score['redundancy_penalty']:.4f}`",
+                f"  - drift_penalty: `{score['drift_penalty']:.4f}`",
+                f"  - noisy_branch_penalty: `{score['noisy_branch_penalty']:.4f}`",
+                f"  - positive_score_sum: `{score['positive_score_sum']:.4f}`",
+                f"  - negative_penalty_sum: `{score['negative_penalty_sum']:.4f}`",
+                f"  - penalty_to_positive_ratio: `{score['penalty_to_positive_ratio']:.4f}`",
+                "",
+            ]
+        )
+    return lines
+
+
+def same_answer_id(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return bool(left and right and left.get("answer_id") == right.get("answer_id"))
+
+
+def top_evidence(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    paths = candidate.get("paths", []) if candidate else []
+    if not paths:
+        return []
+    return paths[0].get("evidence", []) or []
+
+
+def top_path_readable_plain(candidate: dict[str, Any]) -> str:
+    paths = candidate.get("paths", []) if candidate else []
+    if not paths:
+        return ""
+    return str(paths[0].get("readable", ""))
+
+
+def hop_relation_set(evidence: list[dict[str, Any]], hop: int) -> set[tuple[str, str]]:
+    return {
+        (str(step.get("relation_id", "")), str(step.get("direction", "")))
+        for step in evidence
+        if step.get("hop") == hop and step.get("relation_id")
+    }
+
+
+def relation_sequence(evidence: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (str(step.get("relation_id", "")), str(step.get("direction", "")))
+        for step in evidence
+        if step.get("relation_id")
+    )
+
+
+def format_relation_set(values: set[tuple[str, str]]) -> set[str]:
+    return {f"{relation}/{direction}" for relation, direction in values}
+
+
+def drift_family(candidate: dict[str, Any]) -> str:
+    evidence = top_evidence(candidate)
+    if not evidence:
+        return "unknown"
+    fragments = []
+    for step in evidence:
+        fragments.append(" ".join(str(step.get(key, "")) for key in ["from_entity", "relation_id", "direction", "to_entity"]))
+        fragments.append(" ".join(str(type_name) for type_name in (step.get("to_types", []) or [])))
+    path_text = " ".join(fragments).casefold().replace("_", " ")
+    relation_ids = [str(step.get("relation_id", "")) for step in evidence]
+    entity_chain = [str(step.get("from_entity_id", "")) for step in evidence] + [str(step.get("to_entity_id", "")) for step in evidence]
+    if has_path_inverse_loop(evidence):
+        return "inverse_loop"
+    if any(term in path_text for term in ["subsidiary", "parent organization", "owner of", "owned by"]):
+        return "organization_parent_subsidiary_loop"
+    if any(term in path_text for term in ["award", "famous people", "notable", "winner", "nominated"]):
+        return "award_or_fame_drift"
+    if any(term in path_text for term in ["cast member", "film", "movie", "director", "producer", "screenwriter", "composer"]):
+        return "cast_or_film_drift"
+    if any(term in path_text for term in ["country", "capital", "shares border", "diplomatic relation", "administrative territorial"]):
+        return "geography_drift"
+    if any(term in path_text for term in ["location", "located in", "city", "state", "province"]):
+        return "broad_location_or_country_branch"
+    if len(relation_ids) != len(set(relation_ids)) or len(entity_chain) != len(set(entity_chain)):
+        return "generic_relation_loop"
+    return "unknown"
+
+
+def has_path_inverse_loop(evidence: list[dict[str, Any]]) -> bool:
+    seen = set()
+    for step in evidence:
+        edge = (step.get("from_entity_id"), step.get("relation_id"), step.get("to_entity_id"))
+        reverse = (step.get("to_entity_id"), step.get("relation_id"), step.get("from_entity_id"))
+        if reverse in seen:
+            return True
+        seen.add(edge)
+    return False
+
+
+def future_score_breakdown(future_top: dict[str, Any]) -> dict[str, float]:
+    paths = future_top.get("paths", []) if future_top else []
+    signals = paths[0].get("soft_signals", {}) if paths else {}
+    future_bonus_total = float(signals.get("future_satisfiability", 0.0)) + float(signals.get("useful_convergence", 0.0))
+    useful_convergence = float(signals.get("useful_convergence", 0.0))
+    surface = float(signals.get("surface_convergence_penalty", 0.0))
+    redundancy = float(signals.get("redundancy_penalty", 0.0))
+    drift = float(signals.get("drift_penalty", 0.0))
+    noisy = float(signals.get("noisy_branch_penalty", 0.0))
+    positive_sum = sum(
+        max(0.0, float(signals.get(key, 0.0)))
+        for key in ["current_relevance", "future_satisfiability", "useful_convergence", "type_compatibility", "progress"]
+    )
+    negative_sum = sum(abs(min(0.0, value)) for value in [surface, redundancy, drift, noisy])
+    return {
+        "future_bonus_total": future_bonus_total,
+        "useful_convergence": useful_convergence,
+        "surface_convergence_penalty": surface,
+        "redundancy_penalty": redundancy,
+        "drift_penalty": drift,
+        "noisy_branch_penalty": noisy,
+        "positive_score_sum": positive_sum,
+        "negative_penalty_sum": negative_sum,
+        "penalty_to_positive_ratio": negative_sum / positive_sum if positive_sum else 0.0,
+    }
 
 
 def top_path_readable(candidate: dict[str, Any]) -> str:
