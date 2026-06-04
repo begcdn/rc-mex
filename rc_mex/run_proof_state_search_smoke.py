@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import time
 from collections import Counter, defaultdict
@@ -61,6 +62,7 @@ TWO_SCORE_FIXED_CONSTANTS = {
 }
 
 RELATION_PROPOSAL_K = 10
+ANSWER_POOL_CAP = 100
 
 TWO_SCORE_WIDE_PROPOSAL_CONSTANTS = {
     **TWO_SCORE_FIXED_CONSTANTS,
@@ -73,6 +75,13 @@ HYBRID_RELATION_PROPOSAL_CONSTANTS = {
     "relation_proposal_k": float(RELATION_PROPOSAL_K),
     "hybrid_relation_proposal_mode": 1.0,
     "alias_dictionary_size": 10.0,
+}
+
+PATH_FAMILY_CONSTANTS = {
+    **HYBRID_RELATION_PROPOSAL_CONSTANTS,
+    "answer_pool_cap": float(ANSWER_POOL_CAP),
+    "path_family_mode": 1.0,
+    "support_bonus_weight": 0.03,
 }
 
 RELATION_ALIASES = {
@@ -199,6 +208,17 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        path_family = run_path_family_beam(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         future_aware = run_future_aware_proof_state_beam(
             graph=graph,
             example=example,
@@ -221,7 +241,7 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -235,6 +255,7 @@ def main() -> None:
             "two_score_fixed_proof_state_beam": TWO_SCORE_FIXED_CONSTANTS,
             "two_score_wide_proposal_beam": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
             "hybrid_relation_proposal_beam": HYBRID_RELATION_PROPOSAL_CONSTANTS,
+            "path_family_beam": PATH_FAMILY_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -243,27 +264,27 @@ def main() -> None:
     write_jsonl(output_dir / "predictions.jsonl", rows)
     write_json(output_dir / "metrics.json", summary)
     (output_dir / "report.md").write_text(write_report(metrics, rows), encoding="utf-8")
-    error_overlap = build_error_overlap(rows, future_key="hybrid_relation_proposal_beam", diagnostic_label="hybrid_relation_proposal_beam")
+    error_overlap = build_error_overlap(rows, future_key="path_family_beam", diagnostic_label="path_family_beam")
     write_json(output_dir / "error_overlap.json", error_overlap)
     (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
     gold_survival_audit = build_target_gold_survival_audit(
         graph,
         rows,
         args,
-        target_key="hybrid_relation_proposal_beam",
-        target_label="Hybrid Relation Proposal",
+        target_key="path_family_beam",
+        target_label="Path Family Beam",
     )
     behavior_audit = build_target_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="hybrid_relation_proposal_beam",
-        target_label="Hybrid Relation Proposal",
+        target_key="path_family_beam",
+        target_label="Path Family Beam",
     )
     code_behavior_audit = build_two_score_code_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="hybrid_relation_proposal_beam",
-        constants=HYBRID_RELATION_PROPOSAL_CONSTANTS,
+        target_key="path_family_beam",
+        constants=PATH_FAMILY_CONSTANTS,
     )
     write_json(output_dir / "gold_survival_audit.json", gold_survival_audit)
     (output_dir / "gold_survival_audit.md").write_text(write_gold_survival_audit_markdown(gold_survival_audit), encoding="utf-8")
@@ -1297,6 +1318,140 @@ def run_hybrid_relation_proposal_beam(
         mode="hybrid_relation_proposal_beam",
         debug_trace=trace,
         answer_score_key="final_proof_score",
+    )
+    result["audit_trace"] = audit_trace
+    return result
+
+
+def run_path_family_beam(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    del top_k
+    answer_type = guess_answer_type(example.question)
+    semantic_used = semantic_relation_model_available()
+    states = [
+        SearchState(
+            frontier_ids=set(example.start_entity_ids),
+            score=0.0,
+            entity_sequences=[[graph.entity_name(entity_id)] for entity_id in sorted(example.start_entity_ids)],
+            relation_sequences=[[]],
+            soft_signals={"answer_type_known": 1.0 if answer_type else 0.0},
+        )
+    ]
+    expansion_count = 0
+    trace: list[dict[str, Any]] = []
+    audit_trace: list[dict[str, Any]] = []
+    retained_family_records: list[dict[str, Any]] = []
+    for hop in [1, 2]:
+        next_states: list[SearchState] = []
+        for state in states:
+            expansion_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for source_id in sorted(state.frontier_ids):
+                frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
+                ranked = rank_relations_hybrid(example.question, frontier)
+                for candidate in ranked[:RELATION_PROPOSAL_K]:
+                    targets = relation_targets(graph, source_id, candidate, max_branch_entities)
+                    expansion_count += 1
+                    for target_id in targets:
+                        expansion_groups[target_id].append(
+                            {
+                                "source_id": source_id,
+                                "candidate": candidate,
+                                "branch_size": len(targets),
+                            }
+                        )
+            for target_id, fragments in expansion_groups.items():
+                steps = [
+                    evidence_step(graph, fragment["source_id"], fragment["candidate"], target_id, hop, fragment["branch_size"])
+                    for fragment in fragments
+                ]
+                signals = two_score_fixed_fragment_signals(
+                    graph=graph,
+                    question=example.question,
+                    answer_type=answer_type,
+                    state=state,
+                    target_id=target_id,
+                    steps=steps,
+                    hop=hop,
+                    relation_cap=relation_cap,
+                    sample_entities=sample_entities,
+                    noisy_branch_threshold=noisy_branch_threshold,
+                    start_entity_ids=example.start_entity_ids,
+                )
+                signals["relation_proposal_k"] = float(RELATION_PROPOSAL_K)
+                signals["answer_pool_cap"] = float(ANSWER_POOL_CAP)
+                signals["path_family_mode"] = 1.0
+                signals["semantic_relation_embeddings_used"] = 1.0 if semantic_used else 0.0
+                relation_sequences = extend_relation_sequences(state.relation_sequences, steps)
+                entity_sequences = extend_entity_sequences(graph, state.entity_sequences, steps)
+                next_states.append(
+                    SearchState(
+                        frontier_ids={target_id},
+                        score=state.score + signals["retention_delta"],
+                        evidence=state.evidence + steps,
+                        relation_sequences=relation_sequences,
+                        entity_sequences=entity_sequences,
+                        soft_signals=merge_two_score_fixed_signal_dicts(state.soft_signals, signals),
+                    )
+                )
+        family_records = build_path_family_records(next_states)
+        selected_records = family_records[:beam_width]
+        retained_family_records = selected_records
+        selected_states = flatten_family_states(selected_records, ANSWER_POOL_CAP)
+        all_summaries = [
+            summarize_path_family_record(record, rank)
+            for rank, record in enumerate(family_records, start=1)
+        ]
+        selected_summaries = [
+            summarize_path_family_record(record, rank)
+            for rank, record in enumerate(selected_records, start=1)
+        ]
+        audit_trace.append(
+            {
+                "hop": hop,
+                "all_candidate_states": all_summaries,
+                "selected_states": selected_summaries,
+                "all_path_families": all_summaries,
+                "selected_path_families": selected_summaries,
+                "constants": PATH_FAMILY_CONSTANTS,
+                "relation_proposal_k": RELATION_PROPOSAL_K,
+                "answer_pool_cap": ANSWER_POOL_CAP,
+                "semantic_relation_embeddings_used": semantic_used,
+                "number_of_path_families_generated": len(family_records),
+                "number_of_path_families_retained": len(selected_records),
+                "average_answer_pool_size_per_family": avg(len(record["states"]) for record in family_records),
+            }
+        )
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": all_summaries[:5],
+                    "selected_states": selected_summaries[:5],
+                    "all_path_families": all_summaries[:5],
+                    "selected_path_families": selected_summaries[:5],
+                    "constants": PATH_FAMILY_CONSTANTS,
+                    "relation_proposal_k": RELATION_PROPOSAL_K,
+                    "answer_pool_cap": ANSWER_POOL_CAP,
+                    "semantic_relation_embeddings_used": semantic_used,
+                }
+            )
+        states = selected_states
+    final_states = flatten_family_states(retained_family_records, ANSWER_POOL_CAP)
+    result = path_family_search_result(
+        graph=graph,
+        states=final_states,
+        gold_answer_ids=example.gold_answer_ids,
+        expansion_count=expansion_count,
+        debug_trace=trace,
     )
     result["audit_trace"] = audit_trace
     return result
@@ -2803,6 +2958,7 @@ def build_prediction_row(
     two_score_fixed: dict[str, Any],
     two_score_wide: dict[str, Any],
     hybrid_proposal: dict[str, Any],
+    path_family: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2812,10 +2968,13 @@ def build_prediction_row(
     two_score_fixed_correct = two_score_fixed["hits_at_1"]
     two_score_wide_correct = two_score_wide["hits_at_1"]
     hybrid_correct = hybrid_proposal["hits_at_1"]
+    path_family_correct = path_family["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
-    if baseline_correct and proof_correct and hybrid_correct:
+    if baseline_correct and proof_correct and path_family_correct:
         failure_type = "both_correct"
+    elif path_family_correct and not hybrid_correct:
+        failure_type = "path_family_correct"
     elif hybrid_correct and not two_score_wide_correct:
         failure_type = "hybrid_relation_proposal_correct"
     elif two_score_wide_correct and not two_score_fixed_correct:
@@ -2832,9 +2991,9 @@ def build_prediction_row(
         failure_type = "proof_state_correct"
     elif baseline_correct:
         failure_type = "baseline_correct"
-    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not hybrid_proposal["gold_generated"]:
+    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not path_family["gold_generated"]:
         failure_type = "gold_not_generated"
-    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not hybrid_proposal["candidate_answers"]:
+    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not path_family["candidate_answers"]:
         failure_type = "empty_frontier"
     else:
         failure_type = "both_fail"
@@ -2856,6 +3015,7 @@ def build_prediction_row(
         "two_score_fixed_proof_state_beam": two_score_fixed,
         "two_score_wide_proposal_beam": two_score_wide,
         "hybrid_relation_proposal_beam": hybrid_proposal,
+        "path_family_beam": path_family,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -2869,6 +3029,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     two_score_fixed = [row["two_score_fixed_proof_state_beam"] for row in rows]
     two_score_wide = [row["two_score_wide_proposal_beam"] for row in rows]
     hybrid = [row["hybrid_relation_proposal_beam"] for row in rows]
+    path_family = [row["path_family_beam"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
@@ -2876,6 +3037,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     two_score_fixed_overlap = [error_overlap_case(row, future_key="two_score_fixed_proof_state_beam") for row in rows]
     two_score_wide_overlap = [error_overlap_case(row, future_key="two_score_wide_proposal_beam") for row in rows]
     hybrid_overlap = [error_overlap_case(row, future_key="hybrid_relation_proposal_beam") for row in rows]
+    path_family_overlap = [error_overlap_case(row, future_key="path_family_beam") for row in rows]
     return {
         "number_of_selected_questions": len(rows),
         "baseline_hits_at_1": avg_bool(item["hits_at_1"] for item in baseline),
@@ -2884,6 +3046,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_fixed_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_fixed),
         "two_score_wide_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_wide),
         "hybrid_relation_proposal_hits_at_1": avg_bool(item["hits_at_1"] for item in hybrid),
+        "path_family_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
@@ -2892,6 +3055,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_fixed_exact_match": avg_bool(item["exact_match"] for item in two_score_fixed),
         "two_score_wide_exact_match": avg_bool(item["exact_match"] for item in two_score_wide),
         "hybrid_relation_proposal_exact_match": avg_bool(item["exact_match"] for item in hybrid),
+        "path_family_exact_match": avg_bool(item["exact_match"] for item in path_family),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
@@ -2900,6 +3064,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_fixed_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_fixed),
         "two_score_wide_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_wide),
         "hybrid_relation_proposal_final_answer_f1": avg(item["final_answer_f1"] for item in hybrid),
+        "path_family_final_answer_f1": avg(item["final_answer_f1"] for item in path_family),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
@@ -2908,6 +3073,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_fixed_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_fixed),
         "two_score_wide_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_wide),
         "hybrid_relation_proposal_gold_generated_rate": avg_bool(item["gold_generated"] for item in hybrid),
+        "path_family_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
@@ -2916,6 +3082,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_candidate_count_two_score_fixed": avg(item["candidate_count"] for item in two_score_fixed),
         "average_candidate_count_two_score_wide": avg(item["candidate_count"] for item in two_score_wide),
         "average_candidate_count_hybrid_relation_proposal": avg(item["candidate_count"] for item in hybrid),
+        "average_candidate_count_path_family": avg(item["candidate_count"] for item in path_family),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
@@ -2924,6 +3091,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_expansion_count_two_score_fixed": avg(item["expansion_count"] for item in two_score_fixed),
         "average_expansion_count_two_score_wide": avg(item["expansion_count"] for item in two_score_wide),
         "average_expansion_count_hybrid_relation_proposal": avg(item["expansion_count"] for item in hybrid),
+        "average_expansion_count_path_family": avg(item["expansion_count"] for item in path_family),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
@@ -2932,6 +3100,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_final_result_size_two_score_fixed": avg(item["final_result_size"] for item in two_score_fixed),
         "average_final_result_size_two_score_wide": avg(item["final_result_size"] for item in two_score_wide),
         "average_final_result_size_hybrid_relation_proposal": avg(item["final_result_size"] for item in hybrid),
+        "average_final_result_size_path_family": avg(item["final_result_size"] for item in path_family),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
@@ -3014,6 +3183,30 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
         ),
+        "path_family_wins_over_hybrid": sum(
+            1 for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ),
+        "hybrid_wins_over_path_family": sum(
+            1 for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ),
+        "path_family_wins_over_two_score_wide": sum(
+            1 for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ),
+        "two_score_wide_wins_over_path_family": sum(
+            1 for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ),
+        "path_family_wins_over_baseline": sum(
+            1 for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
+        ),
+        "baseline_wins_over_path_family": sum(
+            1 for row in rows
+            if row["baseline_path_beam"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ),
         "future_aware_wins_over_current_proof_state": sum(
             1 for row in rows
             if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
@@ -3042,13 +3235,13 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["hits_at_1"]
             and row["soft_proof_state_beam"]["hits_at_1"]
-            and row["hybrid_relation_proposal_beam"]["hits_at_1"]
+            and row["path_family_beam"]["hits_at_1"]
         ),
         "both_fail": sum(
             1 for row in rows
             if not row["baseline_path_beam"]["hits_at_1"]
             and not row["soft_proof_state_beam"]["hits_at_1"]
-            and not row["hybrid_relation_proposal_beam"]["hits_at_1"]
+            and not row["path_family_beam"]["hits_at_1"]
         ),
         "future_aware_avoids_surface_convergence": sum(
             1 for row in rows
@@ -3147,24 +3340,40 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["hybrid_relation_proposal_beam"]["gold_generated"] and not row["hybrid_relation_proposal_beam"]["hits_at_1"]
         ),
+        "path_family_repeats_baseline_mistake": sum(
+            1 for case in path_family_overlap
+            if case["future_repeats_baseline_mistake"]
+        ),
+        "path_family_same_first_hop_as_baseline": sum(
+            1 for case in path_family_overlap
+            if case["same_first_hop_relation_as_baseline"]
+        ),
+        "path_family_same_drift_family_as_baseline": sum(
+            1 for case in path_family_overlap
+            if case["same_drift_family_as_baseline"]
+        ),
+        "path_family_gold_generated_but_ranked_low": sum(
+            1 for row in rows
+            if row["path_family_beam"]["gold_generated"] and not row["path_family_beam"]["hits_at_1"]
+        ),
         "failure_counts": dict(Counter(row["failure_type"] for row in rows)),
     }
 
 
 def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     lines = [
-        "# Hybrid Relation-Proposal Proof-State Search Smoke Test",
+        "# Path-Family Beam Search Smoke Test",
         "",
-        "This tests whether alias-expanded hybrid relation proposal reduces lexical mismatch before fixed two-score beam pruning.",
+        "This tests whether preserving relation path families, rather than individual sibling entities, reduces early beam pruning failures.",
         "",
         "No gold relation IDs, gold prefixes, relation cards, LLM constraint extraction, ToG/Freebase, or quantum-inspired scoring are used during search.",
         "",
-        "The main comparison is `two_score_wide_proposal_beam` vs `hybrid_relation_proposal_beam`. The proof-state scorer is unchanged; only local relation proposal ranking changes.",
+        "The main comparison is `hybrid_relation_proposal_beam` vs `path_family_beam`. Relation proposal stays hybrid; beam retention groups by relation/direction path family and final answer ranking uses final proof score with a small support bonus.",
         "",
-        "Hybrid relation-proposal constants:",
+        "Path-family constants:",
         "",
         "```json",
-        json.dumps(HYBRID_RELATION_PROPOSAL_CONSTANTS, indent=2, sort_keys=True),
+        json.dumps(PATH_FAMILY_CONSTANTS, indent=2, sort_keys=True),
         "```",
         "",
         "## Metrics",
@@ -3173,6 +3382,18 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## Path-Family Wins Over Hybrid Proposal",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "path_family_over_hybrid"), limit=5),
+        "## Hybrid Proposal Wins Over Path-Family",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "hybrid_over_path_family"), limit=5),
+        "## Path-Family Wins Over Wide Lexical Proposal",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "path_family_over_two_score_wide"), limit=5),
+        "## Wide Lexical Proposal Wins Over Path-Family",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_path_family"), limit=5),
         "## Hybrid Wins Over Wide Lexical Proposal",
         "",
         *debug_section_rows(select_debug_rows(rows, "hybrid_over_two_score_wide"), limit=5),
@@ -3220,6 +3441,10 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
     for kind in [
         "hybrid_over_two_score_wide",
         "two_score_wide_over_hybrid",
+        "path_family_over_hybrid",
+        "hybrid_over_path_family",
+        "path_family_over_two_score_wide",
+        "two_score_wide_over_path_family",
         "hybrid_over_baseline",
         "baseline_over_hybrid",
         "two_score_wide_over_two_score_fixed",
@@ -3301,12 +3526,14 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "two_score_fixed_constants": TWO_SCORE_FIXED_CONSTANTS,
         "two_score_wide_constants": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
         "hybrid_relation_proposal_constants": HYBRID_RELATION_PROPOSAL_CONSTANTS,
+        "path_family_constants": PATH_FAMILY_CONSTANTS,
         "future_aware_v2_constants": FUTURE_AWARE_V2_CONSTANTS,
         "explanation": proof_state_choice_explanation(row),
         "two_score_explanation": two_score_choice_explanation(row),
         "two_score_fixed_explanation": two_score_fixed_choice_explanation(row),
         "two_score_wide_explanation": two_score_wide_choice_explanation(row),
         "hybrid_relation_proposal_explanation": hybrid_relation_proposal_choice_explanation(row),
+        "path_family_explanation": path_family_choice_explanation(row),
         "future_aware_explanation": future_aware_choice_explanation(row),
         "future_aware_v2_explanation": future_aware_v2_choice_explanation(row),
     }
@@ -3328,6 +3555,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         two_score_fixed = row["two_score_fixed_proof_state_beam"]
         two_score_wide = row["two_score_wide_proposal_beam"]
         hybrid = row["hybrid_relation_proposal_beam"]
+        path_family = row["path_family_beam"]
         future = row["future_aware_proof_state_beam"]
         future_v2 = row["future_aware_v2_proof_state_beam"]
         baseline_top = baseline["top_answer"] or {}
@@ -3336,6 +3564,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         two_score_fixed_top = two_score_fixed["top_answer"] or {}
         two_score_wide_top = two_score_wide["top_answer"] or {}
         hybrid_top = hybrid["top_answer"] or {}
+        path_family_top = path_family["top_answer"] or {}
         future_top = future["top_answer"] or {}
         future_v2_top = future_v2["top_answer"] or {}
         lines.extend(
@@ -3358,6 +3587,8 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"Hybrid proposal top final state: {top_path_readable(hybrid_top)}",
                 "",
+                f"Path-family top final state: {top_path_readable(path_family_top)}",
+                "",
                 f"Future-aware top final state: {top_path_readable(future_top)}",
                 "",
                 f"Future-aware v2 top final state: {top_path_readable(future_v2_top)}",
@@ -3368,6 +3599,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 f"Two-score fixed correct: `{two_score_fixed['hits_at_1']}`",
                 f"Two-score wide correct: `{two_score_wide['hits_at_1']}`",
                 f"Hybrid proposal correct: `{hybrid['hits_at_1']}`",
+                f"Path-family correct: `{path_family['hits_at_1']}`",
                 f"Future-aware correct: `{future['hits_at_1']}`",
                 f"Future-aware v2 correct: `{future_v2['hits_at_1']}`",
                 "",
@@ -3389,6 +3621,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Hybrid Relation-Proposal Proof-State Hop Trace",
                 "",
                 *two_score_trace_lines(hybrid.get("debug_trace", [])),
+                "### Path-Family Beam Hop Trace",
+                "",
+                *two_score_trace_lines(path_family.get("debug_trace", [])),
                 "### Future-Aware Proof-State Hop Trace",
                 "",
                 *future_aware_trace_lines(future.get("debug_trace", [])),
@@ -3410,6 +3645,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Why Hybrid Proposal Chose This",
                 "",
                 *hybrid_relation_proposal_choice_explanation(row),
+                "### Why Path-Family Beam Chose This",
+                "",
+                *path_family_choice_explanation(row),
                 "### Why Future-Aware Chose This",
                 "",
                 *future_aware_choice_explanation(row),
@@ -3699,6 +3937,16 @@ def hybrid_relation_proposal_choice_explanation(row: dict[str, Any]) -> list[str
     )
 
 
+def path_family_choice_explanation(row: dict[str, Any]) -> list[str]:
+    return two_score_choice_explanation_for(
+        row,
+        key="path_family_beam",
+        label="path-family beam",
+        compare_key="hybrid_relation_proposal_beam",
+        compare_label="hybrid relation proposal",
+    )
+
+
 def two_score_choice_explanation_for(
     row: dict[str, Any],
     key: str,
@@ -3850,6 +4098,26 @@ def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, A
             row for row in rows
             if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
         ]
+    elif kind == "path_family_over_hybrid":
+        selected = [
+            row for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "hybrid_over_path_family":
+        selected = [
+            row for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ]
+    elif kind == "path_family_over_two_score_wide":
+        selected = [
+            row for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_wide_over_path_family":
+        selected = [
+            row for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ]
     elif kind == "two_score_wide_over_hybrid":
         selected = [
             row for row in rows
@@ -3985,6 +4253,7 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         two_score_fixed_top = row["two_score_fixed_proof_state_beam"]["top_answer"] or {}
         two_score_wide_top = row["two_score_wide_proposal_beam"]["top_answer"] or {}
         hybrid_top = row["hybrid_relation_proposal_beam"]["top_answer"] or {}
+        path_family_top = row["path_family_beam"]["top_answer"] or {}
         future_top = row["future_aware_proof_state_beam"]["top_answer"] or {}
         future_v2_top = row["future_aware_v2_proof_state_beam"]["top_answer"] or {}
         baseline_path = top_path_readable(baseline_top)
@@ -3993,6 +4262,7 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         two_score_fixed_path = top_path_readable(two_score_fixed_top)
         two_score_wide_path = top_path_readable(two_score_wide_top)
         hybrid_path = top_path_readable(hybrid_top)
+        path_family_path = top_path_readable(path_family_top)
         future_path = top_path_readable(future_top)
         future_v2_path = top_path_readable(future_v2_top)
         likely = likely_reason(row)
@@ -4013,6 +4283,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
                 f"- Two-score wide evidence: {two_score_wide_path}",
                 f"- Hybrid proposal top answer: `{hybrid_top.get('answer_label', '')}`",
                 f"- Hybrid proposal evidence: {hybrid_path}",
+                f"- Path-family top answer: `{path_family_top.get('answer_label', '')}`",
+                f"- Path-family evidence: {path_family_path}",
                 f"- Future-aware top answer: `{future_top.get('answer_label', '')}`",
                 f"- Future-aware evidence: {future_path}",
                 f"- Future-aware v2 top answer: `{future_v2_top.get('answer_label', '')}`",
@@ -5500,6 +5772,15 @@ def two_score_formula_notes() -> dict[str, dict[str, Any]]:
         "proof_score_boundary": "The hybrid score is proposal-only. evidence_step preserves original label_score as relation_label_score for proof-state scoring.",
         "beam_retention": "After fixed two-score retention scoring, keep only beam_width states. Hybrid proposal does not increase final beam width.",
     }
+    formulas["path_family_beam"] = {
+        **formulas["hybrid_relation_proposal_beam"],
+        "path_family_key": "Group generated bindings by (relation_sequence, direction_sequence, depth, coarse_relation_family_sequence). The final answer entity id/name is not part of the key.",
+        "family_retention_score": "For each path family, score = max(binding retention_score) + 0.04*log1p(min(pool_size, ANSWER_POOL_CAP)) + branch_noise.",
+        "family_beam_retention": "Keep top beam_width path families after scoring, then keep up to ANSWER_POOL_CAP concrete bindings inside each retained family.",
+        "individual_sibling_pruning": "Sibling answer entities inside a retained relation path family do not compete against unrelated path families before final ranking.",
+        "final_answer_score": "path_family_search_result groups retained bindings by answer and ranks each answer by max(final_proof_score) + 0.03*log1p(number_of_supporting_paths). Raw support is not summed.",
+        "support_bonus": "Small support bonus only: 0.03*log1p(num_paths), capped indirectly by answer_pool retention.",
+    }
     return formulas
 
 
@@ -6348,6 +6629,141 @@ def future_score_breakdown(future_top: dict[str, Any]) -> dict[str, float]:
         "positive_score_sum": positive_sum,
         "negative_penalty_sum": negative_sum,
         "penalty_to_positive_ratio": negative_sum / positive_sum if positive_sum else 0.0,
+    }
+
+
+def build_path_family_records(states: list[SearchState]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[SearchState]] = defaultdict(list)
+    for state in states:
+        groups[path_family_key(state)].append(state)
+    records = []
+    for key, family_states in groups.items():
+        family_states.sort(key=lambda item: (-float(item.soft_signals.get("final_proof_score", item.score)), -item.score, state_sort_key(item)))
+        capped = family_states[:ANSWER_POOL_CAP]
+        retention_score = max((state.score for state in capped), default=0.0)
+        final_score = max((float(state.soft_signals.get("final_proof_score", 0.0)) for state in capped), default=0.0)
+        pool_size = len(family_states)
+        branch_noise = -0.05 * max(0.0, math.log1p(pool_size) - math.log1p(ANSWER_POOL_CAP / 4))
+        score = retention_score + 0.04 * math.log1p(min(pool_size, ANSWER_POOL_CAP)) + branch_noise
+        records.append(
+            {
+                "family_key": key,
+                "states": capped,
+                "all_pool_size": pool_size,
+                "retention_score": retention_score,
+                "final_proof_score": final_score,
+                "family_score": score,
+                "branch_noise": branch_noise,
+            }
+        )
+    records.sort(key=lambda item: (-float(item["family_score"]), str(item["family_key"])))
+    return records
+
+
+def path_family_key(state: SearchState) -> tuple[Any, ...]:
+    relation_sequence = tuple(step.get("relation_id", "") for step in state.evidence)
+    direction_sequence = tuple(step.get("direction", "") for step in state.evidence)
+    family_sequence = tuple(relation_family_from_text(str(step.get("relation_id", ""))) for step in state.evidence)
+    return relation_sequence, direction_sequence, len(relation_sequence), family_sequence
+
+
+def flatten_family_states(records: list[dict[str, Any]], cap: int) -> list[SearchState]:
+    out: list[SearchState] = []
+    for record in records:
+        out.extend(record.get("states", [])[:cap])
+    return out
+
+
+def summarize_path_family_record(record: dict[str, Any], rank: int) -> dict[str, Any]:
+    states = list(record.get("states", []))
+    top_state = states[0] if states else SearchState(frontier_ids=set(), score=0.0)
+    summary = summarize_two_score_state(top_state, rank)
+    summary.update(
+        {
+            "rank": rank,
+            "family_key": repr(record.get("family_key")),
+            "path_family_key": repr(record.get("family_key")),
+            "number_of_bindings": int(record.get("all_pool_size", len(states))),
+            "answer_pool_size": len(states),
+            "retention_score": float(record.get("retention_score", 0.0)),
+            "final_proof_score": float(record.get("final_proof_score", 0.0)),
+            "family_score": float(record.get("family_score", 0.0)),
+            "branch_noise": float(record.get("branch_noise", 0.0)),
+            "pool_target_entities": [next(iter(state.frontier_ids), "") for state in states[:ANSWER_POOL_CAP]],
+            "pool_target_labels": [state.evidence[-1].get("to_entity", "") for state in states[:10] if state.evidence],
+            "states": [summarize_two_score_state(state, index) for index, state in enumerate(states[:10], start=1)],
+        }
+    )
+    return summary
+
+
+def path_family_search_result(
+    graph: KnowledgeGraph,
+    states: list[SearchState],
+    gold_answer_ids: set[str],
+    expansion_count: int,
+    debug_trace: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for state in states:
+        for entity_id in state.frontier_ids:
+            final_score = float(state.soft_signals.get("final_proof_score", state.score))
+            row = grouped.setdefault(
+                entity_id,
+                {
+                    "answer_id": entity_id,
+                    "answer_label": graph.entity_name(entity_id),
+                    "score": float("-inf"),
+                    "best_path_score": float("-inf"),
+                    "raw_support_count": 0,
+                    "paths": [],
+                    "is_gold": entity_id in gold_answer_ids,
+                },
+            )
+            row["raw_support_count"] += 1
+            row["best_path_score"] = max(row["best_path_score"], final_score)
+            row["paths"].append(
+                {
+                    "path_score": final_score,
+                    "retention_score": state.score,
+                    "evidence": state.evidence,
+                    "relation_sequences": state.relation_sequences,
+                    "entity_sequences": state.entity_sequences,
+                    "soft_signals": state.soft_signals,
+                    "readable": " | ".join(step["readable"] for step in state.evidence),
+                }
+            )
+    candidates = list(grouped.values())
+    for candidate in candidates:
+        support_bonus = 0.03 * math.log1p(float(candidate.get("raw_support_count", 0)))
+        candidate["score"] = float(candidate["best_path_score"]) + support_bonus
+        candidate["support_bonus"] = support_bonus
+        candidate["num_paths"] = len(candidate["paths"])
+        if candidate["best_path_score"] == float("-inf"):
+            candidate["best_path_score"] = 0.0
+            candidate["score"] = 0.0
+    candidates.sort(key=lambda item: (-item["score"], -item["best_path_score"], item["answer_label"], item["answer_id"]))
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = rank
+        candidate["paths"].sort(key=lambda item: (-item["path_score"], item["readable"]))
+    predicted_ids = {candidates[0]["answer_id"]} if candidates else set()
+    gold_generated = any(candidate["is_gold"] for candidate in candidates)
+    p = precision(gold_answer_ids, predicted_ids)
+    r = recall(gold_answer_ids, predicted_ids)
+    return {
+        "mode": "path_family_beam",
+        "candidate_answers": candidates,
+        "top_answer": candidates[0] if candidates else None,
+        "gold_generated": gold_generated,
+        "hits_at_1": bool(predicted_ids & gold_answer_ids),
+        "exact_match": predicted_ids == gold_answer_ids if gold_answer_ids else not predicted_ids,
+        "final_answer_precision": p,
+        "final_answer_recall": r,
+        "final_answer_f1": f1(p, r),
+        "candidate_count": len(candidates),
+        "expansion_count": expansion_count,
+        "final_result_size": len(predicted_ids),
+        "debug_trace": debug_trace or [],
     }
 
 
