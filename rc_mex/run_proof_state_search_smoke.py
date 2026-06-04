@@ -68,6 +68,30 @@ TWO_SCORE_WIDE_PROPOSAL_CONSTANTS = {
     "wide_proposal_mode": 1.0,
 }
 
+HYBRID_RELATION_PROPOSAL_CONSTANTS = {
+    **TWO_SCORE_FIXED_CONSTANTS,
+    "relation_proposal_k": float(RELATION_PROPOSAL_K),
+    "hybrid_relation_proposal_mode": 1.0,
+    "alias_dictionary_size": 10.0,
+}
+
+RELATION_ALIASES = {
+    "place of birth": ["born in", "birthplace", "was born", "native of"],
+    "place of burial": ["buried in", "burial place", "grave location", "buried at"],
+    "residence": ["lives in", "resides in", "resident of"],
+    "author": ["wrote", "written by", "authored", "writer of"],
+    "cast member": ["starred in", "acted in", "appears in"],
+    "director": ["directed by", "director of", "made by"],
+    "member of sports team": ["player for", "member of team", "plays for"],
+    "headquarters location": ["headquartered in", "based in", "headquarters"],
+    "legal form": ["business type", "company type", "legal status"],
+    "occupation": ["job", "profession", "work as", "position"],
+}
+
+_SEMANTIC_RELATION_MODEL: Any | None = None
+_SEMANTIC_RELATION_MODEL_ATTEMPTED = False
+_SEMANTIC_EMBEDDING_CACHE: dict[str, Any] = {}
+
 
 @dataclass
 class SmokeExample:
@@ -164,6 +188,17 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        hybrid_proposal = run_hybrid_relation_proposal_beam(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         future_aware = run_future_aware_proof_state_beam(
             graph=graph,
             example=example,
@@ -186,7 +221,7 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -199,6 +234,7 @@ def main() -> None:
             "two_score_proof_state_beam": TWO_SCORE_CONSTANTS,
             "two_score_fixed_proof_state_beam": TWO_SCORE_FIXED_CONSTANTS,
             "two_score_wide_proposal_beam": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
+            "hybrid_relation_proposal_beam": HYBRID_RELATION_PROPOSAL_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -207,27 +243,27 @@ def main() -> None:
     write_jsonl(output_dir / "predictions.jsonl", rows)
     write_json(output_dir / "metrics.json", summary)
     (output_dir / "report.md").write_text(write_report(metrics, rows), encoding="utf-8")
-    error_overlap = build_error_overlap(rows, future_key="two_score_wide_proposal_beam", diagnostic_label="two_score_wide_proposal_beam")
+    error_overlap = build_error_overlap(rows, future_key="hybrid_relation_proposal_beam", diagnostic_label="hybrid_relation_proposal_beam")
     write_json(output_dir / "error_overlap.json", error_overlap)
     (output_dir / "error_overlap.md").write_text(write_error_overlap_markdown(error_overlap), encoding="utf-8")
     gold_survival_audit = build_target_gold_survival_audit(
         graph,
         rows,
         args,
-        target_key="two_score_wide_proposal_beam",
-        target_label="Two-Score Wide Proposal",
+        target_key="hybrid_relation_proposal_beam",
+        target_label="Hybrid Relation Proposal",
     )
     behavior_audit = build_target_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="two_score_wide_proposal_beam",
-        target_label="Two-Score Wide Proposal",
+        target_key="hybrid_relation_proposal_beam",
+        target_label="Hybrid Relation Proposal",
     )
     code_behavior_audit = build_two_score_code_behavior_audit(
         rows,
         gold_survival_audit,
-        target_key="two_score_wide_proposal_beam",
-        constants=TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
+        target_key="hybrid_relation_proposal_beam",
+        constants=HYBRID_RELATION_PROPOSAL_CONSTANTS,
     )
     write_json(output_dir / "gold_survival_audit.json", gold_survival_audit)
     (output_dir / "gold_survival_audit.md").write_text(write_gold_survival_audit_markdown(gold_survival_audit), encoding="utf-8")
@@ -1144,6 +1180,128 @@ def run_two_score_wide_proposal_beam(
     return result
 
 
+def run_hybrid_relation_proposal_beam(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    del top_k
+    answer_type = guess_answer_type(example.question)
+    semantic_used = semantic_relation_model_available()
+    states = [
+        SearchState(
+            frontier_ids=set(example.start_entity_ids),
+            score=0.0,
+            entity_sequences=[[graph.entity_name(entity_id)] for entity_id in sorted(example.start_entity_ids)],
+            relation_sequences=[[]],
+            soft_signals={"answer_type_known": 1.0 if answer_type else 0.0},
+        )
+    ]
+    expansion_count = 0
+    trace: list[dict[str, Any]] = []
+    audit_trace: list[dict[str, Any]] = []
+    for hop in [1, 2]:
+        next_states: list[SearchState] = []
+        for state in states:
+            expansion_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for source_id in sorted(state.frontier_ids):
+                frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
+                ranked = rank_relations_hybrid(example.question, frontier)
+                for candidate in ranked[:RELATION_PROPOSAL_K]:
+                    targets = relation_targets(graph, source_id, candidate, max_branch_entities)
+                    expansion_count += 1
+                    for target_id in targets:
+                        expansion_groups[target_id].append(
+                            {
+                                "source_id": source_id,
+                                "candidate": candidate,
+                                "branch_size": len(targets),
+                            }
+                        )
+            for target_id, fragments in expansion_groups.items():
+                steps = [
+                    evidence_step(graph, fragment["source_id"], fragment["candidate"], target_id, hop, fragment["branch_size"])
+                    for fragment in fragments
+                ]
+                signals = two_score_fixed_fragment_signals(
+                    graph=graph,
+                    question=example.question,
+                    answer_type=answer_type,
+                    state=state,
+                    target_id=target_id,
+                    steps=steps,
+                    hop=hop,
+                    relation_cap=relation_cap,
+                    sample_entities=sample_entities,
+                    noisy_branch_threshold=noisy_branch_threshold,
+                    start_entity_ids=example.start_entity_ids,
+                )
+                signals["relation_proposal_k"] = float(RELATION_PROPOSAL_K)
+                signals["hybrid_relation_proposal_mode"] = 1.0
+                signals["semantic_relation_embeddings_used"] = 1.0 if semantic_used else 0.0
+                relation_sequences = extend_relation_sequences(state.relation_sequences, steps)
+                entity_sequences = extend_entity_sequences(graph, state.entity_sequences, steps)
+                next_states.append(
+                    SearchState(
+                        frontier_ids={target_id},
+                        score=state.score + signals["retention_delta"],
+                        evidence=state.evidence + steps,
+                        relation_sequences=relation_sequences,
+                        entity_sequences=entity_sequences,
+                        soft_signals=merge_two_score_fixed_signal_dicts(state.soft_signals, signals),
+                    )
+                )
+        next_states.sort(key=lambda item: (-item.score, state_sort_key(item)))
+        all_summaries = [
+            summarize_two_score_state(state, rank)
+            for rank, state in enumerate(next_states, start=1)
+        ]
+        selected_states = next_states[:beam_width]
+        selected_summaries = [
+            summarize_two_score_state(state, rank)
+            for rank, state in enumerate(selected_states, start=1)
+        ]
+        audit_trace.append(
+            {
+                "hop": hop,
+                "all_candidate_states": all_summaries,
+                "selected_states": selected_summaries,
+                "constants": HYBRID_RELATION_PROPOSAL_CONSTANTS,
+                "relation_proposal_k": RELATION_PROPOSAL_K,
+                "semantic_relation_embeddings_used": semantic_used,
+            }
+        )
+        if debug_trace:
+            trace.append(
+                {
+                    "hop": hop,
+                    "top_candidate_states": all_summaries[:5],
+                    "selected_states": selected_summaries[:5],
+                    "constants": HYBRID_RELATION_PROPOSAL_CONSTANTS,
+                    "relation_proposal_k": RELATION_PROPOSAL_K,
+                    "semantic_relation_embeddings_used": semantic_used,
+                }
+            )
+        states = selected_states
+    result = search_result(
+        graph,
+        states,
+        example.gold_answer_ids,
+        expansion_count,
+        mode="hybrid_relation_proposal_beam",
+        debug_trace=trace,
+        answer_score_key="final_proof_score",
+    )
+    result["audit_trace"] = audit_trace
+    return result
+
+
 def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
     ranked = []
     for relation in frontier:
@@ -1162,6 +1320,129 @@ def rank_relations(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
         )
     ranked.sort(key=lambda item: (-item["label_score"], item["relation_id"], item["direction"]))
     return ranked
+
+
+def rank_relations_hybrid(question: str, frontier: list[Any]) -> list[dict[str, Any]]:
+    ranked = []
+    semantic_used = semantic_relation_model_available()
+    for relation in frontier:
+        label = f"{relation.predicate.replace('_', ' ')} {relation.direction}"
+        lexical_similarity = char_ngram_similarity(question, label)
+        frequency_bonus = 0.03 * min(1.0, float(relation.frequency) / 5.0)
+        relation_texts = relation_text_expansions(str(relation.predicate), str(relation.direction))
+        expansion_scores = [char_ngram_similarity(question, text) for text in relation_texts]
+        expanded_lexical_score = max(expansion_scores, default=lexical_similarity)
+        matched_aliases = [
+            text for text, score in zip(relation_texts, expansion_scores)
+            if text != label and score >= lexical_similarity + 0.02 and score >= 0.08
+        ][:5]
+        overlap = question_relation_term_overlap(question, relation_texts)
+        semantic_score = semantic_relation_score(question, " ; ".join(relation_texts)) if semantic_used else 0.0
+        non_semantic_score = max(lexical_similarity, expanded_lexical_score) + 0.05 * overlap + frequency_bonus
+        if semantic_used:
+            lexical_component = max(lexical_similarity, expanded_lexical_score) + 0.05 * overlap
+            hybrid_relation_score = 0.55 * lexical_component + 0.35 * semantic_score + 0.10 * frequency_bonus
+        else:
+            hybrid_relation_score = non_semantic_score
+        ranked.append(
+            {
+                "relation_id": relation.predicate,
+                "direction": relation.direction,
+                "frequency": relation.frequency,
+                "lexical_similarity": lexical_similarity,
+                "frequency_bonus": frequency_bonus,
+                "label_score": lexical_similarity + frequency_bonus,
+                "expanded_lexical_score": expanded_lexical_score,
+                "question_term_overlap": overlap,
+                "semantic_score": semantic_score,
+                "semantic_embeddings_used": semantic_used,
+                "hybrid_relation_score": hybrid_relation_score,
+                "proposal_score": hybrid_relation_score,
+                "matched_aliases": matched_aliases,
+                "relation_text": " ; ".join(relation_texts[:8]),
+            }
+        )
+    ranked.sort(key=lambda item: (-item["hybrid_relation_score"], item["relation_id"], item["direction"]))
+    return ranked
+
+
+def relation_text_expansions(relation_id: str, direction: str) -> list[str]:
+    label = relation_id.replace("_", " ")
+    variants = {
+        label,
+        f"{label} {direction}",
+        normalize_relation_variant(label),
+    }
+    for alias in RELATION_ALIASES.get(label.lower(), []):
+        variants.add(alias)
+        variants.add(f"{alias} {direction}")
+    if direction == "backward":
+        variants.add(f"inverse {label}")
+        variants.add(f"{label} inverse")
+    return sorted({variant.strip() for variant in variants if variant.strip()})
+
+
+def normalize_relation_variant(label: str) -> str:
+    text = label.lower().replace("-", " ").replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    replacements = {
+        "place of birth": "birth place born in",
+        "place of burial": "burial place buried in",
+        "headquarters location": "headquarters based in",
+        "cast member": "actor starred in",
+        "member of sports team": "plays for team",
+    }
+    return replacements.get(text, text)
+
+
+def question_relation_term_overlap(question: str, relation_texts: list[str]) -> float:
+    question_terms = tokenize_content(question)
+    relation_terms = set(token for text in relation_texts for token in tokenize_content(text))
+    if not question_terms or not relation_terms:
+        return 0.0
+    return len(question_terms & relation_terms) / max(1, len(question_terms))
+
+
+def semantic_relation_model_available() -> bool:
+    return get_semantic_relation_model() is not None
+
+
+def get_semantic_relation_model() -> Any | None:
+    global _SEMANTIC_RELATION_MODEL, _SEMANTIC_RELATION_MODEL_ATTEMPTED
+    if _SEMANTIC_RELATION_MODEL_ATTEMPTED:
+        return _SEMANTIC_RELATION_MODEL
+    _SEMANTIC_RELATION_MODEL_ATTEMPTED = True
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        _SEMANTIC_RELATION_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    except Exception:
+        _SEMANTIC_RELATION_MODEL = None
+    return _SEMANTIC_RELATION_MODEL
+
+
+def semantic_relation_score(question: str, relation_text: str) -> float:
+    model = get_semantic_relation_model()
+    if model is None:
+        return 0.0
+    try:
+        import numpy as np  # type: ignore
+        q_vec = semantic_embedding(question)
+        r_vec = semantic_embedding(relation_text)
+        denom = float(np.linalg.norm(q_vec) * np.linalg.norm(r_vec))
+        if denom == 0.0:
+            return 0.0
+        return max(0.0, float(np.dot(q_vec, r_vec) / denom))
+    except Exception:
+        return 0.0
+
+
+def semantic_embedding(text: str) -> Any:
+    model = get_semantic_relation_model()
+    if model is None:
+        return []
+    if text not in _SEMANTIC_EMBEDDING_CACHE:
+        _SEMANTIC_EMBEDDING_CACHE[text] = model.encode(text, normalize_embeddings=False)
+    return _SEMANTIC_EMBEDDING_CACHE[text]
 
 
 def relation_targets(graph: KnowledgeGraph, source_id: str, candidate: dict[str, Any], max_branch_entities: int) -> list[str]:
@@ -1197,6 +1478,13 @@ def evidence_step(
         "relation_label_score": candidate["label_score"],
         "lexical_similarity": candidate.get("lexical_similarity", candidate["label_score"]),
         "frequency_bonus": candidate.get("frequency_bonus", 0.0),
+        "proposal_score": candidate.get("proposal_score", candidate.get("label_score", 0.0)),
+        "hybrid_relation_score": candidate.get("hybrid_relation_score", 0.0),
+        "expanded_lexical_score": candidate.get("expanded_lexical_score", 0.0),
+        "question_term_overlap": candidate.get("question_term_overlap", 0.0),
+        "semantic_score": candidate.get("semantic_score", 0.0),
+        "semantic_embeddings_used": candidate.get("semantic_embeddings_used", False),
+        "matched_aliases": candidate.get("matched_aliases", []),
         "branch_size": branch_size,
         "readable": f"{graph.entity_name(source_id)} --{candidate['relation_id']}[{candidate['direction']}]--> {graph.entity_name(target_id)}",
     }
@@ -2497,6 +2785,12 @@ def summarize_two_score_state(state: SearchState, rank: int) -> dict[str, Any]:
         "surface_convergence_penalty": state.soft_signals.get("surface_convergence_penalty", 0.0),
         "redundancy_penalty": state.soft_signals.get("redundancy_penalty", 0.0),
         "final_proof_score": state.soft_signals.get("final_proof_score", 0.0),
+        "proposal_score": last_step.get("proposal_score", 0.0),
+        "hybrid_relation_score": last_step.get("hybrid_relation_score", 0.0),
+        "expanded_lexical_score": last_step.get("expanded_lexical_score", 0.0),
+        "question_term_overlap": last_step.get("question_term_overlap", 0.0),
+        "semantic_score": last_step.get("semantic_score", 0.0),
+        "matched_aliases": last_step.get("matched_aliases", []),
     }
 
 
@@ -2508,6 +2802,7 @@ def build_prediction_row(
     two_score: dict[str, Any],
     two_score_fixed: dict[str, Any],
     two_score_wide: dict[str, Any],
+    hybrid_proposal: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2516,10 +2811,13 @@ def build_prediction_row(
     two_score_correct = two_score["hits_at_1"]
     two_score_fixed_correct = two_score_fixed["hits_at_1"]
     two_score_wide_correct = two_score_wide["hits_at_1"]
+    hybrid_correct = hybrid_proposal["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
-    if baseline_correct and proof_correct and two_score_wide_correct:
+    if baseline_correct and proof_correct and hybrid_correct:
         failure_type = "both_correct"
+    elif hybrid_correct and not two_score_wide_correct:
+        failure_type = "hybrid_relation_proposal_correct"
     elif two_score_wide_correct and not two_score_fixed_correct:
         failure_type = "two_score_wide_correct"
     elif two_score_fixed_correct and not proof_correct:
@@ -2534,9 +2832,9 @@ def build_prediction_row(
         failure_type = "proof_state_correct"
     elif baseline_correct:
         failure_type = "baseline_correct"
-    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not two_score_wide["gold_generated"]:
+    elif not baseline["gold_generated"] and not proof_state["gold_generated"] and not hybrid_proposal["gold_generated"]:
         failure_type = "gold_not_generated"
-    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not two_score_wide["candidate_answers"]:
+    elif not baseline["candidate_answers"] or not proof_state["candidate_answers"] or not hybrid_proposal["candidate_answers"]:
         failure_type = "empty_frontier"
     else:
         failure_type = "both_fail"
@@ -2557,6 +2855,7 @@ def build_prediction_row(
         "two_score_proof_state_beam": two_score,
         "two_score_fixed_proof_state_beam": two_score_fixed,
         "two_score_wide_proposal_beam": two_score_wide,
+        "hybrid_relation_proposal_beam": hybrid_proposal,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -2569,12 +2868,14 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     two_score = [row["two_score_proof_state_beam"] for row in rows]
     two_score_fixed = [row["two_score_fixed_proof_state_beam"] for row in rows]
     two_score_wide = [row["two_score_wide_proposal_beam"] for row in rows]
+    hybrid = [row["hybrid_relation_proposal_beam"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
     two_score_overlap = [error_overlap_case(row, future_key="two_score_proof_state_beam") for row in rows]
     two_score_fixed_overlap = [error_overlap_case(row, future_key="two_score_fixed_proof_state_beam") for row in rows]
     two_score_wide_overlap = [error_overlap_case(row, future_key="two_score_wide_proposal_beam") for row in rows]
+    hybrid_overlap = [error_overlap_case(row, future_key="hybrid_relation_proposal_beam") for row in rows]
     return {
         "number_of_selected_questions": len(rows),
         "baseline_hits_at_1": avg_bool(item["hits_at_1"] for item in baseline),
@@ -2582,6 +2883,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score),
         "two_score_fixed_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_fixed),
         "two_score_wide_hits_at_1": avg_bool(item["hits_at_1"] for item in two_score_wide),
+        "hybrid_relation_proposal_hits_at_1": avg_bool(item["hits_at_1"] for item in hybrid),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
@@ -2589,6 +2891,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_exact_match": avg_bool(item["exact_match"] for item in two_score),
         "two_score_fixed_exact_match": avg_bool(item["exact_match"] for item in two_score_fixed),
         "two_score_wide_exact_match": avg_bool(item["exact_match"] for item in two_score_wide),
+        "hybrid_relation_proposal_exact_match": avg_bool(item["exact_match"] for item in hybrid),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
@@ -2596,6 +2899,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_final_answer_f1": avg(item["final_answer_f1"] for item in two_score),
         "two_score_fixed_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_fixed),
         "two_score_wide_final_answer_f1": avg(item["final_answer_f1"] for item in two_score_wide),
+        "hybrid_relation_proposal_final_answer_f1": avg(item["final_answer_f1"] for item in hybrid),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
@@ -2603,6 +2907,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "two_score_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score),
         "two_score_fixed_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_fixed),
         "two_score_wide_gold_generated_rate": avg_bool(item["gold_generated"] for item in two_score_wide),
+        "hybrid_relation_proposal_gold_generated_rate": avg_bool(item["gold_generated"] for item in hybrid),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
@@ -2610,6 +2915,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_candidate_count_two_score": avg(item["candidate_count"] for item in two_score),
         "average_candidate_count_two_score_fixed": avg(item["candidate_count"] for item in two_score_fixed),
         "average_candidate_count_two_score_wide": avg(item["candidate_count"] for item in two_score_wide),
+        "average_candidate_count_hybrid_relation_proposal": avg(item["candidate_count"] for item in hybrid),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
@@ -2617,6 +2923,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_expansion_count_two_score": avg(item["expansion_count"] for item in two_score),
         "average_expansion_count_two_score_fixed": avg(item["expansion_count"] for item in two_score_fixed),
         "average_expansion_count_two_score_wide": avg(item["expansion_count"] for item in two_score_wide),
+        "average_expansion_count_hybrid_relation_proposal": avg(item["expansion_count"] for item in hybrid),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
@@ -2624,6 +2931,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_final_result_size_two_score": avg(item["final_result_size"] for item in two_score),
         "average_final_result_size_two_score_fixed": avg(item["final_result_size"] for item in two_score_fixed),
         "average_final_result_size_two_score_wide": avg(item["final_result_size"] for item in two_score_wide),
+        "average_final_result_size_hybrid_relation_proposal": avg(item["final_result_size"] for item in hybrid),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
@@ -2690,6 +2998,22 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
         ),
+        "hybrid_wins_over_two_score_wide": sum(
+            1 for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ),
+        "two_score_wide_wins_over_hybrid": sum(
+            1 for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ),
+        "hybrid_wins_over_baseline": sum(
+            1 for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
+        ),
+        "baseline_wins_over_hybrid": sum(
+            1 for row in rows
+            if row["baseline_path_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ),
         "future_aware_wins_over_current_proof_state": sum(
             1 for row in rows
             if row["future_aware_proof_state_beam"]["final_answer_f1"] > row["soft_proof_state_beam"]["final_answer_f1"]
@@ -2718,13 +3042,13 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["baseline_path_beam"]["hits_at_1"]
             and row["soft_proof_state_beam"]["hits_at_1"]
-            and row["two_score_wide_proposal_beam"]["hits_at_1"]
+            and row["hybrid_relation_proposal_beam"]["hits_at_1"]
         ),
         "both_fail": sum(
             1 for row in rows
             if not row["baseline_path_beam"]["hits_at_1"]
             and not row["soft_proof_state_beam"]["hits_at_1"]
-            and not row["two_score_wide_proposal_beam"]["hits_at_1"]
+            and not row["hybrid_relation_proposal_beam"]["hits_at_1"]
         ),
         "future_aware_avoids_surface_convergence": sum(
             1 for row in rows
@@ -2807,24 +3131,40 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["two_score_wide_proposal_beam"]["gold_generated"] and not row["two_score_wide_proposal_beam"]["hits_at_1"]
         ),
+        "hybrid_repeats_baseline_mistake": sum(
+            1 for case in hybrid_overlap
+            if case["future_repeats_baseline_mistake"]
+        ),
+        "hybrid_same_first_hop_as_baseline": sum(
+            1 for case in hybrid_overlap
+            if case["same_first_hop_relation_as_baseline"]
+        ),
+        "hybrid_same_drift_family_as_baseline": sum(
+            1 for case in hybrid_overlap
+            if case["same_drift_family_as_baseline"]
+        ),
+        "hybrid_gold_generated_but_ranked_low": sum(
+            1 for row in rows
+            if row["hybrid_relation_proposal_beam"]["gold_generated"] and not row["hybrid_relation_proposal_beam"]["hits_at_1"]
+        ),
         "failure_counts": dict(Counter(row["failure_type"] for row in rows)),
     }
 
 
 def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     lines = [
-        "# Two-Score Wide-Proposal Proof-State Search Smoke Test",
+        "# Hybrid Relation-Proposal Proof-State Search Smoke Test",
         "",
-        "This tests whether widening the lexical relation proposal pool improves candidate survival before fixed two-score beam pruning.",
+        "This tests whether alias-expanded hybrid relation proposal reduces lexical mismatch before fixed two-score beam pruning.",
         "",
         "No gold relation IDs, gold prefixes, relation cards, LLM constraint extraction, ToG/Freebase, or quantum-inspired scoring are used during search.",
         "",
-        "The main comparison is `two_score_fixed_proof_state_beam` vs `two_score_wide_proposal_beam`. The scorer is unchanged; only the internal relation proposal pool is widened.",
+        "The main comparison is `two_score_wide_proposal_beam` vs `hybrid_relation_proposal_beam`. The proof-state scorer is unchanged; only local relation proposal ranking changes.",
         "",
-        "Two-score wide-proposal constants:",
+        "Hybrid relation-proposal constants:",
         "",
         "```json",
-        json.dumps(TWO_SCORE_WIDE_PROPOSAL_CONSTANTS, indent=2, sort_keys=True),
+        json.dumps(HYBRID_RELATION_PROPOSAL_CONSTANTS, indent=2, sort_keys=True),
         "```",
         "",
         "## Metrics",
@@ -2833,18 +3173,21 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## Hybrid Wins Over Wide Lexical Proposal",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "hybrid_over_two_score_wide"), limit=5),
+        "## Wide Lexical Proposal Wins Over Hybrid",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_hybrid"), limit=5),
+        "## Hybrid Wins Over Baseline",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "hybrid_over_baseline"), limit=5),
+        "## Baseline Wins Over Hybrid",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "baseline_over_hybrid"), limit=5),
         "## Two-Score Wide Wins Over Two-Score Fixed",
         "",
         *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_two_score_fixed"), limit=5),
-        "## Two-Score Fixed Wins Over Two-Score Wide",
-        "",
-        *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_two_score_wide"), limit=5),
-        "## Two-Score Wide Wins Over Baseline",
-        "",
-        *debug_section_rows(select_debug_rows(rows, "two_score_wide_over_baseline"), limit=5),
-        "## Baseline Wins Over Two-Score Wide",
-        "",
-        *debug_section_rows(select_debug_rows(rows, "baseline_over_two_score_wide"), limit=5),
         "## Two-Score Fixed Wins Over Current Proof-State",
         "",
         *debug_section_rows(select_debug_rows(rows, "two_score_fixed_over_current"), limit=5),
@@ -2875,6 +3218,10 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for kind in [
+        "hybrid_over_two_score_wide",
+        "two_score_wide_over_hybrid",
+        "hybrid_over_baseline",
+        "baseline_over_hybrid",
         "two_score_wide_over_two_score_fixed",
         "two_score_fixed_over_two_score_wide",
         "two_score_wide_over_baseline",
@@ -2931,6 +3278,7 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "two_score_correct": row["two_score_proof_state_beam"]["hits_at_1"],
         "two_score_fixed_correct": row["two_score_fixed_proof_state_beam"]["hits_at_1"],
         "two_score_wide_correct": row["two_score_wide_proposal_beam"]["hits_at_1"],
+        "hybrid_relation_proposal_correct": row["hybrid_relation_proposal_beam"]["hits_at_1"],
         "future_aware_correct": row["future_aware_proof_state_beam"]["hits_at_1"],
         "future_aware_v2_correct": row["future_aware_v2_proof_state_beam"]["hits_at_1"],
         "baseline_top_answer": row["baseline_path_beam"]["top_answer"],
@@ -2938,6 +3286,7 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "two_score_top_answer": row["two_score_proof_state_beam"]["top_answer"],
         "two_score_fixed_top_answer": row["two_score_fixed_proof_state_beam"]["top_answer"],
         "two_score_wide_top_answer": row["two_score_wide_proposal_beam"]["top_answer"],
+        "hybrid_relation_proposal_top_answer": row["hybrid_relation_proposal_beam"]["top_answer"],
         "future_aware_top_answer": row["future_aware_proof_state_beam"]["top_answer"],
         "future_aware_v2_top_answer": row["future_aware_v2_proof_state_beam"]["top_answer"],
         "baseline_debug_trace": row["baseline_path_beam"].get("debug_trace", []),
@@ -2945,16 +3294,19 @@ def debug_trace_json_row(row: dict[str, Any]) -> dict[str, Any]:
         "two_score_debug_trace": row["two_score_proof_state_beam"].get("debug_trace", []),
         "two_score_fixed_debug_trace": row["two_score_fixed_proof_state_beam"].get("debug_trace", []),
         "two_score_wide_debug_trace": row["two_score_wide_proposal_beam"].get("debug_trace", []),
+        "hybrid_relation_proposal_debug_trace": row["hybrid_relation_proposal_beam"].get("debug_trace", []),
         "future_aware_debug_trace": row["future_aware_proof_state_beam"].get("debug_trace", []),
         "future_aware_v2_debug_trace": row["future_aware_v2_proof_state_beam"].get("debug_trace", []),
         "two_score_constants": TWO_SCORE_CONSTANTS,
         "two_score_fixed_constants": TWO_SCORE_FIXED_CONSTANTS,
         "two_score_wide_constants": TWO_SCORE_WIDE_PROPOSAL_CONSTANTS,
+        "hybrid_relation_proposal_constants": HYBRID_RELATION_PROPOSAL_CONSTANTS,
         "future_aware_v2_constants": FUTURE_AWARE_V2_CONSTANTS,
         "explanation": proof_state_choice_explanation(row),
         "two_score_explanation": two_score_choice_explanation(row),
         "two_score_fixed_explanation": two_score_fixed_choice_explanation(row),
         "two_score_wide_explanation": two_score_wide_choice_explanation(row),
+        "hybrid_relation_proposal_explanation": hybrid_relation_proposal_choice_explanation(row),
         "future_aware_explanation": future_aware_choice_explanation(row),
         "future_aware_v2_explanation": future_aware_v2_choice_explanation(row),
     }
@@ -2975,6 +3327,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         two_score = row["two_score_proof_state_beam"]
         two_score_fixed = row["two_score_fixed_proof_state_beam"]
         two_score_wide = row["two_score_wide_proposal_beam"]
+        hybrid = row["hybrid_relation_proposal_beam"]
         future = row["future_aware_proof_state_beam"]
         future_v2 = row["future_aware_v2_proof_state_beam"]
         baseline_top = baseline["top_answer"] or {}
@@ -2982,6 +3335,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
         two_score_top = two_score["top_answer"] or {}
         two_score_fixed_top = two_score_fixed["top_answer"] or {}
         two_score_wide_top = two_score_wide["top_answer"] or {}
+        hybrid_top = hybrid["top_answer"] or {}
         future_top = future["top_answer"] or {}
         future_v2_top = future_v2["top_answer"] or {}
         lines.extend(
@@ -3002,6 +3356,8 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 f"Two-score wide top final state: {top_path_readable(two_score_wide_top)}",
                 "",
+                f"Hybrid proposal top final state: {top_path_readable(hybrid_top)}",
+                "",
                 f"Future-aware top final state: {top_path_readable(future_top)}",
                 "",
                 f"Future-aware v2 top final state: {top_path_readable(future_v2_top)}",
@@ -3011,6 +3367,7 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 f"Two-score correct: `{two_score['hits_at_1']}`",
                 f"Two-score fixed correct: `{two_score_fixed['hits_at_1']}`",
                 f"Two-score wide correct: `{two_score_wide['hits_at_1']}`",
+                f"Hybrid proposal correct: `{hybrid['hits_at_1']}`",
                 f"Future-aware correct: `{future['hits_at_1']}`",
                 f"Future-aware v2 correct: `{future_v2['hits_at_1']}`",
                 "",
@@ -3029,6 +3386,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Two-Score Wide-Proposal Proof-State Hop Trace",
                 "",
                 *two_score_trace_lines(two_score_wide.get("debug_trace", [])),
+                "### Hybrid Relation-Proposal Proof-State Hop Trace",
+                "",
+                *two_score_trace_lines(hybrid.get("debug_trace", [])),
                 "### Future-Aware Proof-State Hop Trace",
                 "",
                 *future_aware_trace_lines(future.get("debug_trace", [])),
@@ -3047,6 +3407,9 @@ def write_debug_trace_markdown(rows: list[dict[str, Any]]) -> str:
                 "### Why Two-Score Wide Chose This",
                 "",
                 *two_score_wide_choice_explanation(row),
+                "### Why Hybrid Proposal Chose This",
+                "",
+                *hybrid_relation_proposal_choice_explanation(row),
                 "### Why Future-Aware Chose This",
                 "",
                 *future_aware_choice_explanation(row),
@@ -3326,6 +3689,16 @@ def two_score_wide_choice_explanation(row: dict[str, Any]) -> list[str]:
     )
 
 
+def hybrid_relation_proposal_choice_explanation(row: dict[str, Any]) -> list[str]:
+    return two_score_choice_explanation_for(
+        row,
+        key="hybrid_relation_proposal_beam",
+        label="hybrid relation proposal",
+        compare_key="two_score_wide_proposal_beam",
+        compare_label="wide lexical proposal",
+    )
+
+
 def two_score_choice_explanation_for(
     row: dict[str, Any],
     key: str,
@@ -3472,7 +3845,27 @@ def escape_md(value: Any) -> str:
 
 
 def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    if kind == "two_score_wide_over_two_score_fixed":
+    if kind == "hybrid_over_two_score_wide":
+        selected = [
+            row for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["two_score_wide_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_wide_over_hybrid":
+        selected = [
+            row for row in rows
+            if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "hybrid_over_baseline":
+        selected = [
+            row for row in rows
+            if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["baseline_path_beam"]["final_answer_f1"]
+        ]
+    elif kind == "baseline_over_hybrid":
+        selected = [
+            row for row in rows
+            if row["baseline_path_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "two_score_wide_over_two_score_fixed":
         selected = [
             row for row in rows
             if row["two_score_wide_proposal_beam"]["final_answer_f1"] > row["two_score_fixed_proof_state_beam"]["final_answer_f1"]
@@ -3591,6 +3984,7 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         two_score_top = row["two_score_proof_state_beam"]["top_answer"] or {}
         two_score_fixed_top = row["two_score_fixed_proof_state_beam"]["top_answer"] or {}
         two_score_wide_top = row["two_score_wide_proposal_beam"]["top_answer"] or {}
+        hybrid_top = row["hybrid_relation_proposal_beam"]["top_answer"] or {}
         future_top = row["future_aware_proof_state_beam"]["top_answer"] or {}
         future_v2_top = row["future_aware_v2_proof_state_beam"]["top_answer"] or {}
         baseline_path = top_path_readable(baseline_top)
@@ -3598,6 +3992,7 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
         two_score_path = top_path_readable(two_score_top)
         two_score_fixed_path = top_path_readable(two_score_fixed_top)
         two_score_wide_path = top_path_readable(two_score_wide_top)
+        hybrid_path = top_path_readable(hybrid_top)
         future_path = top_path_readable(future_top)
         future_v2_path = top_path_readable(future_v2_top)
         likely = likely_reason(row)
@@ -3616,6 +4011,8 @@ def debug_section_rows(rows: list[dict[str, Any]], limit: int) -> list[str]:
                 f"- Two-score fixed evidence: {two_score_fixed_path}",
                 f"- Two-score wide top answer: `{two_score_wide_top.get('answer_label', '')}`",
                 f"- Two-score wide evidence: {two_score_wide_path}",
+                f"- Hybrid proposal top answer: `{hybrid_top.get('answer_label', '')}`",
+                f"- Hybrid proposal evidence: {hybrid_path}",
                 f"- Future-aware top answer: `{future_top.get('answer_label', '')}`",
                 f"- Future-aware evidence: {future_path}",
                 f"- Future-aware v2 top answer: `{future_v2_top.get('answer_label', '')}`",
@@ -3655,6 +4052,8 @@ def build_error_overlap(
         summary["diagnostic_constants"] = TWO_SCORE_FIXED_CONSTANTS
     elif future_key == "two_score_wide_proposal_beam":
         summary["diagnostic_constants"] = TWO_SCORE_WIDE_PROPOSAL_CONSTANTS
+    elif future_key == "hybrid_relation_proposal_beam":
+        summary["diagnostic_constants"] = HYBRID_RELATION_PROPOSAL_CONSTANTS
     elif future_key == "two_score_proof_state_beam":
         summary["diagnostic_constants"] = TWO_SCORE_CONSTANTS
     else:
@@ -3972,6 +4371,24 @@ def build_target_gold_survival_audit(
             } & set(case["diagnosis"])
         ),
         "number_of_sibling_ambiguity_failures": diagnosis_counts["gold_sibling_ranked_lower"],
+        "gold_first_hop_missed_by_lexical_proposal": sum(
+            1 for case in cases if not case.get("was_gold_relation_in_proposal_original_first_hop", False)
+        ),
+        "gold_first_hop_recovered_by_hybrid_proposal": sum(
+            1 for case in cases
+            if not case.get("was_gold_relation_in_proposal_original_first_hop", False)
+            and case.get("was_gold_relation_in_proposal_hybrid_first_hop", False)
+        ),
+        "gold_second_hop_missed_by_lexical_proposal": sum(
+            1 for case in cases if not case.get("was_gold_relation_in_proposal_original_second_hop", False)
+        ),
+        "gold_second_hop_recovered_by_hybrid_proposal": sum(
+            1 for case in cases
+            if not case.get("was_gold_relation_in_proposal_original_second_hop", False)
+            and case.get("was_gold_relation_in_proposal_hybrid_second_hop", False)
+        ),
+        "hybrid_raised_gold_first_hop": sum(1 for case in cases if case.get("did_hybrid_raise_gold_first_hop", False)),
+        "hybrid_raised_gold_second_hop": sum(1 for case in cases if case.get("did_hybrid_raise_gold_second_hop", False)),
     }
     return {"summary": summary, "cases": cases}
 
@@ -3991,7 +4408,7 @@ def build_target_gold_survival_case(
     hop1_selected = audit_selected_states_for_hop(audit_trace, 1)
     hop2_all = audit_states_for_hop(audit_trace, 2)
     proposal_k = target_relation_proposal_k(target_result, args)
-    relation_survival = gold_relation_survival_diagnostics(graph, row, args, proposal_k, hop1_all, hop1_selected, hop2_all)
+    relation_survival = gold_relation_survival_diagnostics(graph, row, args, proposal_k, hop1_all, hop1_selected, hop2_all, target_key)
     final_gold_candidates = [candidate for candidate in target_result.get("candidate_answers", []) if candidate.get("is_gold")]
     final_gold_candidates.sort(key=lambda item: int(item.get("rank", 999999)))
     gold_hop2_states = [state for state in hop2_all if str(state.get("target_entity", "")) in gold_ids]
@@ -4397,25 +4814,41 @@ def gold_relation_survival_diagnostics(
     hop1_all: list[dict[str, Any]],
     hop1_selected: list[dict[str, Any]],
     hop2_all: list[dict[str, Any]],
+    target_key: str,
 ) -> dict[str, Any]:
     steps = row.get("gold_relation_steps", [])
     first = steps[0] if len(steps) >= 1 else {}
     second = steps[1] if len(steps) >= 2 else {}
     start_ids = set(str(entity_id) for entity_id in row.get("start_entity", {}).get("entity_ids", []))
-    first_rank = relation_rank_in_frontier(graph, row["question"], start_ids, first, args)
+    first_rank_original = relation_rank_in_frontier(graph, row["question"], start_ids, first, args, ranker="original")
+    first_rank_hybrid = relation_rank_in_frontier(graph, row["question"], start_ids, first, args, ranker="hybrid")
     first_targets, _ = graph.follow(start_ids, first.get("relation_id", ""), first.get("direction", ""), max_proofs=10000) if first else (set(), [])
-    second_rank = relation_rank_in_frontier(graph, row["question"], first_targets, second, args)
+    second_rank_original = relation_rank_in_frontier(graph, row["question"], first_targets, second, args, ranker="original")
+    second_rank_hybrid = relation_rank_in_frontier(graph, row["question"], first_targets, second, args, ranker="hybrid")
+    use_hybrid = target_key == "hybrid_relation_proposal_beam"
+    first_rank = first_rank_hybrid if use_hybrid else first_rank_original
+    second_rank = second_rank_hybrid if use_hybrid else second_rank_original
     first_expanded = relation_step_seen_in_states(hop1_all, first, hop=1)
     first_selected = relation_step_seen_in_states(hop1_selected, first, hop=1)
     second_expanded = relation_step_seen_in_states(hop2_all, second, hop=2)
     return {
         "relation_proposal_k": proposal_k,
         "gold_first_hop_relation_rank_before_proposal": first_rank,
+        "first_hop_relation_label_rank_original_lexical": first_rank_original,
+        "first_hop_relation_label_rank_hybrid": first_rank_hybrid,
         "was_gold_first_hop_in_relation_proposal": bool(first_rank and first_rank <= proposal_k),
+        "was_gold_relation_in_proposal_original_first_hop": bool(first_rank_original and first_rank_original <= proposal_k),
+        "was_gold_relation_in_proposal_hybrid_first_hop": bool(first_rank_hybrid and first_rank_hybrid <= proposal_k),
+        "did_hybrid_raise_gold_first_hop": rank_improved(first_rank_original, first_rank_hybrid),
         "was_gold_first_hop_expanded": first_expanded,
         "was_gold_first_hop_pruned_by_beam": bool(first_rank and first_rank <= proposal_k and first_expanded and not first_selected),
         "gold_second_hop_relation_rank_before_proposal": second_rank,
+        "second_hop_relation_label_rank_original_lexical": second_rank_original,
+        "second_hop_relation_label_rank_hybrid": second_rank_hybrid,
         "was_gold_second_hop_in_relation_proposal": bool(second_rank and second_rank <= proposal_k),
+        "was_gold_relation_in_proposal_original_second_hop": bool(second_rank_original and second_rank_original <= proposal_k),
+        "was_gold_relation_in_proposal_hybrid_second_hop": bool(second_rank_hybrid and second_rank_hybrid <= proposal_k),
+        "did_hybrid_raise_gold_second_hop": rank_improved(second_rank_original, second_rank_hybrid),
         "was_gold_second_hop_expanded": second_expanded,
         "was_gold_second_hop_pruned_by_beam": bool(second_expanded and not any(str(state.get("target_entity", "")) in set(row["gold_answer_ids"]) for state in hop2_all[:int(args.beam_width)])),
     }
@@ -4427,15 +4860,24 @@ def relation_rank_in_frontier(
     source_ids: set[str],
     gold_step: dict[str, str],
     args: argparse.Namespace,
+    ranker: str = "original",
 ) -> int | None:
     if not source_ids or not gold_step:
         return None
     frontier = graph.candidate_relations(source_ids, cap=args.relation_cap, sample_entities=args.sample_entities)
-    ranked = rank_relations(question, frontier)
+    ranked = rank_relations_hybrid(question, frontier) if ranker == "hybrid" else rank_relations(question, frontier)
     for index, candidate in enumerate(ranked, start=1):
         if candidate["relation_id"] == gold_step.get("relation_id") and candidate["direction"] == gold_step.get("direction"):
             return index
     return None
+
+
+def rank_improved(original_rank: int | None, hybrid_rank: int | None) -> bool:
+    if hybrid_rank is None:
+        return False
+    if original_rank is None:
+        return True
+    return hybrid_rank < original_rank
 
 
 def relation_step_seen_in_states(states: list[dict[str, Any]], gold_step: dict[str, str], hop: int) -> bool:
@@ -4923,16 +5365,23 @@ def build_two_score_code_behavior_audit(
                 "scoring_function": "two_score_fixed_fragment_signals",
                 "final_answer_ranker": "search_result(answer_score_key='final_proof_score')",
             },
+            "hybrid_relation_proposal_beam": {
+                "file": "rc_mex/run_proof_state_search_smoke.py",
+                "search_function": "run_hybrid_relation_proposal_beam",
+                "relation_ranking_function": "rank_relations_hybrid",
+                "scoring_function": "two_score_fixed_fragment_signals",
+                "final_answer_ranker": "search_result(answer_score_key='final_proof_score')",
+            },
         },
         "exact_formulas": two_score_formula_notes(),
         "order_of_operations": {
             **order_of_operations_notes(),
             "two_score_specific": [
-                "Local relation candidates are ranked lexically first. The fixed mode expands ranked[:top_k]; wide-proposal mode expands ranked[:RELATION_PROPOSAL_K].",
+                "Local relation candidates are ranked before scoring. Fixed mode expands lexical ranked[:top_k]; wide-proposal mode expands lexical ranked[:RELATION_PROPOSAL_K]; hybrid mode expands hybrid ranked[:RELATION_PROPOSAL_K].",
                 "Beam retention sorts by cumulative SearchState.score, which is cumulative retention_score.",
                 "Final answer ranking calls search_result(..., answer_score_key='final_proof_score'), so grouped answers are ranked by final proof score.",
                 "Future satisfiability appears in retention as future_retention_bonus but is not a direct positive term in final_proof_score.",
-                f"No hard first-hop diversity pruning is applied in {target_key}; wide proposal only changes pre-scoring relation proposal size.",
+                f"No hard first-hop diversity pruning is applied in {target_key}; hybrid proposal only changes pre-scoring relation proposal ranking.",
             ],
         },
         "gate_behavior": two_score_gate_behavior_notes(states),
@@ -4949,7 +5398,7 @@ def build_two_score_code_behavior_audit(
             ),
         },
         "first_hop_diversity": {
-            "implementation": f"No hard first-hop diversity pruning in {target_key}. Wide proposal keeps beam width fixed and only widens relation proposal before scoring.",
+            "implementation": f"No hard first-hop diversity pruning in {target_key}. Hybrid proposal keeps beam width fixed and only changes relation proposal ranking before scoring.",
             "relation_family_definition": "relation_family_from_text is used only for soft diversity/drift diagnostics.",
             "family_limit": None,
             "when_applied": "Not applied as pruning.",
@@ -5043,6 +5492,13 @@ def two_score_formula_notes() -> dict[str, dict[str, Any]]:
         **formulas["two_score_fixed_proof_state_beam"],
         "relation_proposal": "At each hop, rank relations lexically as before but expand ranked[:RELATION_PROPOSAL_K] instead of ranked[:top_k]. RELATION_PROPOSAL_K is hard-coded.",
         "beam_retention": "After fixed two-score retention scoring, keep only beam_width states. Wide proposal does not increase final beam width.",
+    }
+    formulas["hybrid_relation_proposal_beam"] = {
+        **formulas["two_score_fixed_proof_state_beam"],
+        "relation_proposal": "At each hop, rank relations with hybrid_relation_score and expand ranked[:RELATION_PROPOSAL_K]. RELATION_PROPOSAL_K is hard-coded.",
+        "hybrid_relation_score": "If embeddings unavailable: max(original lexical score, alias-expanded lexical score) + 0.05*question_term_overlap + frequency_bonus. If embeddings available: 0.55*lexical_component + 0.35*semantic_score + 0.10*frequency_bonus.",
+        "proof_score_boundary": "The hybrid score is proposal-only. evidence_step preserves original label_score as relation_label_score for proof-state scoring.",
+        "beam_retention": "After fixed two-score retention scoring, keep only beam_width states. Hybrid proposal does not increase final beam width.",
     }
     return formulas
 
@@ -5920,6 +6376,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     two_score = row["two_score_proof_state_beam"]
     two_score_fixed = row["two_score_fixed_proof_state_beam"]
     two_score_wide = row["two_score_wide_proposal_beam"]
+    hybrid = row["hybrid_relation_proposal_beam"]
     future = row["future_aware_proof_state_beam"]
     future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
@@ -5927,6 +6384,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     two_score_top = two_score["top_answer"] or {}
     two_score_fixed_top = two_score_fixed["top_answer"] or {}
     two_score_wide_top = two_score_wide["top_answer"] or {}
+    hybrid_top = hybrid["top_answer"] or {}
     future_top = future["top_answer"] or {}
     future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
@@ -5938,6 +6396,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Two-score top answer: {two_score_top.get('answer_label', '<none>')}", flush=True)
     print(f"Two-score fixed top answer: {two_score_fixed_top.get('answer_label', '<none>')}", flush=True)
     print(f"Two-score wide top answer: {two_score_wide_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Hybrid proposal top answer: {hybrid_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
@@ -5945,6 +6404,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Gold generated two-score: {'yes' if two_score['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated two-score fixed: {'yes' if two_score_fixed['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated two-score wide: {'yes' if two_score_wide['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated hybrid proposal: {'yes' if hybrid['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
@@ -5952,6 +6412,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Two-score evidence: {top_path_readable(two_score_top)}", flush=True)
     print(f"Two-score fixed evidence: {top_path_readable(two_score_fixed_top)}", flush=True)
     print(f"Two-score wide evidence: {top_path_readable(two_score_wide_top)}", flush=True)
+    print(f"Hybrid proposal evidence: {top_path_readable(hybrid_top)}", flush=True)
     print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
     print(f"Future-aware v2 evidence: {top_path_readable(future_v2_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)
