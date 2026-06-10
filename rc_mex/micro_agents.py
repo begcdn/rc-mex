@@ -244,7 +244,7 @@ def link_answer_concept(
         prompt = TYPE_LINKER_SPAN_PROMPT_TEMPLATE.format(question=question)
         result = call_local_llm(prompt, prompt_version, model=model)
         raw = result["text"]
-        chosen = _resolve_span_to_concept(graph, raw, mask_names)
+        chosen = _resolve_span_to_concept(graph, raw, mask_names, question)
     elif prompt_version == TYPE_LINKER_MC_PROMPT_VERSION:
         letters = [chr(ord("A") + index) for index in range(len(shortlist))]
         candidates_block = "\n".join(f"{letter}. {name}" for letter, name in zip(letters, shortlist))
@@ -335,19 +335,38 @@ def _verify_letter_choice(raw_response: str, shortlist: list[str]) -> str | None
     return None
 
 
-def _resolve_span_to_concept(graph: KnowledgeGraph, raw_response: str, mask_names: list[str]) -> str | None:
+def _resolve_span_to_concept(
+    graph: KnowledgeGraph,
+    raw_response: str,
+    mask_names: list[str],
+    question: str = "",
+) -> str | None:
     """Map an LLM-quoted span to a KB concept with the proven symbolic machinery.
 
-    The LLM only locates the wh-focus words; concept resolution (exact lookup,
-    aliases, county rewrite) stays symbolic and verifiable."""
+    The LLM only locates the wh-focus words; concept resolution stays symbolic
+    and verifiable. Small models reliably name the focus head noun but drop
+    modifiers ("institution" for "higher education institution"), so the span
+    is first expanded to the most specific concept mention in the question
+    that contains all of the span's tokens."""
     from rc_mex.run_proof_state_search_smoke import question_concept_mentions
 
     span = raw_response.strip().splitlines()[0].strip().strip('"').strip("'").strip(".") if raw_response.strip() else ""
     normalized = normalize_text(span)
+    if normalized.startswith("type words"):
+        normalized = normalize_text(normalized[len("type words"):].lstrip(" :"))
     if not normalized or normalized == "none":
         return None
     if len(normalized.split()) > 6:
         return None
+    span_tokens = set(normalized.split())
+    if question:
+        containing = [
+            mention for mention in question_concept_mentions(graph, question, mask_names)
+            if span_tokens <= set(str(mention["concept_name"]).split())
+        ]
+        if containing:
+            containing.sort(key=lambda m: (-int(m["length"]), int(m["position"])))
+            return str(containing[0]["concept_name"])
     direct = graph.find_concepts(normalized)
     if direct:
         return normalized
