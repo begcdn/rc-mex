@@ -351,6 +351,26 @@ def main() -> None:
     (output_dir / "behavior_audit.md").write_text(write_behavior_audit_markdown(behavior_audit), encoding="utf-8")
     write_json(output_dir / "code_behavior_audit.json", code_behavior_audit)
     (output_dir / "code_behavior_audit.md").write_text(write_code_behavior_audit_markdown(code_behavior_audit), encoding="utf-8")
+    role_aware_gold_survival_audit = build_target_gold_survival_audit(
+        graph,
+        rows,
+        args,
+        target_key="path_family_answer_verifier_role_aware",
+        target_label="Path Family Answer Verifier Role-Aware",
+    )
+    role_aware_behavior_audit = build_target_behavior_audit(
+        rows,
+        role_aware_gold_survival_audit,
+        target_key="path_family_answer_verifier_role_aware",
+        target_label="Path Family Answer Verifier Role-Aware",
+    )
+    role_aware_regression_audit = build_role_aware_regression_audit(rows)
+    write_json(output_dir / "gold_survival_audit_role_aware.json", role_aware_gold_survival_audit)
+    (output_dir / "gold_survival_audit_role_aware.md").write_text(write_gold_survival_audit_markdown(role_aware_gold_survival_audit), encoding="utf-8")
+    write_json(output_dir / "behavior_audit_role_aware.json", role_aware_behavior_audit)
+    (output_dir / "behavior_audit_role_aware.md").write_text(write_behavior_audit_markdown(role_aware_behavior_audit), encoding="utf-8")
+    write_json(output_dir / "role_aware_regression_audit.json", role_aware_regression_audit)
+    (output_dir / "role_aware_regression_audit.md").write_text(write_role_aware_regression_audit_markdown(role_aware_regression_audit), encoding="utf-8")
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
@@ -358,6 +378,12 @@ def main() -> None:
     log_line("error_overlap.md")
     log_line("gold_survival_audit.json")
     log_line("gold_survival_audit.md")
+    log_line("gold_survival_audit_role_aware.json")
+    log_line("gold_survival_audit_role_aware.md")
+    log_line("behavior_audit_role_aware.json")
+    log_line("behavior_audit_role_aware.md")
+    log_line("role_aware_regression_audit.json")
+    log_line("role_aware_regression_audit.md")
     log_line("behavior_audit.json")
     log_line("behavior_audit.md")
     log_line("code_behavior_audit.json")
@@ -4959,6 +4985,224 @@ def build_target_behavior_case(row: dict[str, Any], survival: dict[str, Any], ta
         ]},
         "behavior_labels": sorted(set(labels)) or ["unclear"],
     }
+
+
+def build_role_aware_regression_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    plain_correct_role_wrong = [
+        build_role_aware_regression_case(row)
+        for row in rows
+        if row["path_family_answer_verifier"]["hits_at_1"]
+        and not row["path_family_answer_verifier_role_aware"]["hits_at_1"]
+    ]
+    role_correct_plain_wrong = [
+        build_role_aware_regression_case(row)
+        for row in rows
+        if row["path_family_answer_verifier_role_aware"]["hits_at_1"]
+        and not row["path_family_answer_verifier"]["hits_at_1"]
+    ]
+    both_correct = [
+        row["question_id"]
+        for row in rows
+        if row["path_family_answer_verifier"]["hits_at_1"]
+        and row["path_family_answer_verifier_role_aware"]["hits_at_1"]
+    ]
+    both_wrong = [
+        row["question_id"]
+        for row in rows
+        if not row["path_family_answer_verifier"]["hits_at_1"]
+        and not row["path_family_answer_verifier_role_aware"]["hits_at_1"]
+    ]
+    summary = {
+        "plain_verifier": "path_family_answer_verifier",
+        "role_aware_verifier": "path_family_answer_verifier_role_aware",
+        "total_questions": len(rows),
+        "plain_correct_role_aware_wrong": len(plain_correct_role_wrong),
+        "role_aware_correct_plain_wrong": len(role_correct_plain_wrong),
+        "both_correct": len(both_correct),
+        "both_wrong": len(both_wrong),
+        "role_aware_fixed_previous_plain_failures": len(role_correct_plain_wrong),
+        "role_aware_broke_previous_plain_successes": len(plain_correct_role_wrong),
+    }
+    return {
+        "summary": summary,
+        "plain_correct_role_aware_wrong_cases": plain_correct_role_wrong,
+        "role_aware_correct_plain_wrong_cases": role_correct_plain_wrong,
+        "both_correct_question_ids": both_correct,
+        "both_wrong_question_ids": both_wrong,
+    }
+
+
+def build_role_aware_regression_case(row: dict[str, Any]) -> dict[str, Any]:
+    plain = row["path_family_answer_verifier"]
+    role = row["path_family_answer_verifier_role_aware"]
+    plain_top = plain.get("top_answer") or {}
+    role_top = role.get("top_answer") or {}
+    plain_gold = first_gold_candidate(plain)
+    role_gold = first_gold_candidate(role)
+    plain_top_summary = verifier_candidate_regression_summary(plain_top)
+    role_top_summary = verifier_candidate_regression_summary(role_top)
+    plain_gold_summary = verifier_candidate_regression_summary(plain_gold)
+    role_gold_summary = verifier_candidate_regression_summary(role_gold)
+    return {
+        "question_id": row["question_id"],
+        "question": row["question"],
+        "gold_answers": row["gold_answers"],
+        "plain_verifier_correct": plain["hits_at_1"],
+        "role_aware_correct": role["hits_at_1"],
+        "plain_verifier_gold_generated": plain["gold_generated"],
+        "role_aware_gold_generated": role["gold_generated"],
+        "plain_verifier_top_answer": plain_top_summary,
+        "role_aware_top_answer": role_top_summary,
+        "plain_verifier_gold_candidate": plain_gold_summary,
+        "role_aware_gold_candidate": role_gold_summary,
+        "plain_top_path": top_path_readable_plain(plain_top),
+        "role_aware_top_path": top_path_readable_plain(role_top),
+        "diagnosis": role_aware_regression_diagnosis(plain_top_summary, role_top_summary, role_gold_summary),
+    }
+
+
+def first_gold_candidate(result: dict[str, Any]) -> dict[str, Any]:
+    candidates = [candidate for candidate in result.get("candidate_answers", []) if candidate.get("is_gold")]
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: int(item.get("rank", 999999)))
+    return candidates[0]
+
+
+def verifier_candidate_regression_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+    if not candidate:
+        return {}
+    verifier = candidate.get("answer_verifier", {}) or {}
+    return {
+        "answer_id": candidate.get("answer_id", ""),
+        "answer_label": candidate.get("answer_label", ""),
+        "rank": candidate.get("rank"),
+        "is_gold": bool(candidate.get("is_gold", False)),
+        "path": top_path_readable_plain(candidate),
+        "old_score": verifier.get("old_path_family_final_score", candidate.get("best_path_score", 0.0)),
+        "plain_or_role_aware_verified_score": verifier.get("verified_final_score", candidate.get("score", 0.0)),
+        "candidate_score": candidate.get("score", 0.0),
+        "verification_score": verifier.get("verification_score", 0.0),
+        "specific_type_evidence": verifier.get("specific_type_evidence", 0.0),
+        "remaining_need_evidence": verifier.get("remaining_need_evidence", 0.0),
+        "local_relation_evidence": verifier.get("local_relation_evidence", 0.0),
+        "role_aware_specific_type_score": verifier.get("role_aware_specific_type_score", verifier.get("specific_type_evidence", 0.0)),
+        "role_confusion_penalty": verifier.get("role_confusion_penalty", 0.0),
+        "broad_only_penalty": verifier.get("broad_only_penalty", 0.0),
+        "contradiction_penalty": verifier.get("contradiction_penalty", 0.0),
+        "support_bonus": verifier.get("support_bonus", candidate.get("support_bonus", 0.0)),
+        "candidate_name_score": verifier.get("candidate_name_score", 0.0),
+        "candidate_type_score": verifier.get("candidate_type_score", 0.0),
+        "candidate_relation_label_score": verifier.get("candidate_relation_label_score", 0.0),
+        "neighbor_entity_score": verifier.get("neighbor_entity_score", 0.0),
+        "candidate_name_text": verifier.get("candidate_name_text", ""),
+        "candidate_type_text": verifier.get("candidate_type_text", ""),
+        "candidate_relation_label_text": verifier.get("candidate_relation_label_text", ""),
+        "neighbor_entity_text": verifier.get("neighbor_entity_text", ""),
+        "role_aware_reason": verifier.get("role_aware_reason", ""),
+        "evidence_snippets": verifier.get("evidence_snippets", []),
+    }
+
+
+def role_aware_regression_diagnosis(
+    plain_top: dict[str, Any],
+    role_top: dict[str, Any],
+    role_gold: dict[str, Any],
+) -> list[str]:
+    labels: list[str] = []
+    if not role_top:
+        return ["no_role_aware_top_answer"]
+    if role_gold:
+        if float(role_top.get("old_score", 0.0)) > float(role_gold.get("old_score", 0.0)):
+            labels.append("old_path_score_still_favors_wrong_top")
+        if float(role_top.get("role_aware_specific_type_score", 0.0)) > float(role_gold.get("role_aware_specific_type_score", 0.0)):
+            labels.append("role_aware_specific_type_favors_wrong_top")
+        if float(role_gold.get("role_confusion_penalty", 0.0)) < 0.0:
+            labels.append("role_confusion_penalized_gold")
+        if float(role_gold.get("contradiction_penalty", 0.0)) < 0.0:
+            labels.append("contradiction_penalized_gold")
+        if float(role_top.get("candidate_relation_label_score", 0.0)) > float(role_gold.get("candidate_relation_label_score", 0.0)):
+            labels.append("relation_label_channel_favors_wrong_top")
+        if float(role_top.get("neighbor_entity_score", 0.0)) > float(role_gold.get("neighbor_entity_score", 0.0)):
+            labels.append("neighbor_channel_favors_wrong_top")
+    if plain_top and plain_top.get("answer_id") != role_top.get("answer_id"):
+        labels.append("role_aware_changed_top_answer")
+    return labels or ["unclear"]
+
+
+def write_role_aware_regression_audit_markdown(audit: dict[str, Any]) -> str:
+    summary = audit.get("summary", {})
+    lines = [
+        "# Role-Aware Verifier Regression Audit",
+        "",
+        "This compares `path_family_answer_verifier` against `path_family_answer_verifier_role_aware` on the same retained answer pools.",
+        "",
+        "No search, relation proposal, family retention, beam width, answer pool cap, or candidate generation changes are analyzed here; this is final-answer ranking only.",
+        "",
+        "## Summary",
+        "",
+    ]
+    for key, value in summary.items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Plain Correct, Role-Aware Wrong", ""])
+    for case in audit.get("plain_correct_role_aware_wrong_cases", []):
+        append_role_aware_regression_case_markdown(lines, case)
+    if not audit.get("plain_correct_role_aware_wrong_cases"):
+        lines.append("_No cases._")
+    lines.extend(["", "## Role-Aware Correct, Plain Wrong", ""])
+    for case in audit.get("role_aware_correct_plain_wrong_cases", []):
+        append_role_aware_regression_case_markdown(lines, case)
+    if not audit.get("role_aware_correct_plain_wrong_cases"):
+        lines.append("_No cases._")
+    return "\n".join(lines) + "\n"
+
+
+def append_role_aware_regression_case_markdown(lines: list[str], case: dict[str, Any]) -> None:
+    lines.extend(
+        [
+            f"### {case.get('question_id', '')}",
+            "",
+            f"- Question: {case.get('question', '')}",
+            f"- Gold answer: `{case.get('gold_answers', [])}`",
+            f"- Plain correct: `{case.get('plain_verifier_correct')}`",
+            f"- Role-aware correct: `{case.get('role_aware_correct')}`",
+            f"- Diagnosis: `{case.get('diagnosis', [])}`",
+            "",
+            "#### Plain verifier top",
+            "",
+        ]
+    )
+    append_candidate_regression_markdown(lines, case.get("plain_verifier_top_answer", {}))
+    lines.extend(["", "#### Role-aware top", ""])
+    append_candidate_regression_markdown(lines, case.get("role_aware_top_answer", {}))
+    lines.extend(["", "#### Role-aware gold candidate", ""])
+    append_candidate_regression_markdown(lines, case.get("role_aware_gold_candidate", {}))
+    lines.append("")
+
+
+def append_candidate_regression_markdown(lines: list[str], candidate: dict[str, Any]) -> None:
+    if not candidate:
+        lines.append("_No candidate._")
+        return
+    lines.extend(
+        [
+            f"- Answer: `{candidate.get('answer_label', '')}` rank=`{candidate.get('rank')}` gold=`{candidate.get('is_gold')}`",
+            f"- Path: `{candidate.get('path', '')}`",
+            f"- Old score: `{float(candidate.get('old_score', 0.0)):.4f}`",
+            f"- Verified score: `{float(candidate.get('plain_or_role_aware_verified_score', 0.0)):.4f}`",
+            f"- Verification score: `{float(candidate.get('verification_score', 0.0)):.4f}`",
+            f"- Role-aware specific type: `{float(candidate.get('role_aware_specific_type_score', 0.0)):.4f}`",
+            f"- Role confusion penalty: `{float(candidate.get('role_confusion_penalty', 0.0)):.4f}`",
+            f"- Broad-only penalty: `{float(candidate.get('broad_only_penalty', 0.0)):.4f}`",
+            f"- Contradiction penalty: `{float(candidate.get('contradiction_penalty', 0.0)):.4f}`",
+            f"- Name score/type score/relation score/neighbor score: `{float(candidate.get('candidate_name_score', 0.0)):.4f}` / `{float(candidate.get('candidate_type_score', 0.0)):.4f}` / `{float(candidate.get('candidate_relation_label_score', 0.0)):.4f}` / `{float(candidate.get('neighbor_entity_score', 0.0)):.4f}`",
+            f"- Candidate name text: `{candidate.get('candidate_name_text', '')}`",
+            f"- Candidate type text: `{candidate.get('candidate_type_text', '')}`",
+            f"- Candidate relation text: `{candidate.get('candidate_relation_label_text', '')[:300]}`",
+            f"- Neighbor entity text: `{candidate.get('neighbor_entity_text', '')[:300]}`",
+            f"- Evidence snippets: `{candidate.get('evidence_snippets', [])}`",
+        ]
+    )
 
 
 def build_target_gold_survival_audit(
