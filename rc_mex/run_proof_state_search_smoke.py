@@ -119,6 +119,12 @@ PATH_FAMILY_ANSWER_VERIFIER_ROLE_AWARE_CONSTANTS = {
     "role_aware_verification_relation_weight": 0.15,
 }
 
+PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS = {
+    **PATH_FAMILY_ANSWER_VERIFIER_CONSTANTS,
+    "concept_verifier_mode": 1.0,
+    "answer_concept_membership_weight": 0.45,
+}
+
 RELATION_ALIASES = {
     "place of birth": ["born in", "birthplace", "was born", "native of"],
     "place of burial": ["buried in", "burial place", "grave location", "buried at"],
@@ -276,6 +282,17 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        path_family_concept_verifier = run_path_family_concept_verifier(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         future_aware = run_future_aware_proof_state_beam(
             graph=graph,
             example=example,
@@ -298,7 +315,7 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -315,6 +332,7 @@ def main() -> None:
             "path_family_beam": PATH_FAMILY_CONSTANTS,
             "path_family_answer_verifier": PATH_FAMILY_ANSWER_VERIFIER_CONSTANTS,
             "path_family_answer_verifier_role_aware": PATH_FAMILY_ANSWER_VERIFIER_ROLE_AWARE_CONSTANTS,
+            "path_family_concept_verifier": PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -371,6 +389,11 @@ def main() -> None:
     (output_dir / "behavior_audit_role_aware.md").write_text(write_behavior_audit_markdown(role_aware_behavior_audit), encoding="utf-8")
     write_json(output_dir / "role_aware_regression_audit.json", role_aware_regression_audit)
     (output_dir / "role_aware_regression_audit.md").write_text(write_role_aware_regression_audit_markdown(role_aware_regression_audit), encoding="utf-8")
+    concept_regression_audit = build_concept_verifier_regression_audit(rows)
+    write_json(output_dir / "concept_verifier_regression_audit.json", concept_regression_audit)
+    (output_dir / "concept_verifier_regression_audit.md").write_text(
+        write_concept_verifier_regression_markdown(concept_regression_audit), encoding="utf-8"
+    )
     log_line("predictions.jsonl")
     log_line("metrics.json")
     log_line("report.md")
@@ -388,6 +411,8 @@ def main() -> None:
     log_line("behavior_audit.md")
     log_line("code_behavior_audit.json")
     log_line("code_behavior_audit.md")
+    log_line("concept_verifier_regression_audit.json")
+    log_line("concept_verifier_regression_audit.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -1421,10 +1446,15 @@ def run_path_family_beam(
     answer_ranker_v2: bool = False,
     answer_verifier: bool = False,
     answer_verifier_role_aware: bool = False,
+    concept_verifier: bool = False,
 ) -> dict[str, Any]:
     del top_k
     answer_type = guess_answer_type(example.question)
     semantic_used = semantic_relation_model_available()
+    answer_concept_ids: set[str] | None = None
+    if concept_verifier:
+        extracted_concept = extract_answer_concept(graph, example.question, [example.start_entity_name])
+        answer_concept_ids = set(extracted_concept["concept_ids"]) if extracted_concept else set()
     states = [
         SearchState(
             frontier_ids=set(example.start_entity_ids),
@@ -1509,7 +1539,7 @@ def run_path_family_beam(
                 "selected_states": selected_summaries,
                 "all_path_families": all_summaries,
                 "selected_path_families": selected_summaries,
-                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware),
+                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
                 "relation_proposal_k": RELATION_PROPOSAL_K,
                 "answer_pool_cap": ANSWER_POOL_CAP,
                 "semantic_relation_embeddings_used": semantic_used,
@@ -1526,7 +1556,7 @@ def run_path_family_beam(
                     "selected_states": selected_summaries[:5],
                     "all_path_families": all_summaries[:5],
                     "selected_path_families": selected_summaries[:5],
-                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware),
+                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
                     "relation_proposal_k": RELATION_PROPOSAL_K,
                     "answer_pool_cap": ANSWER_POOL_CAP,
                     "semantic_relation_embeddings_used": semantic_used,
@@ -1541,14 +1571,20 @@ def run_path_family_beam(
         gold_answer_ids=example.gold_answer_ids,
         expansion_count=expansion_count,
         debug_trace=trace,
-        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware),
+        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
         answer_ranker_v2=answer_ranker_v2,
         answer_verifier=answer_verifier,
         answer_verifier_role_aware=answer_verifier_role_aware,
         family_records=retained_family_records,
         answer_type=answer_type,
+        answer_concept_ids=answer_concept_ids,
     )
     result["audit_trace"] = audit_trace
+    if concept_verifier:
+        result["answer_concept_extraction"] = {
+            "extracted_concept_name": extracted_concept["concept_name"] if extracted_concept else "",
+            "extracted_concept_ids": sorted(answer_concept_ids or set()),
+        }
     return result
 
 
@@ -1627,7 +1663,40 @@ def run_path_family_answer_verifier_role_aware(
     )
 
 
-def path_family_ranker_mode(answer_ranker_v2: bool, answer_verifier: bool, answer_verifier_role_aware: bool = False) -> str:
+def run_path_family_concept_verifier(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    return run_path_family_beam(
+        graph=graph,
+        example=example,
+        top_k=top_k,
+        beam_width=beam_width,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+        max_branch_entities=max_branch_entities,
+        noisy_branch_threshold=noisy_branch_threshold,
+        debug_trace=debug_trace,
+        answer_verifier=True,
+        concept_verifier=True,
+    )
+
+
+def path_family_ranker_mode(
+    answer_ranker_v2: bool,
+    answer_verifier: bool,
+    answer_verifier_role_aware: bool = False,
+    concept_verifier: bool = False,
+) -> str:
+    if concept_verifier:
+        return "path_family_concept_verifier"
     if answer_verifier_role_aware:
         return "path_family_answer_verifier_role_aware"
     if answer_verifier:
@@ -1637,7 +1706,14 @@ def path_family_ranker_mode(answer_ranker_v2: bool, answer_verifier: bool, answe
     return "path_family_beam"
 
 
-def path_family_ranker_constants(answer_ranker_v2: bool, answer_verifier: bool, answer_verifier_role_aware: bool = False) -> dict[str, float]:
+def path_family_ranker_constants(
+    answer_ranker_v2: bool,
+    answer_verifier: bool,
+    answer_verifier_role_aware: bool = False,
+    concept_verifier: bool = False,
+) -> dict[str, float]:
+    if concept_verifier:
+        return PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS
     if answer_verifier_role_aware:
         return PATH_FAMILY_ANSWER_VERIFIER_ROLE_AWARE_CONSTANTS
     if answer_verifier:
@@ -3151,6 +3227,7 @@ def build_prediction_row(
     path_family: dict[str, Any],
     path_family_answer_verifier: dict[str, Any],
     path_family_answer_verifier_role_aware: dict[str, Any],
+    path_family_concept_verifier: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3163,12 +3240,15 @@ def build_prediction_row(
     path_family_correct = path_family["hits_at_1"]
     path_family_verifier_correct = path_family_answer_verifier["hits_at_1"]
     path_family_verifier_role_aware_correct = path_family_answer_verifier_role_aware["hits_at_1"]
+    path_family_concept_verifier_correct = path_family_concept_verifier["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
     if baseline_correct and proof_correct and path_family_verifier_role_aware_correct:
         failure_type = "both_correct"
     elif path_family_verifier_role_aware_correct and not path_family_verifier_correct:
         failure_type = "path_family_answer_verifier_role_aware_correct"
+    elif path_family_concept_verifier_correct and not path_family_verifier_correct:
+        failure_type = "path_family_concept_verifier_correct"
     elif path_family_verifier_correct and not path_family_correct:
         failure_type = "path_family_answer_verifier_correct"
     elif path_family_correct and not hybrid_correct:
@@ -3216,6 +3296,7 @@ def build_prediction_row(
         "path_family_beam": path_family,
         "path_family_answer_verifier": path_family_answer_verifier,
         "path_family_answer_verifier_role_aware": path_family_answer_verifier_role_aware,
+        "path_family_concept_verifier": path_family_concept_verifier,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -3232,6 +3313,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     path_family = [row["path_family_beam"] for row in rows]
     path_family_verifier = [row["path_family_answer_verifier"] for row in rows]
     path_family_verifier_role_aware = [row["path_family_answer_verifier_role_aware"] for row in rows]
+    path_family_concept = [row["path_family_concept_verifier"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
@@ -3253,6 +3335,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family),
         "path_family_answer_verifier_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_verifier_role_aware),
+        "path_family_concept_verifier_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_concept),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
@@ -3264,6 +3347,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_exact_match": avg_bool(item["exact_match"] for item in path_family),
         "path_family_answer_verifier_exact_match": avg_bool(item["exact_match"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_exact_match": avg_bool(item["exact_match"] for item in path_family_verifier_role_aware),
+        "path_family_concept_verifier_exact_match": avg_bool(item["exact_match"] for item in path_family_concept),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
@@ -3275,6 +3359,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_final_answer_f1": avg(item["final_answer_f1"] for item in path_family),
         "path_family_answer_verifier_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_verifier_role_aware),
+        "path_family_concept_verifier_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_concept),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
@@ -3286,6 +3371,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family),
         "path_family_answer_verifier_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_verifier_role_aware),
+        "path_family_concept_verifier_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_concept),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
@@ -3297,6 +3383,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_candidate_count_path_family": avg(item["candidate_count"] for item in path_family),
         "average_candidate_count_path_family_answer_verifier": avg(item["candidate_count"] for item in path_family_verifier),
         "average_candidate_count_path_family_answer_verifier_role_aware": avg(item["candidate_count"] for item in path_family_verifier_role_aware),
+        "average_candidate_count_path_family_concept_verifier": avg(item["candidate_count"] for item in path_family_concept),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
@@ -3308,6 +3395,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_expansion_count_path_family": avg(item["expansion_count"] for item in path_family),
         "average_expansion_count_path_family_answer_verifier": avg(item["expansion_count"] for item in path_family_verifier),
         "average_expansion_count_path_family_answer_verifier_role_aware": avg(item["expansion_count"] for item in path_family_verifier_role_aware),
+        "average_expansion_count_path_family_concept_verifier": avg(item["expansion_count"] for item in path_family_concept),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
@@ -3319,6 +3407,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_final_result_size_path_family": avg(item["final_result_size"] for item in path_family),
         "average_final_result_size_path_family_answer_verifier": avg(item["final_result_size"] for item in path_family_verifier),
         "average_final_result_size_path_family_answer_verifier_role_aware": avg(item["final_result_size"] for item in path_family_verifier_role_aware),
+        "average_final_result_size_path_family_concept_verifier": avg(item["final_result_size"] for item in path_family_concept),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
@@ -3456,6 +3545,22 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "hybrid_wins_over_path_family_answer_verifier": sum(
             1 for row in rows
             if row["hybrid_relation_proposal_beam"]["final_answer_f1"] > row["path_family_answer_verifier"]["final_answer_f1"]
+        ),
+        "path_family_concept_verifier_wins_over_answer_verifier": sum(
+            1 for row in rows
+            if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_answer_verifier"]["final_answer_f1"]
+        ),
+        "path_family_answer_verifier_wins_over_concept_verifier": sum(
+            1 for row in rows
+            if row["path_family_answer_verifier"]["final_answer_f1"] > row["path_family_concept_verifier"]["final_answer_f1"]
+        ),
+        "path_family_concept_verifier_wins_over_path_family": sum(
+            1 for row in rows
+            if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_beam"]["final_answer_f1"]
+        ),
+        "path_family_wins_over_concept_verifier": sum(
+            1 for row in rows
+            if row["path_family_beam"]["final_answer_f1"] > row["path_family_concept_verifier"]["final_answer_f1"]
         ),
         "future_aware_wins_over_current_proof_state": sum(
             1 for row in rows
@@ -3662,6 +3767,10 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         "",
         "```json",
         json.dumps(PATH_FAMILY_ANSWER_VERIFIER_ROLE_AWARE_CONSTANTS, indent=2, sort_keys=True),
+        "Path-family concept verifier constants:",
+        "",
+        "```json",
+        json.dumps(PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS, indent=2, sort_keys=True),
         "```",
         "",
         "## Metrics",
@@ -3670,6 +3779,12 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## Concept Verifier Wins Over Answer Verifier",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "concept_verifier_over_verifier"), limit=5),
+        "## Answer Verifier Wins Over Concept Verifier",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "verifier_over_concept_verifier"), limit=5),
         "## Answer Verifier Wins Over Path-Family",
         "",
         *debug_section_rows(select_debug_rows(rows, "path_family_verifier_over_path_family"), limit=5),
@@ -3740,6 +3855,8 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
         "two_score_wide_over_hybrid",
         "path_family_over_hybrid",
         "hybrid_over_path_family",
+        "concept_verifier_over_verifier",
+        "verifier_over_concept_verifier",
         "path_family_verifier_over_path_family",
         "path_family_over_v2",
         "path_family_verifier_over_hybrid",
@@ -4472,6 +4589,16 @@ def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, A
         selected = [
             row for row in rows
             if row["path_family_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "concept_verifier_over_verifier":
+        selected = [
+            row for row in rows
+            if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_answer_verifier"]["final_answer_f1"]
+        ]
+    elif kind == "verifier_over_concept_verifier":
+        selected = [
+            row for row in rows
+            if row["path_family_answer_verifier"]["final_answer_f1"] > row["path_family_concept_verifier"]["final_answer_f1"]
         ]
     elif kind == "path_family_verifier_over_path_family":
         selected = [
@@ -7470,6 +7597,110 @@ def answer_ranker_v2_components(
     }
 
 
+CONCEPT_PHRASE_ALIASES = {
+    "movie": "film",
+    "movies": "film",
+    "person": "human",
+}
+
+WH_PERSON_TOKENS = {"who", "whom", "whose"}
+WH_TOKENS = {"which", "what"}
+WH_SKIPPABLE_TOKENS = {"is", "the", "a", "an", "its"}
+
+
+def normalize_question_tokens(text: str) -> list[str]:
+    return [token for token in re.split(r"[^a-z0-9]+", str(text).casefold()) if token]
+
+
+def mask_token_span(tokens: list[str], mask_tokens: list[str]) -> list[str]:
+    out = list(tokens)
+    span = len(mask_tokens)
+    for index in range(len(out) - span + 1):
+        if out[index : index + span] == mask_tokens:
+            for offset in range(span):
+                out[index + offset] = "<topic>"
+    return out
+
+
+def is_wh_adjacent(tokens: list[str], position: int) -> bool:
+    index = position - 1
+    while index >= 0 and tokens[index] in WH_SKIPPABLE_TOKENS:
+        index -= 1
+    return index >= 0 and tokens[index] in WH_TOKENS
+
+
+def question_concept_mentions(
+    graph: KnowledgeGraph,
+    question: str,
+    mask_names: list[str],
+) -> list[dict[str, Any]]:
+    """All KB concept names appearing in the question as whole-word token spans."""
+    tokens = normalize_question_tokens(question)
+    for name in mask_names:
+        mask_tokens = normalize_question_tokens(name)
+        if mask_tokens:
+            tokens = mask_token_span(tokens, mask_tokens)
+    mentions = []
+    for index in range(len(tokens)):
+        for span in range(1, 7):
+            if index + span > len(tokens):
+                break
+            phrase = " ".join(tokens[index : index + span])
+            phrase = CONCEPT_PHRASE_ALIASES.get(phrase, phrase)
+            concept_ids = graph.find_concepts(phrase)
+            if not concept_ids and span == 2 and tokens[index + 1] in {"county", "counties"}:
+                phrase = f"county of {tokens[index]}"
+                concept_ids = graph.find_concepts(phrase)
+            if concept_ids:
+                mentions.append(
+                    {
+                        "concept_name": phrase,
+                        "concept_ids": sorted(concept_ids),
+                        "position": index,
+                        "length": span,
+                        "wh_adjacent": is_wh_adjacent(tokens, index),
+                    }
+                )
+    mentions.sort(key=lambda item: (item["position"], -item["length"], item["concept_name"]))
+    deduped = []
+    covered_until = -1
+    for mention in mentions:
+        if mention["position"] <= covered_until:
+            continue
+        deduped.append(mention)
+        covered_until = mention["position"] + mention["length"] - 1
+    return deduped
+
+
+def extract_answer_concept(graph: KnowledgeGraph, question: str, mask_names: list[str]) -> dict[str, Any] | None:
+    """Answer concept recovered from question text and the KB concept inventory only.
+
+    Priority: if the first wh-token is who/whom/whose, the answer is a person;
+    otherwise the concept mention directly following a wh-word; otherwise the
+    earliest mention (longest on ties). Relative-clause "who/whose" later in
+    the sentence must not override an answer wh-phrase like "what band".
+    """
+    tokens = normalize_question_tokens(question)
+    first_wh = next((token for token in tokens if token in WH_PERSON_TOKENS | WH_TOKENS), "")
+    if first_wh in WH_PERSON_TOKENS:
+        human_ids = graph.find_concepts("human")
+        if human_ids:
+            return {
+                "concept_name": "human",
+                "concept_ids": sorted(human_ids),
+                "position": -1,
+                "length": 1,
+                "wh_adjacent": True,
+            }
+    mentions = question_concept_mentions(graph, question, mask_names)
+    if not mentions:
+        return None
+    wh_adjacent = [mention for mention in mentions if mention["wh_adjacent"]]
+    if wh_adjacent:
+        return wh_adjacent[0]
+    return mentions[0]
+
+
 def answer_side_verification(
     graph: KnowledgeGraph,
     question: str,
@@ -7478,6 +7709,7 @@ def answer_side_verification(
     old_score: float,
     evidence: list[dict[str, Any]],
     support_count: int,
+    answer_concept_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     condition_terms = specific_answer_condition_terms(question, answer_type)
     candidate_types = graph.entity_type_names(entity_id)
@@ -7491,6 +7723,15 @@ def answer_side_verification(
     contradiction = verifier_contradiction_penalty(question, answer_type, specific_type, local_text)
     verification = min(1.0, 0.50 * specific_type + 0.30 * remaining + 0.20 * relation_evidence)
     support_bonus = 0.03 * math.log1p(float(support_count))
+    # Structural evidence: the candidate is an instance (with ancestor closure) of a
+    # KB concept named in the question. Positive-only; exact no-op when no concept
+    # was extracted or the candidate is not an instance.
+    concept_membership = (
+        1.0 if answer_concept_ids and graph.is_instance_of_any(entity_id, answer_concept_ids) else 0.0
+    )
+    concept_membership_bonus = (
+        float(PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS["answer_concept_membership_weight"]) * concept_membership
+    )
     verified_score = (
         old_score
         + float(PATH_FAMILY_ANSWER_VERIFIER_CONSTANTS["verification_score_weight"]) * verification
@@ -7500,6 +7741,7 @@ def answer_side_verification(
         + broad_penalty
         + contradiction
         + support_bonus
+        + concept_membership_bonus
     )
     return {
         "old_path_family_final_score": old_score,
@@ -7511,6 +7753,8 @@ def answer_side_verification(
         "broad_only_penalty": broad_penalty,
         "contradiction_penalty": contradiction,
         "support_bonus": support_bonus,
+        "answer_concept_membership": concept_membership,
+        "answer_concept_membership_bonus": concept_membership_bonus,
         "condition_terms": condition_terms,
         "candidate_types": candidate_types,
         "local_relation_evidence_snippets": snippets,
@@ -7977,6 +8221,7 @@ def build_family_answer_ranker_diagnostics(
     answer_ranker_v2: bool,
     answer_verifier: bool = False,
     answer_verifier_role_aware: bool = False,
+    answer_concept_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     for family_rank, record in enumerate(family_records, start=1):
@@ -8025,6 +8270,7 @@ def build_family_answer_ranker_diagnostics(
                 old_score=float(candidate["best_path_score"]),
                 evidence=evidence,
                 support_count=int(candidate["raw_support_count"]),
+                answer_concept_ids=answer_concept_ids,
             )
             role_aware_verifier = answer_side_verification_role_aware(
                 graph=graph,
@@ -8116,6 +8362,7 @@ def path_family_search_result(
     answer_verifier_role_aware: bool = False,
     family_records: list[dict[str, Any]] | None = None,
     answer_type: str = "",
+    answer_concept_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     grouped: dict[str, dict[str, Any]] = {}
     for state in states:
@@ -8167,16 +8414,27 @@ def path_family_search_result(
             candidate["old_final_proof_score"] = components["old_final_proof_score"]
             candidate["new_final_answer_score_v2"] = components["new_final_answer_score_v2"]
         elif answer_verifier or answer_verifier_role_aware:
-            verifier_fn = answer_side_verification_role_aware if answer_verifier_role_aware else answer_side_verification
-            verifier = verifier_fn(
-                graph=graph,
-                question=question,
-                answer_type=answer_type,
-                entity_id=str(candidate["answer_id"]),
-                old_score=float(candidate["best_path_score"]),
-                evidence=best_path.get("evidence", []) or [],
-                support_count=support_count,
-            )
+            if answer_verifier_role_aware:
+                verifier = answer_side_verification_role_aware(
+                    graph=graph,
+                    question=question,
+                    answer_type=answer_type,
+                    entity_id=str(candidate["answer_id"]),
+                    old_score=float(candidate["best_path_score"]),
+                    evidence=best_path.get("evidence", []) or [],
+                    support_count=support_count,
+                )
+            else:
+                verifier = answer_side_verification(
+                    graph=graph,
+                    question=question,
+                    answer_type=answer_type,
+                    entity_id=str(candidate["answer_id"]),
+                    old_score=float(candidate["best_path_score"]),
+                    evidence=best_path.get("evidence", []) or [],
+                    support_count=support_count,
+                    answer_concept_ids=answer_concept_ids,
+                )
             candidate["score"] = verifier["verified_final_score"]
             candidate["support_bonus"] = verifier["support_bonus"]
             candidate["answer_verifier"] = verifier
@@ -8219,8 +8477,80 @@ def path_family_search_result(
             answer_ranker_v2=answer_ranker_v2,
             answer_verifier=answer_verifier,
             answer_verifier_role_aware=answer_verifier_role_aware,
+            answer_concept_ids=answer_concept_ids,
         ),
     }
+
+
+def build_concept_verifier_regression_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cases = []
+    for row in rows:
+        plain = row["path_family_answer_verifier"]
+        concept = row["path_family_concept_verifier"]
+        plain_hit = bool(plain["hits_at_1"])
+        concept_hit = bool(concept["hits_at_1"])
+        if concept_hit and not plain_hit:
+            label = "concept_correct_plain_wrong"
+        elif plain_hit and not concept_hit:
+            label = "plain_correct_concept_wrong"
+        elif plain_hit:
+            label = "both_correct"
+        else:
+            label = "both_wrong"
+        plain_top = plain.get("top_answer") or {}
+        concept_top = concept.get("top_answer") or {}
+        extraction = concept.get("answer_concept_extraction", {})
+        cases.append(
+            {
+                "question_id": row["question_id"],
+                "question": row["question"],
+                "gold_answers": row["gold_answers"],
+                "label": label,
+                "plain_top_answer": plain_top.get("answer_label", ""),
+                "concept_top_answer": concept_top.get("answer_label", ""),
+                "extracted_concept_name": extraction.get("extracted_concept_name", ""),
+                "gold_generated": bool(concept.get("gold_generated", False)),
+            }
+        )
+    counts = Counter(case["label"] for case in cases)
+    return {
+        "summary": {
+            "both_correct": counts["both_correct"],
+            "both_wrong": counts["both_wrong"],
+            "concept_correct_plain_wrong": counts["concept_correct_plain_wrong"],
+            "plain_correct_concept_wrong": counts["plain_correct_concept_wrong"],
+            "plain_hits_at_1": counts["both_correct"] + counts["plain_correct_concept_wrong"],
+            "concept_hits_at_1": counts["both_correct"] + counts["concept_correct_plain_wrong"],
+            "total_questions": len(cases),
+        },
+        "cases": cases,
+    }
+
+
+def write_concept_verifier_regression_markdown(audit: dict[str, Any]) -> str:
+    summary = audit["summary"]
+    lines = [
+        "# Concept Verifier vs Plain Answer Verifier Regression Audit",
+        "",
+        "Same search, same path families, same answer pools. The only change is the",
+        "structural answer-concept membership bonus inside final answer verification.",
+        "",
+        "```json",
+        json.dumps(summary, indent=2, sort_keys=True),
+        "```",
+        "",
+    ]
+    for label in ["concept_correct_plain_wrong", "plain_correct_concept_wrong", "both_wrong"]:
+        selected = [case for case in audit["cases"] if case["label"] == label]
+        lines.append(f"## {label} ({len(selected)})")
+        lines.append("")
+        for case in selected:
+            lines.append(f"- Q: {case['question']}")
+            lines.append(f"  - gold: {case['gold_answers'][:5]}")
+            lines.append(f"  - plain top: `{case['plain_top_answer']}` concept top: `{case['concept_top_answer']}`")
+            lines.append(f"  - extracted concept: `{case['extracted_concept_name']}` gold_generated: {case['gold_generated']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def top_path_readable(candidate: dict[str, Any]) -> str:
@@ -8252,6 +8582,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family = row["path_family_beam"]
     path_family_verifier = row["path_family_answer_verifier"]
     path_family_verifier_role_aware = row["path_family_answer_verifier_role_aware"]
+    path_family_concept = row["path_family_concept_verifier"]
     future = row["future_aware_proof_state_beam"]
     future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
@@ -8263,6 +8594,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family_top = path_family["top_answer"] or {}
     path_family_verifier_top = path_family_verifier["top_answer"] or {}
     path_family_verifier_role_aware_top = path_family_verifier_role_aware["top_answer"] or {}
+    path_family_concept_top = path_family_concept["top_answer"] or {}
     future_top = future["top_answer"] or {}
     future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
@@ -8278,6 +8610,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Path-family top answer: {path_family_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family answer verifier top answer: {path_family_verifier_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family answer verifier role-aware top answer: {path_family_verifier_role_aware_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Path-family concept verifier top answer: {path_family_concept_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
@@ -8289,6 +8622,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Gold generated path-family: {'yes' if path_family['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family answer verifier: {'yes' if path_family_verifier['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family answer verifier role-aware: {'yes' if path_family_verifier_role_aware['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated path-family concept verifier: {'yes' if path_family_concept['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
@@ -8299,6 +8633,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Hybrid proposal evidence: {top_path_readable(hybrid_top)}", flush=True)
     print(f"Path-family evidence: {top_path_readable(path_family_top)}", flush=True)
     print(f"Path-family answer verifier evidence: {top_path_readable(path_family_verifier_top)}", flush=True)
+    print(f"Path-family concept verifier evidence: {top_path_readable(path_family_concept_top)}", flush=True)
     print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
     print(f"Future-aware v2 evidence: {top_path_readable(future_v2_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)

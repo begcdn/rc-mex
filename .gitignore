@@ -5,3 +5,5 @@ data/
 runs/
 openai_runs/
 .env
+cache/
+.claude/
