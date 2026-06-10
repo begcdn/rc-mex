@@ -117,6 +117,17 @@ Type words: album
 Question: "{question}"
 Type words:"""
 
+PATH_RANKER_PROMPT_VERSION = "path_plausibility_v2"
+PATH_RANKER_PROMPT_TEMPLATE = """A question is answered by following a path of relations in a knowledge base, starting from the starting entity. [forward] follows the relation, [backward] follows it in reverse.
+
+Starting entity: "{start}"
+Question: "{question}"
+
+Candidate relation paths:
+{paths}
+
+Pick the {top_k} paths most likely to reach the answer to the question. Reply with only the {top_k} numbers separated by commas, best first."""
+
 _CACHE: dict[str, str] | None = None
 
 
@@ -320,6 +331,63 @@ def link_answer_concept_cascade(
             "llm_consulted": True,
         }
     return {"concept_name": None, "concept_ids": set(), "source": "none", "raw_response": linked["raw_response"], "llm_consulted": True}
+
+
+def relation_path_label(evidence_steps: list[dict[str, Any]]) -> str:
+    """Relation-only label for a path family, grouped by hop.
+
+    Uses only relation ids and directions — no entities, no benchmark-specific
+    vocabulary — so the micro-agent task transfers to any KB."""
+    by_hop: dict[int, list[str]] = {}
+    for step in evidence_steps or []:
+        hop = int(step.get("hop", 0))
+        label = f"{str(step.get('relation_id', '')).replace('_', ' ')} [{step.get('direction', '')}]"
+        bucket = by_hop.setdefault(hop, [])
+        if label not in bucket:
+            bucket.append(label)
+    return " -> ".join(" & ".join(by_hop[hop]) for hop in sorted(by_hop))
+
+
+def parse_pick_numbers(raw: str, count: int, top_k: int = 3) -> list[int]:
+    """First top_k distinct in-range numbers from the reply (1-based)."""
+    picks: list[int] = []
+    for token in re.findall(r"\d+", raw):
+        value = int(token)
+        if 1 <= value <= count and value not in picks:
+            picks.append(value)
+        if len(picks) == top_k:
+            break
+    return picks
+
+
+def rank_relation_paths(
+    question: str,
+    start_entity_name: str,
+    path_labels: list[str],
+    model: str = DEFAULT_MODEL,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """Mode-2 micro-agent: listwise plausibility ranking of relation paths.
+
+    One call per (question, candidate list). Returns 0-based indices of the
+    LLM's top_k picks; empty picks on any error or parse failure, which the
+    caller must treat as abstention (fall back to symbolic selection)."""
+    if not path_labels:
+        return {"picks": [], "raw_response": "", "error": "", "consulted": False}
+    numbered = "\n".join(f"{i}. {label}" for i, label in enumerate(path_labels, start=1))
+    prompt = PATH_RANKER_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, paths=numbered, top_k=top_k
+    )
+    result = call_local_llm(prompt, PATH_RANKER_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"picks": [], "raw_response": "", "error": result["error"], "consulted": True}
+    picks = parse_pick_numbers(result["text"], len(path_labels), top_k=top_k)
+    return {
+        "picks": [index - 1 for index in picks],
+        "raw_response": result["text"][:120],
+        "error": "",
+        "consulted": True,
+    }
 
 
 def _verify_letter_choice(raw_response: str, shortlist: list[str]) -> str | None:

@@ -19,44 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any
 
-from rc_mex.micro_agents import DEFAULT_MODEL, call_local_llm
-
-PATH_PLAUSIBILITY_PROMPT_VERSION = "path_plausibility_v1"
-PATH_PLAUSIBILITY_PROMPT_TEMPLATE = """A question is answered by following relations in a knowledge base, starting from the starting entity. [forward] follows the relation, [backward] follows it in reverse.
-
-Starting entity: "{start}"
-Question: "{question}"
-
-Candidate relation paths (hop 1 -> hop 2):
-{paths}
-
-Pick the 3 paths most likely to reach the answer to the question. Reply with only the 3 numbers separated by commas, best first."""
+from rc_mex.micro_agents import DEFAULT_MODEL, rank_relation_paths, relation_path_label
 
 
 def family_path_label(summary: dict[str, Any]) -> str:
-    by_hop: dict[int, list[str]] = defaultdict(list)
-    for step in summary.get("evidence", []) or []:
-        hop = int(step.get("hop", 0))
-        label = f"{str(step.get('relation_id', '')).replace('_', ' ')} [{step.get('direction', '')}]"
-        if label not in by_hop[hop]:
-            by_hop[hop].append(label)
-    return " -> ".join(" & ".join(by_hop[hop]) for hop in sorted(by_hop))
-
-
-def parse_pick_numbers(raw: str, count: int) -> list[int]:
-    picks: list[int] = []
-    for token in re.findall(r"\d+", raw):
-        value = int(token)
-        if 1 <= value <= count and value not in picks:
-            picks.append(value)
-        if len(picks) == 3:
-            break
-    return picks
+    return relation_path_label(summary.get("evidence", []) or [])
 
 
 def main() -> None:
@@ -121,20 +92,20 @@ def main() -> None:
         symbolic_hit = bool(gold_labels & set(symbolic_top3_labels))
         counts["symbolic_top3_hit"] += symbolic_hit
 
-        numbered = "\n".join(f"{i}. {label}" for i, label in enumerate(labels, start=1))
-        prompt = PATH_PLAUSIBILITY_PROMPT_TEMPLATE.format(
-            start=row["start_entity"]["name"], question=row["question"], paths=numbered
+        response = rank_relation_paths(
+            question=row["question"],
+            start_entity_name=row["start_entity"]["name"],
+            path_labels=labels,
+            model=args.model,
         )
-        response = call_local_llm(prompt, PATH_PLAUSIBILITY_PROMPT_VERSION, model=args.model, timeout=180.0)
         if response["error"]:
             counts["llm_server_error"] += 1
             if counts["llm_server_error"] == 1:
                 print(f"first server error: {response['error']}")
             continue
-        picks = parse_pick_numbers(response["text"], len(labels))
-        if not picks:
+        if not response["picks"]:
             counts["llm_parse_failure"] += 1
-        llm_top3_labels = [labels[i - 1] for i in picks]
+        llm_top3_labels = [labels[i] for i in response["picks"]]
         llm_hit = bool(gold_labels & set(llm_top3_labels))
         counts["llm_top3_hit"] += llm_hit
         counts["both_hit"] += symbolic_hit and llm_hit
@@ -149,7 +120,7 @@ def main() -> None:
                     "gold_label": sorted(gold_labels)[0],
                     "symbolic_top3": symbolic_top3_labels,
                     "llm_top3": llm_top3_labels,
-                    "llm_raw": response["text"][:80],
+                    "llm_raw": response["raw_response"][:80],
                 }
             )
         if index % 25 == 0:

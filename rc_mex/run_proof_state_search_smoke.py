@@ -125,6 +125,19 @@ PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS = {
     "answer_concept_membership_weight": 0.45,
 }
 
+PATH_FAMILY_LLM_RETENTION_CONSTANTS = {
+    **PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS,
+    "llm_retention_mode": 1.0,
+    "llm_retention_union_cap": 2.0,
+    "llm_retention_max_paths": 60.0,
+}
+
+PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS = {
+    **PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS,
+    "wide_symbolic_mode": 1.0,
+    "wide_symbolic_beam_multiplier": 2.0,
+}
+
 RELATION_ALIASES = {
     "place of birth": ["born in", "birthplace", "was born", "native of"],
     "place of burial": ["buried in", "burial place", "grave location", "buried at"],
@@ -293,6 +306,28 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        path_family_llm_retention = run_path_family_llm_retention(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
+        path_family_wide_symbolic = run_path_family_wide_symbolic(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         future_aware = run_future_aware_proof_state_beam(
             graph=graph,
             example=example,
@@ -315,7 +350,7 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, path_family_llm_retention, path_family_wide_symbolic, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -333,6 +368,8 @@ def main() -> None:
             "path_family_answer_verifier": PATH_FAMILY_ANSWER_VERIFIER_CONSTANTS,
             "path_family_answer_verifier_role_aware": PATH_FAMILY_ANSWER_VERIFIER_ROLE_AWARE_CONSTANTS,
             "path_family_concept_verifier": PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS,
+            "path_family_llm_retention": PATH_FAMILY_LLM_RETENTION_CONSTANTS,
+            "path_family_wide_symbolic": PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -390,9 +427,31 @@ def main() -> None:
     write_json(output_dir / "role_aware_regression_audit.json", role_aware_regression_audit)
     (output_dir / "role_aware_regression_audit.md").write_text(write_role_aware_regression_audit_markdown(role_aware_regression_audit), encoding="utf-8")
     concept_regression_audit = build_concept_verifier_regression_audit(rows)
+    llm_retention_regression_audit = build_method_regression_audit(
+        rows,
+        baseline_key="path_family_concept_verifier",
+        candidate_key="path_family_llm_retention",
+        title="LLM Retention vs Concept Verifier Regression Audit",
+        note="Same final answer ranking (concept verifier); only hop-level family retention changes to symbolic-union-LLM top picks.",
+    )
+    wide_symbolic_regression_audit = build_method_regression_audit(
+        rows,
+        baseline_key="path_family_wide_symbolic",
+        candidate_key="path_family_llm_retention",
+        title="LLM Retention vs Wide Symbolic Control Regression Audit",
+        note="Capacity-matched control: both retain up to 2x beam_width families; the control widens symbolically, the candidate unions in LLM picks.",
+    )
     write_json(output_dir / "concept_verifier_regression_audit.json", concept_regression_audit)
     (output_dir / "concept_verifier_regression_audit.md").write_text(
         write_concept_verifier_regression_markdown(concept_regression_audit), encoding="utf-8"
+    )
+    write_json(output_dir / "llm_retention_regression_audit.json", llm_retention_regression_audit)
+    (output_dir / "llm_retention_regression_audit.md").write_text(
+        write_method_regression_markdown(llm_retention_regression_audit), encoding="utf-8"
+    )
+    write_json(output_dir / "llm_retention_vs_wide_symbolic.json", wide_symbolic_regression_audit)
+    (output_dir / "llm_retention_vs_wide_symbolic.md").write_text(
+        write_method_regression_markdown(wide_symbolic_regression_audit), encoding="utf-8"
     )
     log_line("predictions.jsonl")
     log_line("metrics.json")
@@ -413,6 +472,8 @@ def main() -> None:
     log_line("code_behavior_audit.md")
     log_line("concept_verifier_regression_audit.json")
     log_line("concept_verifier_regression_audit.md")
+    log_line("llm_retention_regression_audit.md")
+    log_line("llm_retention_vs_wide_symbolic.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -1447,6 +1508,8 @@ def run_path_family_beam(
     answer_verifier: bool = False,
     answer_verifier_role_aware: bool = False,
     concept_verifier: bool = False,
+    llm_retention: bool = False,
+    wide_symbolic_beam: bool = False,
 ) -> dict[str, Any]:
     del top_k
     answer_type = guess_answer_type(example.question)
@@ -1521,7 +1584,19 @@ def run_path_family_beam(
                     )
                 )
         family_records = build_path_family_records(next_states)
-        selected_records = family_records[:beam_width]
+        llm_retention_diagnostics: dict[str, Any] = {}
+        if wide_symbolic_beam:
+            selected_records = family_records[: beam_width * int(PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS["wide_symbolic_beam_multiplier"])]
+        elif llm_retention:
+            selected_records, llm_retention_diagnostics = llm_union_family_selection(
+                question=example.question,
+                start_entity_name=example.start_entity_name,
+                family_records=family_records,
+                beam_width=beam_width,
+                max_paths=int(PATH_FAMILY_LLM_RETENTION_CONSTANTS["llm_retention_max_paths"]),
+            )
+        else:
+            selected_records = family_records[:beam_width]
         retained_family_records = selected_records
         selected_states = flatten_family_states(selected_records, ANSWER_POOL_CAP)
         all_summaries = [
@@ -1539,7 +1614,8 @@ def run_path_family_beam(
                 "selected_states": selected_summaries,
                 "all_path_families": all_summaries,
                 "selected_path_families": selected_summaries,
-                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
+                "llm_retention": llm_retention_diagnostics,
+                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam),
                 "relation_proposal_k": RELATION_PROPOSAL_K,
                 "answer_pool_cap": ANSWER_POOL_CAP,
                 "semantic_relation_embeddings_used": semantic_used,
@@ -1556,7 +1632,7 @@ def run_path_family_beam(
                     "selected_states": selected_summaries[:5],
                     "all_path_families": all_summaries[:5],
                     "selected_path_families": selected_summaries[:5],
-                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
+                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam),
                     "relation_proposal_k": RELATION_PROPOSAL_K,
                     "answer_pool_cap": ANSWER_POOL_CAP,
                     "semantic_relation_embeddings_used": semantic_used,
@@ -1571,7 +1647,7 @@ def run_path_family_beam(
         gold_answer_ids=example.gold_answer_ids,
         expansion_count=expansion_count,
         debug_trace=trace,
-        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier),
+        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam),
         answer_ranker_v2=answer_ranker_v2,
         answer_verifier=answer_verifier,
         answer_verifier_role_aware=answer_verifier_role_aware,
@@ -1689,12 +1765,72 @@ def run_path_family_concept_verifier(
     )
 
 
+def run_path_family_llm_retention(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    return run_path_family_beam(
+        graph=graph,
+        example=example,
+        top_k=top_k,
+        beam_width=beam_width,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+        max_branch_entities=max_branch_entities,
+        noisy_branch_threshold=noisy_branch_threshold,
+        debug_trace=debug_trace,
+        answer_verifier=True,
+        concept_verifier=True,
+        llm_retention=True,
+    )
+
+
+def run_path_family_wide_symbolic(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    return run_path_family_beam(
+        graph=graph,
+        example=example,
+        top_k=top_k,
+        beam_width=beam_width,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+        max_branch_entities=max_branch_entities,
+        noisy_branch_threshold=noisy_branch_threshold,
+        debug_trace=debug_trace,
+        answer_verifier=True,
+        concept_verifier=True,
+        wide_symbolic_beam=True,
+    )
+
+
 def path_family_ranker_mode(
     answer_ranker_v2: bool,
     answer_verifier: bool,
     answer_verifier_role_aware: bool = False,
     concept_verifier: bool = False,
+    llm_retention: bool = False,
+    wide_symbolic_beam: bool = False,
 ) -> str:
+    if llm_retention:
+        return "path_family_llm_retention"
+    if wide_symbolic_beam:
+        return "path_family_wide_symbolic"
     if concept_verifier:
         return "path_family_concept_verifier"
     if answer_verifier_role_aware:
@@ -1711,7 +1847,13 @@ def path_family_ranker_constants(
     answer_verifier: bool,
     answer_verifier_role_aware: bool = False,
     concept_verifier: bool = False,
+    llm_retention: bool = False,
+    wide_symbolic_beam: bool = False,
 ) -> dict[str, float]:
+    if llm_retention:
+        return PATH_FAMILY_LLM_RETENTION_CONSTANTS
+    if wide_symbolic_beam:
+        return PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS
     if concept_verifier:
         return PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS
     if answer_verifier_role_aware:
@@ -3228,6 +3370,8 @@ def build_prediction_row(
     path_family_answer_verifier: dict[str, Any],
     path_family_answer_verifier_role_aware: dict[str, Any],
     path_family_concept_verifier: dict[str, Any],
+    path_family_llm_retention: dict[str, Any],
+    path_family_wide_symbolic: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3241,12 +3385,15 @@ def build_prediction_row(
     path_family_verifier_correct = path_family_answer_verifier["hits_at_1"]
     path_family_verifier_role_aware_correct = path_family_answer_verifier_role_aware["hits_at_1"]
     path_family_concept_verifier_correct = path_family_concept_verifier["hits_at_1"]
+    path_family_llm_retention_correct = path_family_llm_retention["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
     if baseline_correct and proof_correct and path_family_verifier_role_aware_correct:
         failure_type = "both_correct"
     elif path_family_verifier_role_aware_correct and not path_family_verifier_correct:
         failure_type = "path_family_answer_verifier_role_aware_correct"
+    elif path_family_llm_retention_correct and not path_family_concept_verifier_correct:
+        failure_type = "path_family_llm_retention_correct"
     elif path_family_concept_verifier_correct and not path_family_verifier_correct:
         failure_type = "path_family_concept_verifier_correct"
     elif path_family_verifier_correct and not path_family_correct:
@@ -3297,6 +3444,8 @@ def build_prediction_row(
         "path_family_answer_verifier": path_family_answer_verifier,
         "path_family_answer_verifier_role_aware": path_family_answer_verifier_role_aware,
         "path_family_concept_verifier": path_family_concept_verifier,
+        "path_family_llm_retention": path_family_llm_retention,
+        "path_family_wide_symbolic": path_family_wide_symbolic,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -3314,6 +3463,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     path_family_verifier = [row["path_family_answer_verifier"] for row in rows]
     path_family_verifier_role_aware = [row["path_family_answer_verifier_role_aware"] for row in rows]
     path_family_concept = [row["path_family_concept_verifier"] for row in rows]
+    path_family_llm_ret = [row["path_family_llm_retention"] for row in rows]
+    path_family_wide_sym = [row["path_family_wide_symbolic"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
@@ -3336,6 +3487,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_answer_verifier_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_verifier_role_aware),
         "path_family_concept_verifier_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_concept),
+        "path_family_llm_retention_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_llm_ret),
+        "path_family_wide_symbolic_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_wide_sym),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
@@ -3348,6 +3501,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_answer_verifier_exact_match": avg_bool(item["exact_match"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_exact_match": avg_bool(item["exact_match"] for item in path_family_verifier_role_aware),
         "path_family_concept_verifier_exact_match": avg_bool(item["exact_match"] for item in path_family_concept),
+        "path_family_llm_retention_exact_match": avg_bool(item["exact_match"] for item in path_family_llm_ret),
+        "path_family_wide_symbolic_exact_match": avg_bool(item["exact_match"] for item in path_family_wide_sym),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
@@ -3360,6 +3515,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_answer_verifier_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_verifier_role_aware),
         "path_family_concept_verifier_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_concept),
+        "path_family_llm_retention_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_llm_ret),
+        "path_family_wide_symbolic_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_wide_sym),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
@@ -3372,6 +3529,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_answer_verifier_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_verifier),
         "path_family_answer_verifier_role_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_verifier_role_aware),
         "path_family_concept_verifier_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_concept),
+        "path_family_llm_retention_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_llm_ret),
+        "path_family_wide_symbolic_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_wide_sym),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
@@ -3384,6 +3543,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_candidate_count_path_family_answer_verifier": avg(item["candidate_count"] for item in path_family_verifier),
         "average_candidate_count_path_family_answer_verifier_role_aware": avg(item["candidate_count"] for item in path_family_verifier_role_aware),
         "average_candidate_count_path_family_concept_verifier": avg(item["candidate_count"] for item in path_family_concept),
+        "average_candidate_count_path_family_llm_retention": avg(item["candidate_count"] for item in path_family_llm_ret),
+        "average_candidate_count_path_family_wide_symbolic": avg(item["candidate_count"] for item in path_family_wide_sym),
         "average_candidate_count_future_aware": avg(item["candidate_count"] for item in future),
         "average_candidate_count_future_aware_v2": avg(item["candidate_count"] for item in future_v2),
         "average_expansion_count_baseline": avg(item["expansion_count"] for item in baseline),
@@ -3396,6 +3557,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_expansion_count_path_family_answer_verifier": avg(item["expansion_count"] for item in path_family_verifier),
         "average_expansion_count_path_family_answer_verifier_role_aware": avg(item["expansion_count"] for item in path_family_verifier_role_aware),
         "average_expansion_count_path_family_concept_verifier": avg(item["expansion_count"] for item in path_family_concept),
+        "average_expansion_count_path_family_llm_retention": avg(item["expansion_count"] for item in path_family_llm_ret),
+        "average_expansion_count_path_family_wide_symbolic": avg(item["expansion_count"] for item in path_family_wide_sym),
         "average_expansion_count_future_aware": avg(item["expansion_count"] for item in future),
         "average_expansion_count_future_aware_v2": avg(item["expansion_count"] for item in future_v2),
         "average_final_result_size_baseline": avg(item["final_result_size"] for item in baseline),
@@ -3408,6 +3571,8 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "average_final_result_size_path_family_answer_verifier": avg(item["final_result_size"] for item in path_family_verifier),
         "average_final_result_size_path_family_answer_verifier_role_aware": avg(item["final_result_size"] for item in path_family_verifier_role_aware),
         "average_final_result_size_path_family_concept_verifier": avg(item["final_result_size"] for item in path_family_concept),
+        "average_final_result_size_path_family_llm_retention": avg(item["final_result_size"] for item in path_family_llm_ret),
+        "average_final_result_size_path_family_wide_symbolic": avg(item["final_result_size"] for item in path_family_wide_sym),
         "average_final_result_size_future_aware": avg(item["final_result_size"] for item in future),
         "average_final_result_size_future_aware_v2": avg(item["final_result_size"] for item in future_v2),
         "proof_state_wins": sum(
@@ -3549,6 +3714,22 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_concept_verifier_wins_over_answer_verifier": sum(
             1 for row in rows
             if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_answer_verifier"]["final_answer_f1"]
+        ),
+        "llm_retention_wins_over_concept_verifier": sum(
+            1 for row in rows
+            if row["path_family_llm_retention"]["final_answer_f1"] > row["path_family_concept_verifier"]["final_answer_f1"]
+        ),
+        "concept_verifier_wins_over_llm_retention": sum(
+            1 for row in rows
+            if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
+        ),
+        "llm_retention_wins_over_wide_symbolic": sum(
+            1 for row in rows
+            if row["path_family_llm_retention"]["final_answer_f1"] > row["path_family_wide_symbolic"]["final_answer_f1"]
+        ),
+        "wide_symbolic_wins_over_llm_retention": sum(
+            1 for row in rows
+            if row["path_family_wide_symbolic"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
         ),
         "path_family_answer_verifier_wins_over_concept_verifier": sum(
             1 for row in rows
@@ -3773,12 +3954,30 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS, indent=2, sort_keys=True),
         "```",
         "",
+        "Path-family LLM retention constants:",
+        "",
+        "```json",
+        json.dumps(PATH_FAMILY_LLM_RETENTION_CONSTANTS, indent=2, sort_keys=True),
+        "```",
+        "",
         "## Metrics",
         "",
         "```json",
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## LLM Retention Wins Over Concept Verifier",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "llm_retention_over_concept_verifier"), limit=5),
+        "## Concept Verifier Wins Over LLM Retention",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "concept_verifier_over_llm_retention"), limit=5),
+        "## LLM Retention Wins Over Wide Symbolic Control",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "llm_retention_over_wide_symbolic"), limit=5),
+        "## Wide Symbolic Control Wins Over LLM Retention",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "wide_symbolic_over_llm_retention"), limit=5),
         "## Concept Verifier Wins Over Answer Verifier",
         "",
         *debug_section_rows(select_debug_rows(rows, "concept_verifier_over_verifier"), limit=5),
@@ -3855,6 +4054,10 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
         "two_score_wide_over_hybrid",
         "path_family_over_hybrid",
         "hybrid_over_path_family",
+        "llm_retention_over_concept_verifier",
+        "concept_verifier_over_llm_retention",
+        "llm_retention_over_wide_symbolic",
+        "wide_symbolic_over_llm_retention",
         "concept_verifier_over_verifier",
         "verifier_over_concept_verifier",
         "path_family_verifier_over_path_family",
@@ -4589,6 +4792,26 @@ def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, A
         selected = [
             row for row in rows
             if row["path_family_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "llm_retention_over_concept_verifier":
+        selected = [
+            row for row in rows
+            if row["path_family_llm_retention"]["final_answer_f1"] > row["path_family_concept_verifier"]["final_answer_f1"]
+        ]
+    elif kind == "concept_verifier_over_llm_retention":
+        selected = [
+            row for row in rows
+            if row["path_family_concept_verifier"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
+        ]
+    elif kind == "llm_retention_over_wide_symbolic":
+        selected = [
+            row for row in rows
+            if row["path_family_llm_retention"]["final_answer_f1"] > row["path_family_wide_symbolic"]["final_answer_f1"]
+        ]
+    elif kind == "wide_symbolic_over_llm_retention":
+        selected = [
+            row for row in rows
+            if row["path_family_wide_symbolic"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
         ]
     elif kind == "concept_verifier_over_verifier":
         selected = [
@@ -7423,6 +7646,67 @@ def build_path_family_records(states: list[SearchState]) -> list[dict[str, Any]]
     return records
 
 
+def family_record_path_label(record: dict[str, Any]) -> str:
+    states = record.get("states", [])
+    if not states:
+        return ""
+    from rc_mex.micro_agents import relation_path_label
+
+    return relation_path_label(states[0].evidence)
+
+
+def llm_union_family_selection(
+    question: str,
+    start_entity_name: str,
+    family_records: list[dict[str, Any]],
+    beam_width: int,
+    max_paths: int = 60,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Union beam: symbolic top-B plus the LLM's listwise top-B path families.
+
+    The union can only add families to the symbolic selection, so gold
+    retention is greater than or equal to the symbolic baseline by
+    construction; any LLM error or parse failure degrades to exactly the
+    symbolic top-B. The LLM sees relation labels and the question only —
+    never entities from the pools, never gold."""
+    from rc_mex.micro_agents import rank_relation_paths
+
+    symbolic_records = family_records[:beam_width]
+    candidates = family_records[:max_paths]
+    labels: list[str] = []
+    label_to_record: dict[str, dict[str, Any]] = {}
+    for record in candidates:
+        label = family_record_path_label(record)
+        if label and label not in label_to_record:
+            labels.append(label)
+            label_to_record[label] = record
+    ranked = rank_relation_paths(
+        question=question,
+        start_entity_name=start_entity_name,
+        path_labels=labels,
+        top_k=beam_width,
+    )
+    picked_records = [label_to_record[labels[index]] for index in ranked["picks"]]
+    selected: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for record in [*symbolic_records, *picked_records]:
+        key = repr(record.get("family_key"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        selected.append(record)
+    diagnostics = {
+        "llm_consulted": bool(ranked.get("consulted")),
+        "llm_error": ranked.get("error", ""),
+        "llm_picked_labels": [labels[index] for index in ranked["picks"]],
+        "candidate_label_count": len(labels),
+        "symbolic_selected": len(symbolic_records),
+        "union_selected": len(selected),
+        "llm_raw_response": ranked.get("raw_response", ""),
+    }
+    return selected, diagnostics
+
+
 def path_family_key(state: SearchState) -> tuple[Any, ...]:
     relation_sequence = tuple(step.get("relation_id", "") for step in state.evidence)
     direction_sequence = tuple(step.get("direction", "") for step in state.evidence)
@@ -8482,6 +8766,92 @@ def path_family_search_result(
     }
 
 
+def build_method_regression_audit(
+    rows: list[dict[str, Any]],
+    baseline_key: str,
+    candidate_key: str,
+    title: str,
+    note: str,
+) -> dict[str, Any]:
+    cases = []
+    for row in rows:
+        baseline = row[baseline_key]
+        candidate = row[candidate_key]
+        baseline_hit = bool(baseline["hits_at_1"])
+        candidate_hit = bool(candidate["hits_at_1"])
+        if candidate_hit and not baseline_hit:
+            label = "candidate_correct_baseline_wrong"
+        elif baseline_hit and not candidate_hit:
+            label = "baseline_correct_candidate_wrong"
+        elif baseline_hit:
+            label = "both_correct"
+        else:
+            label = "both_wrong"
+        baseline_top = baseline.get("top_answer") or {}
+        candidate_top = candidate.get("top_answer") or {}
+        cases.append(
+            {
+                "question_id": row["question_id"],
+                "question": row["question"],
+                "gold_answers": row["gold_answers"],
+                "label": label,
+                "baseline_top_answer": baseline_top.get("answer_label", ""),
+                "candidate_top_answer": candidate_top.get("answer_label", ""),
+                "baseline_gold_generated": bool(baseline.get("gold_generated", False)),
+                "candidate_gold_generated": bool(candidate.get("gold_generated", False)),
+            }
+        )
+    counts = Counter(case["label"] for case in cases)
+    return {
+        "title": title,
+        "note": note,
+        "baseline_key": baseline_key,
+        "candidate_key": candidate_key,
+        "summary": {
+            "both_correct": counts["both_correct"],
+            "both_wrong": counts["both_wrong"],
+            "candidate_correct_baseline_wrong": counts["candidate_correct_baseline_wrong"],
+            "baseline_correct_candidate_wrong": counts["baseline_correct_candidate_wrong"],
+            "baseline_hits_at_1": counts["both_correct"] + counts["baseline_correct_candidate_wrong"],
+            "candidate_hits_at_1": counts["both_correct"] + counts["candidate_correct_baseline_wrong"],
+            "baseline_gold_generated": sum(1 for case in cases if case["baseline_gold_generated"]),
+            "candidate_gold_generated": sum(1 for case in cases if case["candidate_gold_generated"]),
+            "total_questions": len(cases),
+        },
+        "cases": cases,
+    }
+
+
+def write_method_regression_markdown(audit: dict[str, Any]) -> str:
+    lines = [
+        f"# {audit['title']}",
+        "",
+        f"Baseline: `{audit['baseline_key']}`  Candidate: `{audit['candidate_key']}`",
+        "",
+        audit["note"],
+        "",
+        "```json",
+        json.dumps(audit["summary"], indent=2, sort_keys=True),
+        "```",
+        "",
+    ]
+    for label in ["candidate_correct_baseline_wrong", "baseline_correct_candidate_wrong", "both_wrong"]:
+        selected = [case for case in audit["cases"] if case["label"] == label]
+        lines.append(f"## {label} ({len(selected)})")
+        lines.append("")
+        for case in selected:
+            lines.append(f"- Q: {case['question']}")
+            lines.append(f"  - gold: {case['gold_answers'][:5]}")
+            lines.append(
+                f"  - baseline top: `{case['baseline_top_answer']}` candidate top: `{case['candidate_top_answer']}`"
+            )
+            lines.append(
+                f"  - gold_generated baseline/candidate: {case['baseline_gold_generated']}/{case['candidate_gold_generated']}"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
 def build_concept_verifier_regression_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cases = []
     for row in rows:
@@ -8583,6 +8953,8 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family_verifier = row["path_family_answer_verifier"]
     path_family_verifier_role_aware = row["path_family_answer_verifier_role_aware"]
     path_family_concept = row["path_family_concept_verifier"]
+    path_family_llm_ret = row["path_family_llm_retention"]
+    path_family_wide_sym = row["path_family_wide_symbolic"]
     future = row["future_aware_proof_state_beam"]
     future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
@@ -8595,6 +8967,8 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family_verifier_top = path_family_verifier["top_answer"] or {}
     path_family_verifier_role_aware_top = path_family_verifier_role_aware["top_answer"] or {}
     path_family_concept_top = path_family_concept["top_answer"] or {}
+    path_family_llm_ret_top = path_family_llm_ret["top_answer"] or {}
+    path_family_wide_sym_top = path_family_wide_sym["top_answer"] or {}
     future_top = future["top_answer"] or {}
     future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
@@ -8611,6 +8985,8 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Path-family answer verifier top answer: {path_family_verifier_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family answer verifier role-aware top answer: {path_family_verifier_role_aware_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family concept verifier top answer: {path_family_concept_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Path-family LLM retention top answer: {path_family_llm_ret_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Path-family wide symbolic top answer: {path_family_wide_sym_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
@@ -8623,6 +8999,8 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Gold generated path-family answer verifier: {'yes' if path_family_verifier['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family answer verifier role-aware: {'yes' if path_family_verifier_role_aware['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family concept verifier: {'yes' if path_family_concept['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated path-family LLM retention: {'yes' if path_family_llm_ret['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated path-family wide symbolic: {'yes' if path_family_wide_sym['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
@@ -8634,6 +9012,8 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Path-family evidence: {top_path_readable(path_family_top)}", flush=True)
     print(f"Path-family answer verifier evidence: {top_path_readable(path_family_verifier_top)}", flush=True)
     print(f"Path-family concept verifier evidence: {top_path_readable(path_family_concept_top)}", flush=True)
+    print(f"Path-family LLM retention evidence: {top_path_readable(path_family_llm_ret_top)}", flush=True)
+    print(f"Path-family wide symbolic evidence: {top_path_readable(path_family_wide_sym_top)}", flush=True)
     print(f"Future-aware evidence: {top_path_readable(future_top)}", flush=True)
     print(f"Future-aware v2 evidence: {top_path_readable(future_v2_top)}", flush=True)
     print(f"Failure type: {row['failure_type']}", flush=True)
