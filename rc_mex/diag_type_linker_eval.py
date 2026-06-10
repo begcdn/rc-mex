@@ -91,7 +91,7 @@ def main() -> None:
                     "gold": gold_name,
                     "string": string_name,
                     "llm": llm_name,
-                    "llm_raw": linked["raw_response"][:60],
+                    "llm_raw": linked["raw_response"][:200],
                     "shortlist_hit": shortlist_hit,
                     "string_ok": string_ok,
                     "llm_ok": llm_ok,
@@ -116,6 +116,7 @@ def main() -> None:
         for row in errors:
             tag = f"str={'Y' if row['string_ok'] else 'n'} llm={'Y' if row['llm_ok'] else 'n'} short={'Y' if row['shortlist_hit'] else 'n'}"
             print(f"[{tag}] gold={row['gold']!r:28} llm={row['llm']!r:24} str={row['string']!r:20} q={row['question'][:70]}")
+            print(f"        llm_raw={row['llm_raw']!r}")
 
 
 if __name__ == "__main__":
