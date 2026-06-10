@@ -45,6 +45,7 @@ def main() -> None:
 
     counts: Counter[str] = Counter()
     errors = []
+    first_error = ""
     started = time.time()
     for index, example in enumerate(examples, start=1):
         sample = samples[example.program_index]
@@ -81,6 +82,8 @@ def main() -> None:
         counts["llm_abstained"] += bool(linked.get("abstained", False))
         counts["llm_correct_given_recall"] += llm_ok and shortlist_hit
         counts["llm_server_error"] += bool(linked.get("error", ""))
+        if linked.get("error") and not first_error:
+            first_error = str(linked["error"])
         if not llm_ok or not string_ok:
             errors.append(
                 {
@@ -105,6 +108,10 @@ def main() -> None:
     print(f"LLM linker accuracy: {counts['llm_correct']}/{total}")
     print(f"LLM selection accuracy given shortlist hit: {counts['llm_correct_given_recall']}/{recall}")
     print(f"LLM abstentions: {counts['llm_abstained']}/{total}  server errors: {counts['llm_server_error']}")
+    if first_error:
+        from rc_mex.micro_agents import DEFAULT_MODEL as _model, LLM_API_STYLE as _style, OLLAMA_URL as _url
+        print(f"first server error: {first_error}")
+        print(f"endpoint: {_url}  api_style: {_style}  model: {_model}")
     if args.show_errors:
         for row in errors:
             tag = f"str={'Y' if row['string_ok'] else 'n'} llm={'Y' if row['llm_ok'] else 'n'} short={'Y' if row['shortlist_hit'] else 'n'}"

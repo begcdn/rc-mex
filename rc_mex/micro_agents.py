@@ -29,10 +29,17 @@ from typing import Any
 from cigr_d_mvp1.kg import KnowledgeGraph, normalize_text
 
 # Point these at the serving box, e.g.
-#   export RC_MEX_LLM_URL=http://<server>:11434/api/generate
-#   export RC_MEX_LLM_MODEL=qwen3:8b
+#   ollama:           export RC_MEX_LLM_URL=http://localhost:11434/api/generate
+#   vLLM / llama.cpp: export RC_MEX_LLM_URL=http://localhost:8000/v1/chat/completions
+#   export RC_MEX_LLM_MODEL=qwen3:8b    (vLLM: the served name, e.g. Qwen/Qwen3-8B)
+# API style is inferred from the URL; force it with RC_MEX_LLM_API=ollama|openai.
 OLLAMA_URL = os.environ.get("RC_MEX_LLM_URL", "http://localhost:11434/api/generate")
 DEFAULT_MODEL = os.environ.get("RC_MEX_LLM_MODEL", "llama3.2:3b")
+LLM_API_STYLE = os.environ.get(
+    "RC_MEX_LLM_API",
+    "openai" if ("/v1/" in OLLAMA_URL or OLLAMA_URL.endswith("/chat/completions")) else "ollama",
+)
+LLM_API_KEY = os.environ.get("RC_MEX_LLM_API_KEY", "")
 CACHE_PATH = Path("cache/micro_agents.json")
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -144,21 +151,40 @@ def call_local_llm(
     key = _cache_key(prompt_version, model, prompt)
     if key in cache:
         return {"text": cache[key], "from_cache": True, "error": ""}
-    request_body: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0, "seed": 7, "num_predict": 64},
-    }
-    if "qwen" in model.lower():
-        # Disable qwen3 thinking mode; strict verifiers expect the bare answer.
-        request_body["think"] = False
+    if LLM_API_STYLE == "openai":
+        request_body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "seed": 7,
+            "max_tokens": 256,
+        }
+        if "qwen" in model.lower():
+            # vLLM-style switch to disable qwen3 thinking mode.
+            request_body["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        request_body = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0, "seed": 7, "num_predict": 256},
+        }
+        if "qwen" in model.lower():
+            # Disable qwen3 thinking mode; strict verifiers expect the bare answer.
+            request_body["think"] = False
     payload = json.dumps(request_body).encode("utf-8")
-    request = urllib.request.Request(OLLAMA_URL, data=payload, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    request = urllib.request.Request(OLLAMA_URL, data=payload, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
-        text = THINK_BLOCK_PATTERN.sub("", str(body.get("response", ""))).strip()
+        if LLM_API_STYLE == "openai":
+            raw_text = str((body.get("choices") or [{}])[0].get("message", {}).get("content", ""))
+        else:
+            raw_text = str(body.get("response", ""))
+        text = THINK_BLOCK_PATTERN.sub("", raw_text).strip()
     except Exception as exc:
         return {"text": "", "from_cache": False, "error": f"{type(exc).__name__}: {exc}"}
     cache[key] = text
