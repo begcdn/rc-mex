@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 
 from cigr_d_mvp1.io_utils import load_json, write_json
+from cigr_d_mvp1.kg import KnowledgeGraph
+from rc_mex import run_proof_state_search_smoke as smoke
 from rc_mex.run_proof_state_search_smoke import main as run_smoke_main
 
 
@@ -256,6 +258,67 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
             ]
             self.assertEqual(rows[0]["question_id"], "q2")
             self.assertEqual(rows[0]["gold_answers"], ["science fiction"])
+
+    def test_role_aware_verifier_distinguishes_answer_roles(self):
+        graph = KnowledgeGraph(
+            {
+                "concepts": {
+                    "film": {"name": "film", "instanceOf": []},
+                    "film_series": {"name": "film series", "instanceOf": []},
+                    "occupation": {"name": "occupation", "instanceOf": []},
+                    "human": {"name": "human", "instanceOf": []},
+                    "country": {"name": "country", "instanceOf": []},
+                    "county": {"name": "county", "instanceOf": []},
+                    "admin": {"name": "administrative territorial entity", "instanceOf": []},
+                },
+                "entities": {
+                    "generic_film": entity("Generic Movie", ["film"], [("genre", "genre")]),
+                    "film_series": entity("Example Film Series", ["film_series"], [("franchise", "brand")]),
+                    "person": entity("Ada Person", ["human"], [("occupation", "occupation_entity")]),
+                    "occupation_entity": entity("Software engineer", ["occupation"], [("field of work", "software")]),
+                    "country": entity("France", ["country"], [("capital", "city")]),
+                    "county": entity("Orange County", ["county", "admin"], [("located in the administrative territorial entity", "state")]),
+                    "unknown": entity("Mystery Entity", [], []),
+                    "contradict": entity("Random Human", ["human"], [("place of birth", "city")]),
+                    "genre": entity("teen film", [], []),
+                    "brand": entity("Brand", [], []),
+                    "software": entity("software", [], []),
+                    "city": entity("Paris", [], []),
+                    "state": entity("California", [], []),
+                },
+            }
+        )
+
+        def verify(question: str, entity_id: str) -> dict:
+            return smoke.answer_side_verification_role_aware(
+                graph=graph,
+                question=question,
+                answer_type=smoke.guess_answer_type(question),
+                entity_id=entity_id,
+                old_score=1.0,
+                evidence=[],
+                support_count=1,
+            )
+
+        film_series = verify("What film series has this genre?", "film_series")
+        generic_film = verify("What film series has this genre?", "generic_film")
+        self.assertGreater(film_series["verified_final_score"], generic_film["verified_final_score"])
+
+        occupation = verify("What occupation is associated with this person?", "occupation_entity")
+        person = verify("What occupation is associated with this person?", "person")
+        self.assertGreater(occupation["verified_final_score"], person["verified_final_score"])
+        self.assertLess(person["role_confusion_penalty"], 0.0)
+
+        county = verify("Which county contains this place?", "county")
+        country = verify("Which county contains this place?", "country")
+        self.assertGreater(county["verified_final_score"], country["verified_final_score"])
+
+        unknown = verify("What film series has this genre?", "unknown")
+        self.assertGreater(unknown["verified_final_score"], 0.5)
+        self.assertEqual(unknown["contradiction_penalty"], 0.0)
+
+        contradiction = verify("What film series has this genre?", "contradict")
+        self.assertLess(contradiction["contradiction_penalty"], 0.0)
 
 
 if __name__ == "__main__":
