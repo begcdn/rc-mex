@@ -141,11 +141,13 @@ PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS = {
 PATH_FAMILY_ANY_HOP_CONCEPT_CONSTANTS = {
     **PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS,
     "any_hop_answers_mode": 1.0,
+    "depth_normalized_final_scores": 1.0,
 }
 
 PATH_FAMILY_ANY_HOP_LLM_CONSTANTS = {
     **PATH_FAMILY_LLM_RETENTION_CONSTANTS,
     "any_hop_answers_mode": 1.0,
+    "depth_normalized_final_scores": 1.0,
 }
 
 RELATION_ALIASES = {
@@ -1738,6 +1740,7 @@ def run_path_family_beam(
         family_records=retained_family_records,
         answer_type=answer_type,
         answer_concept_ids=answer_concept_ids,
+        depth_normalized_scores=any_hop_answers,
     )
     result["audit_trace"] = audit_trace
     if concept_verifier:
@@ -7923,6 +7926,23 @@ def llm_union_family_selection(
     return selected, diagnostics
 
 
+def state_path_depth(state: SearchState) -> int:
+    return max((int(step.get("hop", 0)) for step in state.evidence), default=1)
+
+
+def state_final_path_score(state: SearchState, depth_normalized: bool) -> float:
+    """Path score for final answer ranking.
+
+    Accumulated per-hop deltas reward longer paths just for being longer; when
+    candidates from different depths compete (any-hop answering), compare the
+    mean per-hop score instead. With uniform depth this is a constant factor,
+    so fixed-depth methods are unaffected by construction."""
+    score = float(state.soft_signals.get("final_proof_score", state.score))
+    if depth_normalized:
+        return score / max(1, state_path_depth(state))
+    return score
+
+
 def path_family_key(state: SearchState) -> tuple[Any, ...]:
     relation_sequence = tuple(step.get("relation_id", "") for step in state.evidence)
     direction_sequence = tuple(step.get("direction", "") for step in state.evidence)
@@ -8722,13 +8742,14 @@ def build_family_answer_ranker_diagnostics(
     answer_verifier: bool = False,
     answer_verifier_role_aware: bool = False,
     answer_concept_ids: set[str] | None = None,
+    depth_normalized_scores: bool = False,
 ) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     for family_rank, record in enumerate(family_records, start=1):
         grouped: dict[str, dict[str, Any]] = {}
         for state in record.get("states", []):
             for entity_id in state.frontier_ids:
-                path_score = float(state.soft_signals.get("final_proof_score", state.score))
+                path_score = state_final_path_score(state, depth_normalized_scores)
                 row = grouped.setdefault(
                     entity_id,
                     {
@@ -8863,11 +8884,12 @@ def path_family_search_result(
     family_records: list[dict[str, Any]] | None = None,
     answer_type: str = "",
     answer_concept_ids: set[str] | None = None,
+    depth_normalized_scores: bool = False,
 ) -> dict[str, Any]:
     grouped: dict[str, dict[str, Any]] = {}
     for state in states:
         for entity_id in state.frontier_ids:
-            final_score = float(state.soft_signals.get("final_proof_score", state.score))
+            final_score = state_final_path_score(state, depth_normalized_scores)
             row = grouped.setdefault(
                 entity_id,
                 {
@@ -8978,6 +9000,7 @@ def path_family_search_result(
             answer_verifier=answer_verifier,
             answer_verifier_role_aware=answer_verifier_role_aware,
             answer_concept_ids=answer_concept_ids,
+            depth_normalized_scores=depth_normalized_scores,
         ),
     }
 
