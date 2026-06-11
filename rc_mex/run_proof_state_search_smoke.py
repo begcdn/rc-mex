@@ -208,6 +208,16 @@ def main() -> None:
     log_line(f"Skipped unsupported: {selection_stats.get('unsupported_program', 0)}")
     log_line(f"Skipped empty gold execution: {selection_stats.get('empty_gold_execution', 0)}")
 
+    from rc_mex.micro_agents import DEFAULT_MODEL as llm_model, probe_llm_endpoint
+
+    probe = probe_llm_endpoint()
+    if probe["ok"]:
+        log_line(f"LLM endpoint OK: {probe['url']} (api={probe['api_style']}, model={probe['model']})")
+    else:
+        log_line("WARNING: LLM endpoint unreachable - LLM-retention methods will silently fall back to symbolic selection.")
+        log_line(f"WARNING: {probe['error']}")
+        log_line(f"WARNING: url={probe['url']} api={probe['api_style']} model={probe['model']} (set RC_MEX_LLM_URL / RC_MEX_LLM_MODEL)")
+
     log_stage(3, 4, "Running baseline, soft proof-state, fixed/wide two-score, and legacy beams")
     rows = []
     for index, example in enumerate(examples, start=1):
@@ -7898,6 +7908,9 @@ def llm_union_family_selection(
             continue
         seen_keys.add(key)
         selected.append(record)
+    if ranked.get("error") and not globals().get("_LLM_RETENTION_ERROR_WARNED"):
+        globals()["_LLM_RETENTION_ERROR_WARNED"] = True
+        print(f"WARNING: LLM path ranking failed ({ranked['error']}); falling back to symbolic family selection.", flush=True)
     diagnostics = {
         "llm_consulted": bool(ranked.get("consulted")),
         "llm_error": ranked.get("error", ""),

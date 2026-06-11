@@ -333,6 +333,21 @@ def link_answer_concept_cascade(
     return {"concept_name": None, "concept_ids": set(), "source": "none", "raw_response": linked["raw_response"], "llm_consulted": True}
 
 
+def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
+    """One cheap generation to verify the endpoint before a long run.
+
+    Cached like everything else, so a healthy endpoint is probed at most once
+    per (model, prompt version). Returns {ok, error, url, api_style, model}."""
+    result = call_local_llm("Reply with the single word: ok", "endpoint_probe_v1", model=model, timeout=30.0)
+    return {
+        "ok": not result["error"],
+        "error": result["error"],
+        "url": OLLAMA_URL,
+        "api_style": LLM_API_STYLE,
+        "model": model,
+    }
+
+
 def relation_path_label(evidence_steps: list[dict[str, Any]]) -> str:
     """Relation-only label for a path family, grouped by hop.
 
