@@ -150,6 +150,13 @@ PATH_FAMILY_ANY_HOP_LLM_CONSTANTS = {
     "depth_normalized_final_scores": 1.0,
 }
 
+PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS = {
+    **PATH_FAMILY_ANY_HOP_LLM_CONSTANTS,
+    "final_adjudicator_mode": 1.0,
+    "adjudicator_bonus": 0.45,
+    "adjudicator_pool_size": 12.0,
+}
+
 RELATION_ALIASES = {
     "place of birth": ["born in", "birthplace", "was born", "native of"],
     "place of burial": ["buried in", "burial place", "grave location", "buried at"],
@@ -397,6 +404,17 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
+        path_family_any_hop_adjudicated = run_path_family_any_hop_adjudicated(
+            graph=graph,
+            example=example,
+            top_k=args.top_k,
+            beam_width=args.beam_width,
+            relation_cap=args.relation_cap,
+            sample_entities=args.sample_entities,
+            max_branch_entities=args.max_branch_entities,
+            noisy_branch_threshold=args.noisy_branch_threshold,
+            debug_trace=args.debug_trace,
+        )
         if args.full_methods:
             future_aware = run_future_aware_proof_state_beam(
                 graph=graph,
@@ -425,7 +443,7 @@ def main() -> None:
             )
         else:
             future_aware_v2 = skipped_method_result("future_aware_v2_proof_state_beam")
-        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, path_family_llm_retention, path_family_wide_symbolic, path_family_any_hop_concept, path_family_any_hop_llm, future_aware, future_aware_v2)
+        row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, path_family_llm_retention, path_family_wide_symbolic, path_family_any_hop_concept, path_family_any_hop_llm, path_family_any_hop_adjudicated, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
 
@@ -447,6 +465,7 @@ def main() -> None:
             "path_family_wide_symbolic": PATH_FAMILY_WIDE_SYMBOLIC_CONSTANTS,
             "path_family_any_hop_concept": PATH_FAMILY_ANY_HOP_CONCEPT_CONSTANTS,
             "path_family_any_hop_llm": PATH_FAMILY_ANY_HOP_LLM_CONSTANTS,
+            "path_family_any_hop_adjudicated": PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS,
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
@@ -538,6 +557,13 @@ def main() -> None:
         title="Any-Hop LLM Retention vs Any-Hop Concept Verifier Regression Audit",
         note="Isolates the LLM retention contribution within the depth-agnostic setting.",
     )
+    adjudicator_value_audit = build_method_regression_audit(
+        rows,
+        baseline_key="path_family_any_hop_llm",
+        candidate_key="path_family_any_hop_adjudicated",
+        title="Final Adjudication vs Any-Hop LLM Regression Audit",
+        note="Isolates micro-agent 3: one entity-aware listwise call over the top final candidates (skipped when the margin makes it a provable no-op).",
+    )
     write_json(output_dir / "concept_verifier_regression_audit.json", concept_regression_audit)
     (output_dir / "concept_verifier_regression_audit.md").write_text(
         write_concept_verifier_regression_markdown(concept_regression_audit), encoding="utf-8"
@@ -557,6 +583,10 @@ def main() -> None:
     write_json(output_dir / "any_hop_llm_value_audit.json", any_hop_llm_value_audit)
     (output_dir / "any_hop_llm_value_audit.md").write_text(
         write_method_regression_markdown(any_hop_llm_value_audit), encoding="utf-8"
+    )
+    write_json(output_dir / "adjudicator_value_audit.json", adjudicator_value_audit)
+    (output_dir / "adjudicator_value_audit.md").write_text(
+        write_method_regression_markdown(adjudicator_value_audit), encoding="utf-8"
     )
     log_line("predictions.jsonl")
     log_line("metrics.json")
@@ -581,6 +611,7 @@ def main() -> None:
     log_line("llm_retention_vs_wide_symbolic.md")
     log_line("any_hop_regression_audit.md")
     log_line("any_hop_llm_value_audit.md")
+    log_line("adjudicator_value_audit.md")
     if args.debug_trace:
         trace_rows = select_trace_rows(rows, args.debug_limit)
         write_jsonl(output_dir / "debug_trace.jsonl", [debug_trace_json_row(row) for row in trace_rows])
@@ -1622,6 +1653,7 @@ def run_path_family_beam(
     llm_retention: bool = False,
     wide_symbolic_beam: bool = False,
     any_hop_answers: bool = False,
+    final_adjudicator: bool = False,
 ) -> dict[str, Any]:
     del top_k
     answer_type = guess_answer_type(example.question)
@@ -1732,7 +1764,7 @@ def run_path_family_beam(
                 "all_path_families": all_summaries,
                 "selected_path_families": selected_summaries,
                 "llm_retention": llm_retention_diagnostics,
-                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers),
+                "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers, final_adjudicator),
                 "relation_proposal_k": RELATION_PROPOSAL_K,
                 "answer_pool_cap": ANSWER_POOL_CAP,
                 "semantic_relation_embeddings_used": semantic_used,
@@ -1749,7 +1781,7 @@ def run_path_family_beam(
                     "selected_states": selected_summaries[:5],
                     "all_path_families": all_summaries[:5],
                     "selected_path_families": selected_summaries[:5],
-                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers),
+                    "constants": path_family_ranker_constants(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers, final_adjudicator),
                     "relation_proposal_k": RELATION_PROPOSAL_K,
                     "answer_pool_cap": ANSWER_POOL_CAP,
                     "semantic_relation_embeddings_used": semantic_used,
@@ -1766,7 +1798,7 @@ def run_path_family_beam(
         gold_answer_ids=example.gold_answer_ids,
         expansion_count=expansion_count,
         debug_trace=trace,
-        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers),
+        mode=path_family_ranker_mode(answer_ranker_v2, answer_verifier, answer_verifier_role_aware, concept_verifier, llm_retention, wide_symbolic_beam, any_hop_answers, final_adjudicator),
         answer_ranker_v2=answer_ranker_v2,
         answer_verifier=answer_verifier,
         answer_verifier_role_aware=answer_verifier_role_aware,
@@ -1775,11 +1807,23 @@ def run_path_family_beam(
         answer_concept_ids=answer_concept_ids,
         depth_normalized_scores=any_hop_answers,
     )
+    if final_adjudicator:
+        apply_final_adjudication(
+            graph=graph,
+            result=result,
+            question=example.question,
+            start_entity_name=example.start_entity_name,
+            gold_answer_ids=example.gold_answer_ids,
+        )
     result["audit_trace"] = audit_trace
+    adjudication = result.get("final_adjudication", {})
     result["llm_usage"] = {
-        "llm_calls": sum(1 for entry in audit_trace if entry.get("llm_retention", {}).get("llm_consulted")),
-        "prompt_tokens": sum(int(entry.get("llm_retention", {}).get("llm_prompt_tokens", 0)) for entry in audit_trace),
-        "completion_tokens": sum(int(entry.get("llm_retention", {}).get("llm_completion_tokens", 0)) for entry in audit_trace),
+        "llm_calls": sum(1 for entry in audit_trace if entry.get("llm_retention", {}).get("llm_consulted"))
+        + (1 if adjudication.get("consulted") else 0),
+        "prompt_tokens": sum(int(entry.get("llm_retention", {}).get("llm_prompt_tokens", 0)) for entry in audit_trace)
+        + int(adjudication.get("prompt_tokens", 0)),
+        "completion_tokens": sum(int(entry.get("llm_retention", {}).get("llm_completion_tokens", 0)) for entry in audit_trace)
+        + int(adjudication.get("completion_tokens", 0)),
     }
     if concept_verifier:
         result["answer_concept_extraction"] = {
@@ -1999,6 +2043,106 @@ def run_path_family_any_hop_llm(
     )
 
 
+def apply_final_adjudication(
+    graph: KnowledgeGraph,
+    result: dict[str, Any],
+    question: str,
+    start_entity_name: str,
+    gold_answer_ids: set[str],
+) -> None:
+    """Micro-agent 3: one entity-aware listwise call over the top final candidates.
+
+    Skips the call when the leader's margin exceeds the bonus (the call
+    provably cannot change the answer). Abstention, error, or parse failure
+    leaves the symbolic ranking untouched."""
+    from rc_mex.micro_agents import adjudicate_answer_candidates
+
+    bonus = float(PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS["adjudicator_bonus"])
+    pool_size = int(PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS["adjudicator_pool_size"])
+    candidates = result.get("candidate_answers", [])
+    adjudication: dict[str, Any] = {"consulted": False, "skipped_provable_noop": False, "error": "", "pick_label": ""}
+    result["final_adjudication"] = adjudication
+    if len(candidates) < 2:
+        return
+    margin = float(candidates[0]["score"]) - float(candidates[1]["score"])
+    if margin > bonus:
+        adjudication["skipped_provable_noop"] = True
+        return
+    top = candidates[:pool_size]
+    blocks = []
+    for candidate in top:
+        readable = (candidate.get("paths") or [{}])[0].get("readable", "")[:180]
+        blocks.append(f"{candidate['answer_label']} (path: {readable})")
+    response = adjudicate_answer_candidates(
+        question=question,
+        start_entity_name=start_entity_name,
+        candidate_blocks=blocks,
+    )
+    adjudication.update(
+        {
+            "consulted": True,
+            "error": response["error"],
+            "prompt_tokens": response["prompt_tokens"],
+            "completion_tokens": response["completion_tokens"],
+            "raw_response": response["raw_response"],
+        }
+    )
+    if response["error"] or response["pick"] is None:
+        return
+    chosen_id = str(top[response["pick"]]["answer_id"])
+    adjudication["pick_label"] = str(top[response["pick"]]["answer_label"])
+    for candidate in candidates:
+        if str(candidate["answer_id"]) == chosen_id:
+            candidate["score"] = float(candidate["score"]) + bonus
+            candidate["adjudicator_bonus"] = bonus
+    candidates.sort(key=lambda item: (-float(item["score"]), -float(item["best_path_score"]), item["answer_label"], item["answer_id"]))
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = rank
+    predicted_ids = {candidates[0]["answer_id"]}
+    p = precision(gold_answer_ids, predicted_ids)
+    r = recall(gold_answer_ids, predicted_ids)
+    result.update(
+        {
+            "candidate_answers": candidates,
+            "top_answer": candidates[0],
+            "hits_at_1": bool(predicted_ids & gold_answer_ids),
+            "exact_match": predicted_ids == gold_answer_ids if gold_answer_ids else not predicted_ids,
+            "final_answer_precision": p,
+            "final_answer_recall": r,
+            "final_answer_f1": f1(p, r),
+        }
+    )
+
+
+def run_path_family_any_hop_adjudicated(
+    graph: KnowledgeGraph,
+    example: SmokeExample,
+    top_k: int,
+    beam_width: int,
+    relation_cap: int,
+    sample_entities: int,
+    max_branch_entities: int,
+    noisy_branch_threshold: int,
+    debug_trace: bool = False,
+) -> dict[str, Any]:
+    return run_path_family_beam(
+        graph=graph,
+        example=example,
+        top_k=top_k,
+        beam_width=beam_width,
+        relation_cap=relation_cap,
+        sample_entities=sample_entities,
+        max_branch_entities=max_branch_entities,
+        noisy_branch_threshold=noisy_branch_threshold,
+        debug_trace=debug_trace,
+        answer_verifier=True,
+        concept_verifier=True,
+        llm_retention=True,
+        any_hop_answers=True,
+        final_adjudicator=True,
+    )
+
+
 def path_family_ranker_mode(
     answer_ranker_v2: bool,
     answer_verifier: bool,
@@ -2007,7 +2151,10 @@ def path_family_ranker_mode(
     llm_retention: bool = False,
     wide_symbolic_beam: bool = False,
     any_hop_answers: bool = False,
+    final_adjudicator: bool = False,
 ) -> str:
+    if final_adjudicator:
+        return "path_family_any_hop_adjudicated"
     if any_hop_answers and llm_retention:
         return "path_family_any_hop_llm"
     if any_hop_answers:
@@ -2035,7 +2182,10 @@ def path_family_ranker_constants(
     llm_retention: bool = False,
     wide_symbolic_beam: bool = False,
     any_hop_answers: bool = False,
+    final_adjudicator: bool = False,
 ) -> dict[str, float]:
+    if final_adjudicator:
+        return PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS
     if any_hop_answers and llm_retention:
         return PATH_FAMILY_ANY_HOP_LLM_CONSTANTS
     if any_hop_answers:
@@ -3589,6 +3739,7 @@ def build_prediction_row(
     path_family_wide_symbolic: dict[str, Any],
     path_family_any_hop_concept: dict[str, Any],
     path_family_any_hop_llm: dict[str, Any],
+    path_family_any_hop_adjudicated: dict[str, Any],
     future_aware: dict[str, Any],
     future_aware_v2: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3604,12 +3755,15 @@ def build_prediction_row(
     path_family_concept_verifier_correct = path_family_concept_verifier["hits_at_1"]
     path_family_llm_retention_correct = path_family_llm_retention["hits_at_1"]
     path_family_any_hop_llm_correct = path_family_any_hop_llm["hits_at_1"]
+    path_family_any_hop_adjudicated_correct = path_family_any_hop_adjudicated["hits_at_1"]
     future_correct = future_aware["hits_at_1"]
     future_v2_correct = future_aware_v2["hits_at_1"]
     if baseline_correct and proof_correct and path_family_verifier_role_aware_correct:
         failure_type = "both_correct"
     elif path_family_verifier_role_aware_correct and not path_family_verifier_correct:
         failure_type = "path_family_answer_verifier_role_aware_correct"
+    elif path_family_any_hop_adjudicated_correct and not path_family_any_hop_llm_correct:
+        failure_type = "path_family_any_hop_adjudicated_correct"
     elif path_family_any_hop_llm_correct and not path_family_llm_retention_correct:
         failure_type = "path_family_any_hop_llm_correct"
     elif path_family_llm_retention_correct and not path_family_concept_verifier_correct:
@@ -3669,6 +3823,7 @@ def build_prediction_row(
         "path_family_wide_symbolic": path_family_wide_symbolic,
         "path_family_any_hop_concept": path_family_any_hop_concept,
         "path_family_any_hop_llm": path_family_any_hop_llm,
+        "path_family_any_hop_adjudicated": path_family_any_hop_adjudicated,
         "future_aware_proof_state_beam": future_aware,
         "future_aware_v2_proof_state_beam": future_aware_v2,
         "failure_type": failure_type,
@@ -3690,6 +3845,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     path_family_wide_sym = [row["path_family_wide_symbolic"] for row in rows]
     path_family_ah_concept = [row["path_family_any_hop_concept"] for row in rows]
     path_family_ah_llm = [row["path_family_any_hop_llm"] for row in rows]
+    path_family_ah_adj = [row["path_family_any_hop_adjudicated"] for row in rows]
     future = [row["future_aware_proof_state_beam"] for row in rows]
     future_v2 = [row["future_aware_v2_proof_state_beam"] for row in rows]
     future_v2_overlap = [error_overlap_case(row, future_key="future_aware_v2_proof_state_beam") for row in rows]
@@ -3716,6 +3872,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_wide_symbolic_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_wide_sym),
         "path_family_any_hop_concept_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_ah_concept),
         "path_family_any_hop_llm_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_ah_llm),
+        "path_family_any_hop_adjudicated_hits_at_1": avg_bool(item["hits_at_1"] for item in path_family_ah_adj),
         "future_aware_hits_at_1": avg_bool(item["hits_at_1"] for item in future),
         "future_aware_v2_hits_at_1": avg_bool(item["hits_at_1"] for item in future_v2),
         "baseline_exact_match": avg_bool(item["exact_match"] for item in baseline),
@@ -3732,6 +3889,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_wide_symbolic_exact_match": avg_bool(item["exact_match"] for item in path_family_wide_sym),
         "path_family_any_hop_concept_exact_match": avg_bool(item["exact_match"] for item in path_family_ah_concept),
         "path_family_any_hop_llm_exact_match": avg_bool(item["exact_match"] for item in path_family_ah_llm),
+        "path_family_any_hop_adjudicated_exact_match": avg_bool(item["exact_match"] for item in path_family_ah_adj),
         "future_aware_exact_match": avg_bool(item["exact_match"] for item in future),
         "future_aware_v2_exact_match": avg_bool(item["exact_match"] for item in future_v2),
         "baseline_final_answer_f1": avg(item["final_answer_f1"] for item in baseline),
@@ -3748,6 +3906,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_wide_symbolic_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_wide_sym),
         "path_family_any_hop_concept_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_ah_concept),
         "path_family_any_hop_llm_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_ah_llm),
+        "path_family_any_hop_adjudicated_final_answer_f1": avg(item["final_answer_f1"] for item in path_family_ah_adj),
         "future_aware_final_answer_f1": avg(item["final_answer_f1"] for item in future),
         "future_aware_v2_final_answer_f1": avg(item["final_answer_f1"] for item in future_v2),
         "baseline_gold_generated_rate": avg_bool(item["gold_generated"] for item in baseline),
@@ -3764,6 +3923,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "path_family_wide_symbolic_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_wide_sym),
         "path_family_any_hop_concept_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_ah_concept),
         "path_family_any_hop_llm_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_ah_llm),
+        "path_family_any_hop_adjudicated_gold_generated_rate": avg_bool(item["gold_generated"] for item in path_family_ah_adj),
         "future_aware_gold_generated_rate": avg_bool(item["gold_generated"] for item in future),
         "future_aware_v2_gold_generated_rate": avg_bool(item["gold_generated"] for item in future_v2),
         "average_candidate_count_baseline": avg(item["candidate_count"] for item in baseline),
@@ -3964,6 +4124,14 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["path_family_wide_symbolic"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
         ),
+        "adjudicated_wins_over_any_hop_llm": sum(
+            1 for row in rows
+            if row["path_family_any_hop_adjudicated"]["final_answer_f1"] > row["path_family_any_hop_llm"]["final_answer_f1"]
+        ),
+        "any_hop_llm_wins_over_adjudicated": sum(
+            1 for row in rows
+            if row["path_family_any_hop_llm"]["final_answer_f1"] > row["path_family_any_hop_adjudicated"]["final_answer_f1"]
+        ),
         "any_hop_llm_wins_over_llm_retention": sum(
             1 for row in rows
             if row["path_family_any_hop_llm"]["final_answer_f1"] > row["path_family_llm_retention"]["final_answer_f1"]
@@ -3978,7 +4146,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "avg_prompt_tokens": avg(row[method].get("llm_usage", {}).get("prompt_tokens", 0) for row in rows),
                 "avg_completion_tokens": avg(row[method].get("llm_usage", {}).get("completion_tokens", 0) for row in rows),
             }
-            for method in ["path_family_llm_retention", "path_family_any_hop_llm"]
+            for method in ["path_family_llm_retention", "path_family_any_hop_llm", "path_family_any_hop_adjudicated"]
         },
         "hits_at_1_by_gold_hop_count": {
             f"{hops}_hop": {
@@ -3995,6 +4163,7 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
                         "path_family_wide_symbolic",
                         "path_family_any_hop_concept",
                         "path_family_any_hop_llm",
+                        "path_family_any_hop_adjudicated",
                     ]
                 },
             }
@@ -4235,6 +4404,12 @@ def write_report(metrics: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         json.dumps(metrics, indent=2, sort_keys=True),
         "```",
         "",
+        "## Adjudicated Wins Over Any-Hop LLM",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "adjudicated_over_any_hop_llm"), limit=5),
+        "## Any-Hop LLM Wins Over Adjudicated",
+        "",
+        *debug_section_rows(select_debug_rows(rows, "any_hop_llm_over_adjudicated"), limit=5),
         "## Any-Hop LLM Wins Over Fixed-Depth LLM Retention",
         "",
         *debug_section_rows(select_debug_rows(rows, "any_hop_llm_over_llm_retention"), limit=5),
@@ -4329,6 +4504,8 @@ def select_trace_rows(rows: list[dict[str, Any]], debug_limit: int) -> list[dict
         "two_score_wide_over_hybrid",
         "path_family_over_hybrid",
         "hybrid_over_path_family",
+        "adjudicated_over_any_hop_llm",
+        "any_hop_llm_over_adjudicated",
         "any_hop_llm_over_llm_retention",
         "llm_retention_over_any_hop_llm",
         "llm_retention_over_concept_verifier",
@@ -5069,6 +5246,16 @@ def select_debug_rows(rows: list[dict[str, Any]], kind: str) -> list[dict[str, A
         selected = [
             row for row in rows
             if row["path_family_beam"]["final_answer_f1"] > row["hybrid_relation_proposal_beam"]["final_answer_f1"]
+        ]
+    elif kind == "adjudicated_over_any_hop_llm":
+        selected = [
+            row for row in rows
+            if row["path_family_any_hop_adjudicated"]["final_answer_f1"] > row["path_family_any_hop_llm"]["final_answer_f1"]
+        ]
+    elif kind == "any_hop_llm_over_adjudicated":
+        selected = [
+            row for row in rows
+            if row["path_family_any_hop_llm"]["final_answer_f1"] > row["path_family_any_hop_adjudicated"]["final_answer_f1"]
         ]
     elif kind == "any_hop_llm_over_llm_retention":
         selected = [
@@ -9268,6 +9455,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family_llm_ret = row["path_family_llm_retention"]
     path_family_wide_sym = row["path_family_wide_symbolic"]
     path_family_ah_llm = row["path_family_any_hop_llm"]
+    path_family_ah_adj = row["path_family_any_hop_adjudicated"]
     future = row["future_aware_proof_state_beam"]
     future_v2 = row["future_aware_v2_proof_state_beam"]
     baseline_top = baseline["top_answer"] or {}
@@ -9283,6 +9471,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     path_family_llm_ret_top = path_family_llm_ret["top_answer"] or {}
     path_family_wide_sym_top = path_family_wide_sym["top_answer"] or {}
     path_family_ah_llm_top = path_family_ah_llm["top_answer"] or {}
+    path_family_ah_adj_top = path_family_ah_adj["top_answer"] or {}
     future_top = future["top_answer"] or {}
     future_v2_top = future_v2["top_answer"] or {}
     print(f"\nQuestion {index}/{total}", flush=True)
@@ -9302,6 +9491,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Path-family LLM retention top answer: {path_family_llm_ret_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family wide symbolic top answer: {path_family_wide_sym_top.get('answer_label', '<none>')}", flush=True)
     print(f"Path-family any-hop LLM top answer: {path_family_ah_llm_top.get('answer_label', '<none>')}", flush=True)
+    print(f"Path-family any-hop adjudicated top answer: {path_family_ah_adj_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware top answer: {future_top.get('answer_label', '<none>')}", flush=True)
     print(f"Future-aware v2 top answer: {future_v2_top.get('answer_label', '<none>')}", flush=True)
     print(f"Gold generated baseline: {'yes' if baseline['gold_generated'] else 'no'}", flush=True)
@@ -9317,6 +9507,7 @@ def print_runtime_log(row: dict[str, Any], index: int, total: int) -> None:
     print(f"Gold generated path-family LLM retention: {'yes' if path_family_llm_ret['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family wide symbolic: {'yes' if path_family_wide_sym['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated path-family any-hop LLM: {'yes' if path_family_ah_llm['gold_generated'] else 'no'}", flush=True)
+    print(f"Gold generated path-family any-hop adjudicated: {'yes' if path_family_ah_adj['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware: {'yes' if future['gold_generated'] else 'no'}", flush=True)
     print(f"Gold generated future-aware v2: {'yes' if future_v2['gold_generated'] else 'no'}", flush=True)
     print(f"Baseline top path: {top_path_readable(baseline_top)}", flush=True)
