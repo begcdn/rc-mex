@@ -223,71 +223,89 @@ def main() -> None:
     log_stage(3, 4, "Running baseline, soft proof-state, fixed/wide two-score, and legacy beams")
     rows = []
     for index, example in enumerate(examples, start=1):
-        baseline = run_baseline_path_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            debug_trace=args.debug_trace,
-        )
-        proof_state = run_soft_proof_state_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
-        two_score = run_two_score_proof_state_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
-        two_score_fixed = run_two_score_fixed_proof_state_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
-        two_score_wide = run_two_score_wide_proposal_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
-        hybrid_proposal = run_hybrid_relation_proposal_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
+        if args.full_methods:
+            baseline = run_baseline_path_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            baseline = skipped_method_result("baseline_path_beam")
+        if args.full_methods:
+            proof_state = run_soft_proof_state_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            proof_state = skipped_method_result("soft_proof_state_beam")
+        if args.full_methods:
+            two_score = run_two_score_proof_state_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            two_score = skipped_method_result("two_score_proof_state_beam")
+        if args.full_methods:
+            two_score_fixed = run_two_score_fixed_proof_state_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            two_score_fixed = skipped_method_result("two_score_fixed_proof_state_beam")
+        if args.full_methods:
+            two_score_wide = run_two_score_wide_proposal_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            two_score_wide = skipped_method_result("two_score_wide_proposal_beam")
+        if args.full_methods:
+            hybrid_proposal = run_hybrid_relation_proposal_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            hybrid_proposal = skipped_method_result("hybrid_relation_proposal_beam")
         path_family = run_path_family_beam(
             graph=graph,
             example=example,
@@ -310,17 +328,20 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        path_family_answer_verifier_role_aware = run_path_family_answer_verifier_role_aware(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
+        if args.full_methods:
+            path_family_answer_verifier_role_aware = run_path_family_answer_verifier_role_aware(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            path_family_answer_verifier_role_aware = skipped_method_result("path_family_answer_verifier_role_aware")
         path_family_concept_verifier = run_path_family_concept_verifier(
             graph=graph,
             example=example,
@@ -376,28 +397,34 @@ def main() -> None:
             noisy_branch_threshold=args.noisy_branch_threshold,
             debug_trace=args.debug_trace,
         )
-        future_aware = run_future_aware_proof_state_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
-        future_aware_v2 = run_future_aware_v2_proof_state_beam(
-            graph=graph,
-            example=example,
-            top_k=args.top_k,
-            beam_width=args.beam_width,
-            relation_cap=args.relation_cap,
-            sample_entities=args.sample_entities,
-            max_branch_entities=args.max_branch_entities,
-            noisy_branch_threshold=args.noisy_branch_threshold,
-            debug_trace=args.debug_trace,
-        )
+        if args.full_methods:
+            future_aware = run_future_aware_proof_state_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            future_aware = skipped_method_result("future_aware_proof_state_beam")
+        if args.full_methods:
+            future_aware_v2 = run_future_aware_v2_proof_state_beam(
+                graph=graph,
+                example=example,
+                top_k=args.top_k,
+                beam_width=args.beam_width,
+                relation_cap=args.relation_cap,
+                sample_entities=args.sample_entities,
+                max_branch_entities=args.max_branch_entities,
+                noisy_branch_threshold=args.noisy_branch_threshold,
+                debug_trace=args.debug_trace,
+            )
+        else:
+            future_aware_v2 = skipped_method_result("future_aware_v2_proof_state_beam")
         row = build_prediction_row(graph, example, baseline, proof_state, two_score, two_score_fixed, two_score_wide, hybrid_proposal, path_family, path_family_answer_verifier, path_family_answer_verifier_role_aware, path_family_concept_verifier, path_family_llm_retention, path_family_wide_symbolic, path_family_any_hop_concept, path_family_any_hop_llm, future_aware, future_aware_v2)
         print_runtime_log(row, index, len(examples))
         rows.append(row)
@@ -423,6 +450,12 @@ def main() -> None:
             "future_aware_v2_proof_state_beam": FUTURE_AWARE_V2_CONSTANTS,
         },
         "selection_stats": selection_stats,
+        "skipped_methods": [] if args.full_methods else [
+            "baseline_path_beam", "soft_proof_state_beam", "two_score_proof_state_beam",
+            "two_score_fixed_proof_state_beam", "two_score_wide_proposal_beam",
+            "hybrid_relation_proposal_beam", "path_family_answer_verifier_role_aware",
+            "future_aware_proof_state_beam", "future_aware_v2_proof_state_beam",
+        ],
         "metrics": metrics,
     }
     write_jsonl(output_dir / "predictions.jsonl", rows)
@@ -3506,6 +3539,31 @@ def summarize_two_score_state(state: SearchState, rank: int) -> dict[str, Any]:
         "question_term_overlap": last_step.get("question_term_overlap", 0.0),
         "semantic_score": last_step.get("semantic_score", 0.0),
         "matched_aliases": last_step.get("matched_aliases", []),
+    }
+
+
+def skipped_method_result(mode: str) -> dict[str, Any]:
+    """Placeholder for retired methods not run in this invocation.
+
+    All metrics consumers see zeros; summaries list the skipped methods so the
+    zeros cannot be mistaken for measurements."""
+    return {
+        "mode": mode,
+        "skipped": True,
+        "candidate_answers": [],
+        "top_answer": None,
+        "gold_generated": False,
+        "hits_at_1": False,
+        "exact_match": False,
+        "final_answer_precision": 0.0,
+        "final_answer_recall": 0.0,
+        "final_answer_f1": 0.0,
+        "candidate_count": 0,
+        "expansion_count": 0,
+        "final_result_size": 0,
+        "debug_trace": [],
+        "audit_trace": [],
+        "family_answer_ranker_diagnostics": [],
     }
 
 
@@ -9359,6 +9417,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-entities", type=int, default=25)
     parser.add_argument("--max-branch-entities", type=int, default=40)
     parser.add_argument("--noisy-branch-threshold", type=int, default=25)
+    parser.add_argument(
+        "--full-methods",
+        action="store_true",
+        help="Also run the retired legacy methods (baseline, soft proof-state, two-score variants, hybrid, role-aware, future-aware). Default runs only the thesis-relevant path-family lineage.",
+    )
     parser.add_argument("--debug-trace", action="store_true", help="Write debug_trace.md/jsonl with top hop states and score components.")
     parser.add_argument("--debug-limit", type=int, default=10, help="Maximum number of questions to include in debug trace outputs.")
     return parser.parse_args()

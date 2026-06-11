@@ -98,6 +98,7 @@ class ProofStateSearchSmokeTests(unittest.TestCase):
                     "2",
                     "--beam-width",
                     "2",
+                    "--full-methods",
                     "--debug-trace",
                     "--debug-limit",
                     "1",
