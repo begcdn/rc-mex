@@ -413,13 +413,15 @@ def rank_relation_paths(
     )
     result = call_local_llm(prompt, PATH_RANKER_PROMPT_VERSION, model=model, timeout=180.0)
     if result["error"]:
-        return {"picks": [], "raw_response": "", "error": result["error"], "consulted": True}
+        return {"picks": [], "raw_response": "", "error": result["error"], "consulted": True, "prompt_tokens": 0, "completion_tokens": 0}
     picks = parse_pick_numbers(result["text"], len(path_labels), top_k=top_k)
     return {
         "picks": [index - 1 for index in picks],
         "raw_response": result["text"][:120],
         "error": "",
         "consulted": True,
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
     }
 
 

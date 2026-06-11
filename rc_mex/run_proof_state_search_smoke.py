@@ -1776,6 +1776,11 @@ def run_path_family_beam(
         depth_normalized_scores=any_hop_answers,
     )
     result["audit_trace"] = audit_trace
+    result["llm_usage"] = {
+        "llm_calls": sum(1 for entry in audit_trace if entry.get("llm_retention", {}).get("llm_consulted")),
+        "prompt_tokens": sum(int(entry.get("llm_retention", {}).get("llm_prompt_tokens", 0)) for entry in audit_trace),
+        "completion_tokens": sum(int(entry.get("llm_retention", {}).get("llm_completion_tokens", 0)) for entry in audit_trace),
+    }
     if concept_verifier:
         result["answer_concept_extraction"] = {
             "extracted_concept_name": extracted_concept["concept_name"] if extracted_concept else "",
@@ -3967,6 +3972,14 @@ def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows
             if row["path_family_llm_retention"]["final_answer_f1"] > row["path_family_any_hop_llm"]["final_answer_f1"]
         ),
+        "llm_cost_per_question": {
+            method: {
+                "avg_llm_calls": avg(row[method].get("llm_usage", {}).get("llm_calls", 0) for row in rows),
+                "avg_prompt_tokens": avg(row[method].get("llm_usage", {}).get("prompt_tokens", 0) for row in rows),
+                "avg_completion_tokens": avg(row[method].get("llm_usage", {}).get("completion_tokens", 0) for row in rows),
+            }
+            for method in ["path_family_llm_retention", "path_family_any_hop_llm"]
+        },
         "hits_at_1_by_gold_hop_count": {
             f"{hops}_hop": {
                 "questions": sum(1 for row in rows if row.get("gold_hop_count", 2) == hops),
@@ -7975,6 +7988,8 @@ def llm_union_family_selection(
     diagnostics = {
         "llm_consulted": bool(ranked.get("consulted")),
         "llm_error": ranked.get("error", ""),
+        "llm_prompt_tokens": int(ranked.get("prompt_tokens", 0)),
+        "llm_completion_tokens": int(ranked.get("completion_tokens", 0)),
         "llm_picked_labels": [labels[index] for index in ranked["picks"]],
         "candidate_label_count": len(labels),
         "symbolic_selected": len(symbolic_records),
