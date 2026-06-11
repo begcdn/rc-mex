@@ -157,11 +157,24 @@ def call_local_llm(
     model: str = DEFAULT_MODEL,
     timeout: float = 90.0,
 ) -> dict[str, Any]:
-    """Cached, deterministic single-shot generation. Returns {text, from_cache, error}."""
+    """Cached, deterministic single-shot generation.
+
+    Returns {text, from_cache, error, prompt_tokens, completion_tokens}.
+    Token counts come from the serving backend and are cached alongside the
+    text (older cache entries are plain strings with unknown token counts)."""
     cache = _load_cache()
     key = _cache_key(prompt_version, model, prompt)
     if key in cache:
-        return {"text": cache[key], "from_cache": True, "error": ""}
+        cached = cache[key]
+        if isinstance(cached, dict):
+            return {
+                "text": cached.get("text", ""),
+                "from_cache": True,
+                "error": "",
+                "prompt_tokens": int(cached.get("prompt_tokens", 0)),
+                "completion_tokens": int(cached.get("completion_tokens", 0)),
+            }
+        return {"text": cached, "from_cache": True, "error": "", "prompt_tokens": 0, "completion_tokens": 0}
     if LLM_API_STYLE == "openai":
         request_body: dict[str, Any] = {
             "model": model,
@@ -193,14 +206,19 @@ def call_local_llm(
             body = json.loads(response.read().decode("utf-8"))
         if LLM_API_STYLE == "openai":
             raw_text = str((body.get("choices") or [{}])[0].get("message", {}).get("content", ""))
+            usage = body.get("usage", {}) or {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0))
+            completion_tokens = int(usage.get("completion_tokens", 0))
         else:
             raw_text = str(body.get("response", ""))
+            prompt_tokens = int(body.get("prompt_eval_count", 0))
+            completion_tokens = int(body.get("eval_count", 0))
         text = THINK_BLOCK_PATTERN.sub("", raw_text).strip()
     except Exception as exc:
-        return {"text": "", "from_cache": False, "error": f"{type(exc).__name__}: {exc}"}
-    cache[key] = text
+        return {"text": "", "from_cache": False, "error": f"{type(exc).__name__}: {exc}", "prompt_tokens": 0, "completion_tokens": 0}
+    cache[key] = {"text": text, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
     _save_cache()
-    return {"text": text, "from_cache": False, "error": ""}
+    return {"text": text, "from_cache": False, "error": "", "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
 
 
 def build_concept_shortlist(
