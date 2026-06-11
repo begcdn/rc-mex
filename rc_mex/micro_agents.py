@@ -156,6 +156,7 @@ def call_local_llm(
     prompt_version: str,
     model: str = DEFAULT_MODEL,
     timeout: float = 90.0,
+    num_predict: int = 256,
 ) -> dict[str, Any]:
     """Cached, deterministic single-shot generation.
 
@@ -181,7 +182,7 @@ def call_local_llm(
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
             "seed": 7,
-            "max_tokens": 256,
+            "max_tokens": num_predict,
         }
         if "qwen" in model.lower():
             # vLLM-style switch to disable qwen3 thinking mode.
@@ -191,7 +192,7 @@ def call_local_llm(
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0, "seed": 7, "num_predict": 256},
+            "options": {"temperature": 0, "seed": 7, "num_predict": num_predict},
         }
         if "qwen" in model.lower():
             # Disable qwen3 thinking mode; strict verifiers expect the bare answer.

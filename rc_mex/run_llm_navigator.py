@@ -42,6 +42,67 @@ MAX_DEPTH = 2
 RELATIONS_PER_PATH = 2
 ENTITIES_PER_BRANCH = 3
 ENTITY_PICK_THRESHOLD = 8
+FAITHFUL_ENTITY_PICK_THRESHOLD = 3
+
+# Faithful mode mirrors the published ToG configuration more closely:
+# few-shot exemplars in every prompt, chain-of-thought before each decision,
+# and LLM entity scoring whenever there is a choice. Exemplars are synthetic
+# (invented entities) so no evaluation data leaks into prompts.
+FAITHFUL_SUFFIX = "_faithful"
+RELATION_EXEMPLARS = """Here are examples of the task.
+
+Example 1:
+Question: "Which lake is north of the town where Anna Veld was born?"
+Current path: Anna Veld
+Possible relations from "Anna Veld":
+1. occupation [forward]
+2. place of birth [forward]
+3. award received [forward]
+4. spouse [forward]
+Reasoning: the question asks about the town where she was born, so I must follow the birthplace relation first; occupation and awards are irrelevant.
+PICKS: 2
+
+Example 2:
+Question: "Who employs the inventor of the Solar Loom?"
+Current path: Solar Loom --inventor[forward]--> Maro Tani
+Possible relations from "Maro Tani":
+1. employer [forward]
+2. place of burial [forward]
+3. sibling [forward]
+Reasoning: I already reached the inventor; now I need who employs him, which is the employer relation.
+PICKS: 1
+
+"""
+ENTITY_EXEMPLARS = """Here is an example of the task.
+
+Example:
+Question: "Which lake is north of the town where Anna Veld was born?"
+Path so far: Anna Veld --place of birth[forward]--> Quellstadt
+Following "north of [backward]" leads to:
+1. Lake Virelle
+2. Mount Harrow
+3. Virelle Forest
+Reasoning: the question asks for a lake, so among these only Lake Virelle fits.
+PICKS: 1
+
+"""
+DECIDE_EXEMPLARS = """Here are examples of the task.
+
+Example 1:
+Question: "Which lake is north of the town where Anna Veld was born?"
+Paths found so far:
+1. Anna Veld --place of birth[forward]--> Quellstadt
+Reasoning: I only reached the town; the question asks for the lake north of it, so I must continue.
+CONTINUE
+
+Example 2:
+Question: "Who employs the inventor of the Solar Loom?"
+Paths found so far:
+1. Solar Loom --inventor[forward]--> Maro Tani --employer[forward]--> Helix Works
+Reasoning: the path ends at the employer of the inventor, which answers the question.
+ANSWER: Helix Works
+
+"""
 
 NAV_RELATION_PROMPT_VERSION = "navigator_relation_v1"
 NAV_RELATION_PROMPT = """You are answering a question by walking a knowledge graph step by step.
@@ -106,15 +167,25 @@ class CallMeter:
         self.completion_tokens = 0
         self.errors = 0
 
-    def ask(self, prompt: str, version: str, model: str) -> str:
+    def ask(self, prompt: str, version: str, model: str, num_predict: int = 256) -> str:
         self.calls += 1
-        result = call_local_llm(prompt, version, model=model, timeout=180.0)
+        result = call_local_llm(prompt, version, model=model, timeout=180.0, num_predict=num_predict)
         if result["error"]:
             self.errors += 1
             return ""
         self.prompt_tokens += int(result.get("prompt_tokens", 0))
         self.completion_tokens += int(result.get("completion_tokens", 0))
         return result["text"]
+
+
+def parse_picks_cot(reply: str, count: int, top_k: int) -> list[int]:
+    """Parse picks from a chain-of-thought reply: prefer the last PICKS: line."""
+    marker = reply.rfind("PICKS:")
+    text = reply[marker + len("PICKS:"):] if marker >= 0 else reply.splitlines()[-1] if reply.strip() else ""
+    picks = parse_pick_numbers(text, count, top_k=top_k)
+    if not picks:
+        picks = parse_pick_numbers(reply, count, top_k=top_k)
+    return picks
 
 
 def path_readable(graph: KnowledgeGraph, path: dict[str, Any]) -> str:
@@ -132,8 +203,13 @@ def navigate(
     relation_cap: int = 30,
     sample_entities: int = 25,
     max_branch_entities: int = 40,
+    faithful: bool = False,
 ) -> dict[str, Any]:
     meter = CallMeter()
+    suffix = FAITHFUL_SUFFIX if faithful else ""
+    cot = "\nFirst write one short Reasoning line, then reply with PICKS: followed by the numbers." if faithful else ""
+    num_predict = 512 if faithful else 256
+    entity_threshold = FAITHFUL_ENTITY_PICK_THRESHOLD if faithful else ENTITY_PICK_THRESHOLD
     paths = [{"entities": [sid], "steps": []} for sid in sorted(start_ids)[:BEAM_WIDTH]]
     visited: set[str] = set(p["entities"][0] for p in paths)
     answer_id, answer_hop = "", 0
@@ -146,15 +222,15 @@ def navigate(
             if not frontier:
                 continue
             labels = [f"{c.predicate.replace('_', ' ')} [{c.direction}]" for c in frontier]
-            prompt = NAV_RELATION_PROMPT.format(
+            prompt = (RELATION_EXEMPLARS if faithful else "") + NAV_RELATION_PROMPT.format(
                 question=question,
                 path=path_readable(graph, path),
                 tail=graph.entity_name(tail),
                 candidates="\n".join(f"{i}. {l}" for i, l in enumerate(labels, 1)),
                 k=RELATIONS_PER_PATH,
-            )
-            reply = meter.ask(prompt, NAV_RELATION_PROMPT_VERSION, model)
-            picks = parse_pick_numbers(reply, len(labels), top_k=RELATIONS_PER_PATH)
+            ) + cot
+            reply = meter.ask(prompt, NAV_RELATION_PROMPT_VERSION + suffix, model, num_predict)
+            picks = parse_picks_cot(reply, len(labels), RELATIONS_PER_PATH) if faithful else parse_pick_numbers(reply, len(labels), top_k=RELATIONS_PER_PATH)
             for pick in picks:
                 candidate = frontier[pick - 1]
                 step_label = f"{candidate.predicate.replace('_', ' ')}[{candidate.direction}]"
@@ -166,17 +242,17 @@ def navigate(
                 targets = [t for t in targets if t not in set(path["entities"])]
                 if not targets:
                     continue
-                if len(targets) > ENTITY_PICK_THRESHOLD:
+                if len(targets) > entity_threshold:
                     names = [graph.entity_name(t) for t in targets[:20]]
-                    eprompt = NAV_ENTITY_PROMPT.format(
+                    eprompt = (ENTITY_EXEMPLARS if faithful else "") + NAV_ENTITY_PROMPT.format(
                         question=question,
                         path=path_readable(graph, path),
                         relation=step_label,
                         candidates="\n".join(f"{i}. {n}" for i, n in enumerate(names, 1)),
                         k=ENTITIES_PER_BRANCH,
-                    )
-                    ereply = meter.ask(eprompt, NAV_ENTITY_PROMPT_VERSION, model)
-                    epicks = parse_pick_numbers(ereply, len(names), top_k=ENTITIES_PER_BRANCH)
+                    ) + cot
+                    ereply = meter.ask(eprompt, NAV_ENTITY_PROMPT_VERSION + suffix, model, num_predict)
+                    epicks = parse_picks_cot(ereply, len(names), ENTITIES_PER_BRANCH) if faithful else parse_pick_numbers(ereply, len(names), top_k=ENTITIES_PER_BRANCH)
                     chosen = [targets[i - 1] for i in epicks] or targets[:ENTITIES_PER_BRANCH]
                 else:
                     chosen = targets[:ENTITIES_PER_BRANCH]
@@ -192,8 +268,8 @@ def navigate(
                 candidates="\n".join(f"{i}. {r}" for i, r in enumerate(readable, 1)),
                 k=BEAM_WIDTH,
             )
-            preply = meter.ask(pprompt, NAV_PRUNE_PROMPT_VERSION, model)
-            ppicks = parse_pick_numbers(preply, len(readable), top_k=BEAM_WIDTH)
+            preply = meter.ask(pprompt if not faithful else pprompt + cot, NAV_PRUNE_PROMPT_VERSION + suffix, model, num_predict)
+            ppicks = parse_picks_cot(preply, len(readable), BEAM_WIDTH) if faithful else parse_pick_numbers(preply, len(readable), top_k=BEAM_WIDTH)
             paths = [new_paths[i - 1] for i in ppicks] or new_paths[:BEAM_WIDTH]
         else:
             paths = new_paths
@@ -204,18 +280,19 @@ def navigate(
                 question=question,
                 candidates="\n".join(f"{i}. {r}" for i, r in enumerate(readable, 1)),
             )
-            decision = meter.ask(dprompt, NAV_DECIDE_PROMPT_VERSION, model)
+            decision = meter.ask((DECIDE_EXEMPLARS if faithful else "") + dprompt, NAV_DECIDE_PROMPT_VERSION + suffix, model, num_predict)
         else:
             decision = meter.ask(
                 NAV_FORCE_PROMPT.format(
                     question=question,
                     candidates="\n".join(f"{i}. {r}" for i, r in enumerate(readable, 1)),
                 ),
-                NAV_FORCE_PROMPT_VERSION,
+                NAV_FORCE_PROMPT_VERSION + suffix,
                 model,
+                num_predict,
             )
         if "ANSWER:" in decision:
-            name = normalize_text(decision.split("ANSWER:", 1)[1].strip().splitlines()[0].strip().strip('"'))
+            name = normalize_text(decision[decision.rfind("ANSWER:") + len("ANSWER:"):].strip().splitlines()[0].strip().strip('"'))
             endpoints = {p["entities"][-1]: normalize_text(graph.entity_name(p["entities"][-1])) for p in paths}
             matched = [eid for eid, ename in endpoints.items() if ename == name]
             if not matched:
@@ -243,6 +320,7 @@ def main() -> None:
     parser.add_argument("--output", default="runs/llm_navigator")
     parser.add_argument("--max-examples", type=int, default=250)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--faithful", action="store_true", help="ToG-faithful mode: few-shot exemplars, chain-of-thought, always-on entity scoring.")
     args = parser.parse_args()
 
     output_dir = ensure_dir(args.output)
@@ -260,7 +338,7 @@ def main() -> None:
     counts: Counter[str] = Counter()
     started = time.time()
     for index, example in enumerate(examples, 1):
-        result = navigate(graph, example.question, example.start_entity_ids, args.model)
+        result = navigate(graph, example.question, example.start_entity_ids, args.model, faithful=args.faithful)
         hit = result["answer_id"] in example.gold_answer_ids if result["answer_id"] else False
         gold_visited = bool(result["visited"] & example.gold_answer_ids)
         counts["total"] += 1
