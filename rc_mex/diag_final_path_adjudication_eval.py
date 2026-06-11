@@ -25,7 +25,7 @@ import json
 import time
 from collections import Counter
 
-from rc_mex.micro_agents import DEFAULT_MODEL, rank_relation_paths, relation_path_label
+from rc_mex.micro_agents import DEFAULT_MODEL, adjudicate_answer_candidates, rank_relation_paths, relation_path_label
 
 
 def candidate_best_label(candidate: dict) -> str:
@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--method", default="path_family_any_hop_llm")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--bonus", type=float, default=0.45)
+    parser.add_argument("--entity-aware", action="store_true", help="Show answer names + evidence paths (world knowledge) instead of relation labels only.")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
@@ -64,39 +65,73 @@ def main() -> None:
         was_hit = bool(res["hits_at_1"])
         counts[f"{hops}hop_before"] += was_hit
 
-        labels: list[str] = []
-        for c in cands:
-            label = candidate_best_label(c)
-            if label and label not in labels:
-                labels.append(label)
-        if len(labels) < 2:
-            counts[f"{hops}hop_after"] += was_hit
-            counts["single_label_skip"] += 1
-            continue
-        response = rank_relation_paths(
-            question=row["question"],
-            start_entity_name=row["start_entity"]["name"],
-            path_labels=labels,
-            model=args.model,
-            top_k=1,
-        )
-        if response["error"]:
-            counts["llm_server_error"] += 1
-            counts[f"{hops}hop_after"] += was_hit
-            continue
-        if not response["picks"]:
-            counts["llm_parse_failure"] += 1
-            counts[f"{hops}hop_after"] += was_hit
-            continue
-        chosen_label = labels[response["picks"][0]]
-        rescored = sorted(
-            (
-                -(float(c["score"]) + (args.bonus if candidate_best_label(c) == chosen_label else 0.0)),
-                str(c["answer_label"]),
-                str(c["answer_id"]),
+        if args.entity_aware:
+            top = cands[:12]
+            blocks = []
+            for c in top:
+                readable = (c.get("paths") or [{}])[0].get("readable", "")[:180]
+                blocks.append(f"{c['answer_label']} (path: {readable})")
+            if len(blocks) < 2:
+                counts[f"{hops}hop_after"] += was_hit
+                counts["single_label_skip"] += 1
+                continue
+            response = adjudicate_answer_candidates(
+                question=row["question"],
+                start_entity_name=row["start_entity"]["name"],
+                candidate_blocks=blocks,
+                model=args.model,
             )
-            for c in cands
-        )
+            if response["error"]:
+                counts["llm_server_error"] += 1
+                counts[f"{hops}hop_after"] += was_hit
+                continue
+            if response["pick"] is None:
+                counts["llm_parse_failure"] += 1
+                counts[f"{hops}hop_after"] += was_hit
+                continue
+            chosen_id = str(top[response["pick"]]["answer_id"])
+            rescored = sorted(
+                (
+                    -(float(c["score"]) + (args.bonus if str(c["answer_id"]) == chosen_id else 0.0)),
+                    str(c["answer_label"]),
+                    str(c["answer_id"]),
+                )
+                for c in cands
+            )
+        else:
+            labels = []
+            for c in cands:
+                label = candidate_best_label(c)
+                if label and label not in labels:
+                    labels.append(label)
+            if len(labels) < 2:
+                counts[f"{hops}hop_after"] += was_hit
+                counts["single_label_skip"] += 1
+                continue
+            response = rank_relation_paths(
+                question=row["question"],
+                start_entity_name=row["start_entity"]["name"],
+                path_labels=labels,
+                model=args.model,
+                top_k=1,
+            )
+            if response["error"]:
+                counts["llm_server_error"] += 1
+                counts[f"{hops}hop_after"] += was_hit
+                continue
+            if not response["picks"]:
+                counts["llm_parse_failure"] += 1
+                counts[f"{hops}hop_after"] += was_hit
+                continue
+            chosen_label = labels[response["picks"][0]]
+            rescored = sorted(
+                (
+                    -(float(c["score"]) + (args.bonus if candidate_best_label(c) == chosen_label else 0.0)),
+                    str(c["answer_label"]),
+                    str(c["answer_id"]),
+                )
+                for c in cands
+            )
         now_hit = rescored[0][2] in gold_ids
         counts[f"{hops}hop_after"] += now_hit
         counts["fixed"] += now_hit and not was_hit

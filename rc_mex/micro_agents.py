@@ -352,6 +352,47 @@ def link_answer_concept_cascade(
     return {"concept_name": None, "concept_ids": set(), "source": "none", "raw_response": linked["raw_response"], "llm_consulted": True}
 
 
+FINAL_ADJUDICATOR_PROMPT_VERSION = "final_adjudicator_v1"
+FINAL_ADJUDICATOR_PROMPT_TEMPLATE = """A question was answered by following evidence paths in a knowledge base, starting from "{start}".
+
+Question: "{question}"
+
+Candidate answers with their evidence paths:
+{candidates}
+
+Pick the candidate whose evidence path correctly and completely answers the question. A path that stops at an intermediate step does not answer it. Reply with only the number."""
+
+
+def adjudicate_answer_candidates(
+    question: str,
+    start_entity_name: str,
+    candidate_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Micro-agent 3 (entity-aware form): one listwise call over the top final
+    candidates, each shown as answer name + evidence path. Unlike the
+    retention ranker this deliberately exposes entity names, importing the
+    model's world knowledge at exactly one bounded decision. Abstention or
+    error returns pick=None (caller keeps the symbolic ranking)."""
+    if not candidate_blocks:
+        return {"pick": None, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(candidate_blocks, start=1))
+    prompt = FINAL_ADJUDICATOR_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, candidates=numbered
+    )
+    result = call_local_llm(prompt, FINAL_ADJUDICATOR_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"pick": None, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    picks = parse_pick_numbers(result["text"], len(candidate_blocks), top_k=1)
+    return {
+        "pick": picks[0] - 1 if picks else None,
+        "raw_response": result["text"][:120],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
