@@ -362,12 +362,30 @@ Candidate answers with their evidence paths:
 
 Pick the candidate whose evidence path correctly and completely answers the question. A path that stops at an intermediate step does not answer it. Reply with only the number."""
 
+# v2: conservative prior. The break anatomy on train (36 breaks) showed the
+# model overriding a candidate-1 whose relation names literally matched the
+# question wording (12 same-depth swaps), or detouring onto longer paths when
+# a direct edge answered the question (11 cases). Candidate 1 is always the
+# current symbolic top, so anchoring on it targets both classes.
+FINAL_ADJUDICATOR_PROMPT_TEMPLATES = {
+    "final_adjudicator_v1": FINAL_ADJUDICATOR_PROMPT_TEMPLATE,
+    "final_adjudicator_v2": """A question was answered by following evidence paths in a knowledge base, starting from "{start}".
+
+Question: "{question}"
+
+Candidate answers with their evidence paths:
+{candidates}
+
+Candidate 1 is currently ranked first. Keep candidate 1 unless its evidence path clearly fails to answer the question — for example it stops at an intermediate step, or its relations do not match what the question asks. Prefer the candidate whose relation names match the question wording; do not switch just because another answer sounds more familiar. Reply with only the number.""",
+}
+
 
 def adjudicate_answer_candidates(
     question: str,
     start_entity_name: str,
     candidate_blocks: list[str],
     model: str = DEFAULT_MODEL,
+    prompt_version: str = FINAL_ADJUDICATOR_PROMPT_VERSION,
 ) -> dict[str, Any]:
     """Micro-agent 3 (entity-aware form): one listwise call over the top final
     candidates, each shown as answer name + evidence path. Unlike the
@@ -377,10 +395,10 @@ def adjudicate_answer_candidates(
     if not candidate_blocks:
         return {"pick": None, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
     numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(candidate_blocks, start=1))
-    prompt = FINAL_ADJUDICATOR_PROMPT_TEMPLATE.format(
+    prompt = FINAL_ADJUDICATOR_PROMPT_TEMPLATES[prompt_version].format(
         start=start_entity_name, question=question, candidates=numbered
     )
-    result = call_local_llm(prompt, FINAL_ADJUDICATOR_PROMPT_VERSION, model=model, timeout=180.0)
+    result = call_local_llm(prompt, prompt_version, model=model, timeout=180.0)
     if result["error"]:
         return {"pick": None, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
     picks = parse_pick_numbers(result["text"], len(candidate_blocks), top_k=1)

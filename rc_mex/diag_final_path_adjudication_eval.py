@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--bonus", type=float, default=0.45)
     parser.add_argument("--entity-aware", action="store_true", help="Show answer names + evidence paths (world knowledge) instead of relation labels only.")
+    parser.add_argument("--prompt-version", default="final_adjudicator_v1", help="Adjudicator prompt variant (entity-aware mode only), e.g. final_adjudicator_v2.")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
@@ -80,6 +81,7 @@ def main() -> None:
                 start_entity_name=row["start_entity"]["name"],
                 candidate_blocks=blocks,
                 model=args.model,
+                prompt_version=args.prompt_version,
             )
             if response["error"]:
                 counts["llm_server_error"] += 1
