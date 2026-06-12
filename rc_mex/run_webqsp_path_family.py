@@ -53,9 +53,25 @@ CVT_PATTERN = re.compile(r"^(m|g)\.[0-9a-z_]+$")
 STORED_CANDIDATES = 25
 STORED_PATHS_PER_CANDIDATE = 2
 METHOD_KEYS = ["path_family_any_hop_concept", "path_family_any_hop_llm", "path_family_any_hop_adjudicated"]
+# Freebase's instanceOf analog: 86% of in-subgraph WebQSP gold answers carry
+# one of these edges, so they can power the structural concept channel.
+TYPE_PREDICATE = "common.topic.notable_types"
 
 
-def build_kb(triples: list[list[str]]) -> dict:
+def type_alias_names(type_name: str) -> set[str]:
+    """Head-noun aliases so question text can hit multi-word type names
+    ("what language ..." -> "Human Language"). Positive evidence only: a bad
+    alias that never appears in a question is dead weight, not a penalty."""
+    aliases = set()
+    for component in re.split(r"[/,]", type_name):
+        words = [w for w in re.split(r"[^0-9A-Za-z]+", component) if w]
+        if words:
+            aliases.add(words[-1].lower())
+    aliases.discard(normalize_text(type_name))
+    return {alias for alias in aliases if len(alias) >= 3}
+
+
+def build_kb(triples: list[list[str]], type_concepts: bool = True) -> dict:
     entities: dict[str, dict] = {}
 
     def ensure(name: str) -> str:
@@ -73,7 +89,27 @@ def build_kb(triples: list[list[str]]) -> dict:
         head_id, tail_id = ensure(head), ensure(tail)
         entities[head_id]["relations"].append({"predicate": relation, "object": tail_id, "direction": "forward"})
         entities[tail_id]["relations"].append({"predicate": relation, "object": head_id, "direction": "backward"})
-    return {"concepts": {}, "entities": entities}
+
+    concepts: dict[str, dict] = {}
+    if type_concepts:
+        for triple in triples:
+            if len(triple) != 3 or str(triple[1]).strip() != TYPE_PREDICATE:
+                continue
+            entity_id = normalize_text(str(triple[0]))
+            type_name = str(triple[2]).strip()
+            if not type_name or entity_id not in entities:
+                continue
+            concept_ids = [f"type:{normalize_text(type_name)}"]
+            concepts.setdefault(concept_ids[0], {"name": type_name, "instanceOf": []})
+            for alias in sorted(type_alias_names(type_name)):
+                alias_id = f"typealias:{alias}"
+                concepts.setdefault(alias_id, {"name": alias, "instanceOf": []})
+                concept_ids.append(alias_id)
+            instance_of = entities[entity_id]["instanceOf"]
+            for concept_id in concept_ids:
+                if concept_id not in instance_of:
+                    instance_of.append(concept_id)
+    return {"concepts": concepts, "entities": entities}
 
 
 def approx_gold_hop_count(kb: dict, start_ids: set[str], gold_ids: set[str], max_depth: int = 4) -> int:
@@ -168,6 +204,11 @@ def main() -> None:
     parser.add_argument("--sample-entities", type=int, default=25)
     parser.add_argument("--max-branch-entities", type=int, default=40)
     parser.add_argument("--noisy-branch-threshold", type=int, default=25)
+    parser.add_argument(
+        "--no-type-concepts",
+        action="store_true",
+        help="Ablation: leave the concept inventory empty instead of deriving it from notable_types edges.",
+    )
     args = parser.parse_args()
 
     from rc_mex.micro_agents import probe_llm_endpoint
@@ -201,7 +242,7 @@ def main() -> None:
     started = time.time()
     with open(f"{output_dir}/predictions.jsonl", "w") as out:
         for index, source in enumerate(source_rows, start=1):
-            kb = build_kb(source.get("graph") or [])
+            kb = build_kb(source.get("graph") or [], type_concepts=not args.no_type_concepts)
             graph = KnowledgeGraph(kb)
             gold_ids = {normalize_text(a) for a in source.get("answer") or [] if str(a).strip()}
             start_ids = {normalize_text(e) for e in source.get("q_entity") or [] if str(e).strip()}
