@@ -411,6 +411,48 @@ def adjudicate_answer_candidates(
     }
 
 
+RELATION_PROPOSAL_PROMPT_VERSION = "relation_proposal_v1"
+RELATION_PROPOSAL_PROMPT_TEMPLATE = """A question will be answered by following relations in a knowledge base, starting from the entity "{start}".
+
+Question: "{question}"
+
+Candidate relations out of "{start}":
+{relations}
+
+Reply with the numbers of up to {k} relations that could lead toward the answer, comma-separated, most promising first."""
+
+
+def propose_relations(
+    question: str,
+    start_entity_name: str,
+    relation_labels: list[str],
+    model: str = DEFAULT_MODEL,
+    top_k: int = 10,
+) -> dict[str, Any]:
+    """Micro-agent 4: pick promising frontier relations from a shortlist.
+
+    Integration contract is union with the symbolic top-K (recall monotone by
+    construction); abstention or error returns picks=[] (caller keeps the
+    symbolic proposal unchanged)."""
+    if not relation_labels:
+        return {"picks": [], "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {label}" for i, label in enumerate(relation_labels, start=1))
+    prompt = RELATION_PROPOSAL_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, relations=numbered, k=top_k
+    )
+    result = call_local_llm(prompt, RELATION_PROPOSAL_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"picks": [], "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    picks = parse_pick_numbers(result["text"], len(relation_labels), top_k=top_k)
+    return {
+        "picks": [pick - 1 for pick in picks],
+        "raw_response": result["text"][:120],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 

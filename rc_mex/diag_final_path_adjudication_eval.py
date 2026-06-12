@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--bonus", type=float, default=0.45)
     parser.add_argument("--entity-aware", action="store_true", help="Show answer names + evidence paths (world knowledge) instead of relation labels only.")
     parser.add_argument("--prompt-version", default="final_adjudicator_v1", help="Adjudicator prompt variant (entity-aware mode only), e.g. final_adjudicator_v2.")
+    parser.add_argument("--pool-size", type=int, default=12, help="How many top candidates the adjudicator sees (stored predictions keep 25).")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
@@ -67,7 +68,7 @@ def main() -> None:
         counts[f"{hops}hop_before"] += was_hit
 
         if args.entity_aware:
-            top = cands[:12]
+            top = cands[: args.pool_size]
             blocks = []
             for c in top:
                 readable = (c.get("paths") or [{}])[0].get("readable", "")[:180]
