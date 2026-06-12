@@ -71,7 +71,51 @@ def type_alias_names(type_name: str) -> set[str]:
     return {alias for alias in aliases if len(alias) >= 3}
 
 
-def build_kb(triples: list[list[str]], type_concepts: bool = True) -> dict:
+def compress_cvt_nodes(triples: list[list[str]], max_pairs_per_cvt: int = 64) -> list[list[str]]:
+    """Collapse Freebase CVT hub nodes into composite edges.
+
+    CVTs encode n-ary facts (marriage, employment tenure, award honor); they
+    are not real entities, but each one costs a search hop and pollutes
+    evidence paths with opaque mids. Standard preprocessing (GraftNet,
+    PullNet) replaces  X --r1--> cvt --r2--> Y  with one composite edge
+    X --"r1 / r2"--> Y. We keep every non-CVT triple as-is, drop the CVT's
+    own triples, and skip CVT-to-CVT chains (rare; measured separately if
+    ever needed). max_pairs_per_cvt bounds degenerate hubs."""
+    cvt_edges: dict[str, list[tuple[str, str, str]]] = {}
+    kept: list[list[str]] = []
+    for triple in triples:
+        if len(triple) != 3:
+            continue
+        head, relation, tail = (str(part).strip() for part in triple)
+        if not head or not relation or not tail:
+            continue
+        head_cvt = bool(CVT_PATTERN.match(head))
+        tail_cvt = bool(CVT_PATTERN.match(tail))
+        if not head_cvt and not tail_cvt:
+            kept.append([head, relation, tail])
+            continue
+        if head_cvt and tail_cvt:
+            continue
+        if tail_cvt:
+            cvt_edges.setdefault(tail, []).append(("in", relation, head))
+        else:
+            cvt_edges.setdefault(head, []).append(("out", relation, tail))
+    for edges in cvt_edges.values():
+        incoming = [(r, e) for side, r, e in edges if side == "in"]
+        outgoing = [(r, e) for side, r, e in edges if side == "out"]
+        pairs = 0
+        for r1, source in incoming:
+            for r2, target in outgoing:
+                if source == target or pairs >= max_pairs_per_cvt:
+                    continue
+                kept.append([source, f"{r1} / {r2}", target])
+                pairs += 1
+    return kept
+
+
+def build_kb(triples: list[list[str]], type_concepts: bool = True, cvt_compression: bool = True) -> dict:
+    if cvt_compression:
+        triples = compress_cvt_nodes(triples)
     entities: dict[str, dict] = {}
 
     def ensure(name: str) -> str:
@@ -209,6 +253,16 @@ def main() -> None:
         action="store_true",
         help="Ablation: leave the concept inventory empty instead of deriving it from notable_types edges.",
     )
+    parser.add_argument(
+        "--no-cvt-compression",
+        action="store_true",
+        help="Ablation: keep raw CVT hub nodes instead of collapsing them into composite edges.",
+    )
+    parser.add_argument(
+        "--minimal-ranker",
+        action="store_true",
+        help="Score answers with path score + support + type membership only (no lexical verifier channels).",
+    )
     args = parser.parse_args()
 
     from rc_mex.micro_agents import probe_llm_endpoint
@@ -236,13 +290,18 @@ def main() -> None:
         "sample_entities": args.sample_entities,
         "max_branch_entities": args.max_branch_entities,
         "noisy_branch_threshold": args.noisy_branch_threshold,
+        "minimal_ranker": args.minimal_ranker,
     }
     rows = []
     selection = Counter()
     started = time.time()
     with open(f"{output_dir}/predictions.jsonl", "w") as out:
         for index, source in enumerate(source_rows, start=1):
-            kb = build_kb(source.get("graph") or [], type_concepts=not args.no_type_concepts)
+            kb = build_kb(
+                source.get("graph") or [],
+                type_concepts=not args.no_type_concepts,
+                cvt_compression=not args.no_cvt_compression,
+            )
             graph = KnowledgeGraph(kb)
             gold_ids = {normalize_text(a) for a in source.get("answer") or [] if str(a).strip()}
             start_ids = {normalize_text(e) for e in source.get("q_entity") or [] if str(e).strip()}

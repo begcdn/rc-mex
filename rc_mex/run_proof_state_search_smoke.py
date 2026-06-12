@@ -1654,6 +1654,7 @@ def run_path_family_beam(
     wide_symbolic_beam: bool = False,
     any_hop_answers: bool = False,
     final_adjudicator: bool = False,
+    minimal_ranker: bool = False,
 ) -> dict[str, Any]:
     del top_k
     answer_type = guess_answer_type(example.question)
@@ -1806,6 +1807,7 @@ def run_path_family_beam(
         answer_type=answer_type,
         answer_concept_ids=answer_concept_ids,
         depth_normalized_scores=any_hop_answers,
+        minimal_ranker=minimal_ranker,
     )
     if final_adjudicator:
         apply_final_adjudication(
@@ -1998,6 +2000,7 @@ def run_path_family_any_hop_concept(
     max_branch_entities: int,
     noisy_branch_threshold: int,
     debug_trace: bool = False,
+    minimal_ranker: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2012,6 +2015,7 @@ def run_path_family_any_hop_concept(
         answer_verifier=True,
         concept_verifier=True,
         any_hop_answers=True,
+        minimal_ranker=minimal_ranker,
     )
 
 
@@ -2025,6 +2029,7 @@ def run_path_family_any_hop_llm(
     max_branch_entities: int,
     noisy_branch_threshold: int,
     debug_trace: bool = False,
+    minimal_ranker: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2040,6 +2045,7 @@ def run_path_family_any_hop_llm(
         concept_verifier=True,
         llm_retention=True,
         any_hop_answers=True,
+        minimal_ranker=minimal_ranker,
     )
 
 
@@ -2124,6 +2130,7 @@ def run_path_family_any_hop_adjudicated(
     max_branch_entities: int,
     noisy_branch_threshold: int,
     debug_trace: bool = False,
+    minimal_ranker: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2139,6 +2146,7 @@ def run_path_family_any_hop_adjudicated(
         concept_verifier=True,
         llm_retention=True,
         any_hop_answers=True,
+        minimal_ranker=minimal_ranker,
         final_adjudicator=True,
     )
 
@@ -9145,6 +9153,7 @@ def path_family_search_result(
     answer_type: str = "",
     answer_concept_ids: set[str] | None = None,
     depth_normalized_scores: bool = False,
+    minimal_ranker: bool = False,
 ) -> dict[str, Any]:
     grouped: dict[str, dict[str, Any]] = {}
     for state in states:
@@ -9181,7 +9190,19 @@ def path_family_search_result(
         best_path = candidate["paths"][0] if candidate.get("paths") else {}
         support_count = int(candidate.get("raw_support_count", 0))
         support_bonus = 0.03 * math.log1p(float(support_count))
-        if answer_ranker_v2:
+        if minimal_ranker:
+            # Held-out-validated minimal form: path score + support + structural
+            # type membership. No lexical verifier channels (measured net
+            # negative-to-neutral on KQA held-out 320).
+            membership_bonus = 0.0
+            if answer_concept_ids and graph.is_instance_of_any(str(candidate["answer_id"]), answer_concept_ids):
+                membership_bonus = float(
+                    PATH_FAMILY_CONCEPT_VERIFIER_CONSTANTS["answer_concept_membership_weight"]
+                )
+            candidate["score"] = float(candidate["best_path_score"]) + support_bonus + membership_bonus
+            candidate["support_bonus"] = support_bonus
+            candidate["concept_membership_bonus"] = membership_bonus
+        elif answer_ranker_v2:
             components = answer_ranker_v2_components(
                 graph=graph,
                 question=question,
