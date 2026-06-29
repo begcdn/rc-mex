@@ -467,6 +467,48 @@ def propose_relations(
     }
 
 
+TYPED_SELECTOR_PROMPT_VERSION = "typed_selector_v1"
+TYPED_SELECTOR_PROMPT_TEMPLATE = """You are identifying the answer to a question by selecting one candidate entity from a knowledge base, starting from "{start}".
+
+Question: "{question}"
+{type_line}
+Candidates (name [type] — reached by relation):
+{candidates}
+
+Pick the candidate whose type and relation match what the question asks for. Reply with only the number."""
+
+
+def select_answer_typed(
+    question: str,
+    start_entity_name: str,
+    answer_type_hint: str,
+    candidate_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Re-posed selection: each candidate carries its type and a clean relation,
+    and the question's expected answer-type is stated explicitly. Tests whether
+    a well-posed selection task lifts the selector's accuracy. Abstain/error
+    returns pick=None."""
+    if not candidate_blocks:
+        return {"pick": None, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(candidate_blocks, start=1))
+    type_line = f"The answer should be a: {answer_type_hint}\n" if answer_type_hint else ""
+    prompt = TYPED_SELECTOR_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, type_line=type_line, candidates=numbered
+    )
+    result = call_local_llm(prompt, TYPED_SELECTOR_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"pick": None, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    picks = parse_pick_numbers(result["text"], len(candidate_blocks), top_k=1)
+    return {
+        "pick": picks[0] - 1 if picks else None,
+        "raw_response": result["text"][:120],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
