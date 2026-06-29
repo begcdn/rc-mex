@@ -112,6 +112,11 @@ def main() -> None:
 
         old = adjudicate_answer_candidates(pred["question"], start_name, old_blocks, model=args.model)
         new = select_answer_typed(pred["question"], start_name, answer_type, new_blocks, model=args.model)
+        if args.show_cases and shown < args.show_cases:
+            shown += 1
+            print(f"--- case {shown}: {pred['question'][:60]!r} | answer_type={answer_type!r}")
+            print(f"    OLD pick={old['pick']} raw={old['raw_response']!r} err={old['error']!r}")
+            print(f"    NEW pick={new['pick']} raw={new['raw_response']!r} err={new['error']!r} ptok={new['prompt_tokens']} ctok={new['completion_tokens']}")
         if old["error"] or new["error"]:
             counts["llm_error"] += 1
             continue
@@ -123,11 +128,6 @@ def main() -> None:
         counts["NEW_fixes_OLD_miss"] += new_hit and not old_hit
         counts["NEW_breaks_OLD_hit"] += old_hit and not new_hit
 
-        if args.show_cases and shown < args.show_cases and new_hit and not old_hit:
-            shown += 1
-            print(f"[NEW fixes] q={pred['question'][:60]!r} type={answer_type!r}")
-            print(f"   OLD picked: {pool[old['pick']]['answer_label'] if old['pick'] is not None else None!r}")
-            print(f"   NEW picked: {pool[new['pick']]['answer_label']!r}  (gold)")
         if index % 50 == 0:
             print(f"  ... {index}/{len(preds)} ({time.time()-started:.0f}s)", flush=True)
 
