@@ -62,6 +62,7 @@ TWO_SCORE_FIXED_CONSTANTS = {
 }
 
 RELATION_PROPOSAL_K = 10
+RELATION_PROPOSAL_SHORTLIST = 40
 ANSWER_POOL_CAP = 100
 
 TWO_SCORE_WIDE_PROPOSAL_CONSTANTS = {
@@ -1655,6 +1656,7 @@ def run_path_family_beam(
     any_hop_answers: bool = False,
     final_adjudicator: bool = False,
     minimal_ranker: bool = False,
+    relation_proposal: bool = False,
 ) -> dict[str, Any]:
     del top_k
     answer_type = guess_answer_type(example.question)
@@ -1679,6 +1681,7 @@ def run_path_family_beam(
     # Depth-agnostic mode: families retained at every hop stay answer
     # candidates; ranking decides the depth, never a per-question hop budget.
     all_hop_retained_records: list[dict[str, Any]] = []
+    proposal_usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
     for hop in [1, 2]:
         next_states: list[SearchState] = []
         for state in states:
@@ -1686,7 +1689,30 @@ def run_path_family_beam(
             for source_id in sorted(state.frontier_ids):
                 frontier = graph.candidate_relations([source_id], cap=relation_cap, sample_entities=sample_entities)
                 ranked = rank_relations_hybrid(example.question, frontier)
-                for candidate in ranked[:RELATION_PROPOSAL_K]:
+                proposed = ranked[:RELATION_PROPOSAL_K]
+                # Micro-agent 4: union LLM-picked relations from the symbolic
+                # shortlist with the symbolic top-K. Recall is monotone (we
+                # never drop a symbolic pick). Restricted to hop 1 (the start
+                # frontier, one source) so it stays one call per question, and
+                # skipped when the shortlist adds nothing (provable no-op).
+                if relation_proposal and hop == 1 and len(ranked) > RELATION_PROPOSAL_K:
+                    from rc_mex.micro_agents import propose_relations
+
+                    shortlist = ranked[:RELATION_PROPOSAL_SHORTLIST]
+                    labels = [f"{c['relation_id'].replace('_', ' ')} [{c['direction']}]" for c in shortlist]
+                    presp = propose_relations(example.question, example.start_entity_name, labels)
+                    proposal_usage["calls"] += 1
+                    proposal_usage["prompt_tokens"] += int(presp["prompt_tokens"])
+                    proposal_usage["completion_tokens"] += int(presp["completion_tokens"])
+                    seen = {(c["relation_id"], c["direction"]) for c in proposed}
+                    proposed = list(proposed)
+                    for index in presp["picks"]:
+                        if 0 <= index < len(shortlist):
+                            extra = shortlist[index]
+                            if (extra["relation_id"], extra["direction"]) not in seen:
+                                proposed.append(extra)
+                                seen.add((extra["relation_id"], extra["direction"]))
+                for candidate in proposed:
                     targets = relation_targets(graph, source_id, candidate, max_branch_entities)
                     expansion_count += 1
                     for target_id in targets:
@@ -1821,11 +1847,14 @@ def run_path_family_beam(
     adjudication = result.get("final_adjudication", {})
     result["llm_usage"] = {
         "llm_calls": sum(1 for entry in audit_trace if entry.get("llm_retention", {}).get("llm_consulted"))
-        + (1 if adjudication.get("consulted") else 0),
+        + (1 if adjudication.get("consulted") else 0)
+        + proposal_usage["calls"],
         "prompt_tokens": sum(int(entry.get("llm_retention", {}).get("llm_prompt_tokens", 0)) for entry in audit_trace)
-        + int(adjudication.get("prompt_tokens", 0)),
+        + int(adjudication.get("prompt_tokens", 0))
+        + proposal_usage["prompt_tokens"],
         "completion_tokens": sum(int(entry.get("llm_retention", {}).get("llm_completion_tokens", 0)) for entry in audit_trace)
-        + int(adjudication.get("completion_tokens", 0)),
+        + int(adjudication.get("completion_tokens", 0))
+        + proposal_usage["completion_tokens"],
     }
     if concept_verifier:
         result["answer_concept_extraction"] = {
@@ -2001,6 +2030,7 @@ def run_path_family_any_hop_concept(
     noisy_branch_threshold: int,
     debug_trace: bool = False,
     minimal_ranker: bool = False,
+    relation_proposal: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2016,6 +2046,7 @@ def run_path_family_any_hop_concept(
         concept_verifier=True,
         any_hop_answers=True,
         minimal_ranker=minimal_ranker,
+        relation_proposal=relation_proposal,
     )
 
 
@@ -2030,6 +2061,7 @@ def run_path_family_any_hop_llm(
     noisy_branch_threshold: int,
     debug_trace: bool = False,
     minimal_ranker: bool = False,
+    relation_proposal: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2046,6 +2078,7 @@ def run_path_family_any_hop_llm(
         llm_retention=True,
         any_hop_answers=True,
         minimal_ranker=minimal_ranker,
+        relation_proposal=relation_proposal,
     )
 
 
@@ -2055,6 +2088,7 @@ def apply_final_adjudication(
     question: str,
     start_entity_name: str,
     gold_answer_ids: set[str],
+    pool_size: int | None = None,
 ) -> None:
     """Micro-agent 3: one entity-aware listwise call over the top final candidates.
 
@@ -2064,7 +2098,8 @@ def apply_final_adjudication(
     from rc_mex.micro_agents import adjudicate_answer_candidates
 
     bonus = float(PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS["adjudicator_bonus"])
-    pool_size = int(PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS["adjudicator_pool_size"])
+    if pool_size is None:
+        pool_size = int(PATH_FAMILY_ANY_HOP_ADJUDICATED_CONSTANTS["adjudicator_pool_size"])
     candidates = result.get("candidate_answers", [])
     adjudication: dict[str, Any] = {"consulted": False, "skipped_provable_noop": False, "error": "", "pick_label": ""}
     result["final_adjudication"] = adjudication
@@ -2131,6 +2166,7 @@ def run_path_family_any_hop_adjudicated(
     noisy_branch_threshold: int,
     debug_trace: bool = False,
     minimal_ranker: bool = False,
+    relation_proposal: bool = False,
 ) -> dict[str, Any]:
     return run_path_family_beam(
         graph=graph,
@@ -2147,6 +2183,7 @@ def run_path_family_any_hop_adjudicated(
         llm_retention=True,
         any_hop_answers=True,
         minimal_ranker=minimal_ranker,
+        relation_proposal=relation_proposal,
         final_adjudicator=True,
     )
 

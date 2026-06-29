@@ -263,6 +263,17 @@ def main() -> None:
         action="store_true",
         help="Score answers with path score + support + type membership only (no lexical verifier channels).",
     )
+    parser.add_argument(
+        "--relation-proposal",
+        action="store_true",
+        help="Micro-agent 4: union LLM-picked relations with the symbolic top-K at hop 1 (raises recall ceiling).",
+    )
+    parser.add_argument(
+        "--adjudicator-pool-size",
+        type=int,
+        default=12,
+        help="How many top candidates the final adjudicator sees (default 12; raise to expose lower-ranked gold).",
+    )
     args = parser.parse_args()
 
     from rc_mex.micro_agents import probe_llm_endpoint
@@ -283,7 +294,10 @@ def main() -> None:
     output_dir = ensure_dir(args.output)
     print(f"{len(source_rows)} questions from {args.data}")
 
-    knobs = {
+    # concept stays the pure-symbolic, zero-LLM anchor (its gold-gen is the
+    # determinism canary), so relation proposal is applied only to the
+    # retention/adjudicated path.
+    concept_knobs = {
         "top_k": args.top_k,
         "beam_width": args.beam_width,
         "relation_cap": args.relation_cap,
@@ -292,6 +306,7 @@ def main() -> None:
         "noisy_branch_threshold": args.noisy_branch_threshold,
         "minimal_ranker": args.minimal_ranker,
     }
+    llm_knobs = {**concept_knobs, "relation_proposal": args.relation_proposal}
     rows = []
     selection = Counter()
     started = time.time()
@@ -323,8 +338,8 @@ def main() -> None:
                     gold_answer_labels=[str(a) for a in source.get("answer") or []],
                     hop_count=hop,
                 )
-                res_concept = run_path_family_any_hop_concept(graph=graph, example=example, **knobs)
-                res_llm = run_path_family_any_hop_llm(graph=graph, example=example, **knobs)
+                res_concept = run_path_family_any_hop_concept(graph=graph, example=example, **concept_knobs)
+                res_llm = run_path_family_any_hop_llm(graph=graph, example=example, **llm_knobs)
                 for res in (res_concept, res_llm):
                     res.pop("audit_trace", None)
                     filter_cvt_and_rescore(res, gold_ids)
@@ -335,6 +350,7 @@ def main() -> None:
                     question=example.question,
                     start_entity_name=example.start_entity_name,
                     gold_answer_ids=gold_ids,
+                    pool_size=args.adjudicator_pool_size,
                 )
                 adjudication = res_adj.get("final_adjudication", {})
                 retention_usage = res_llm.get("llm_usage", {})
