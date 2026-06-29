@@ -31,7 +31,7 @@ import time
 from collections import Counter
 
 from cigr_d_mvp1.kg import KnowledgeGraph, normalize_text
-from rc_mex.micro_agents import DEFAULT_MODEL, adjudicate_answer_candidates, select_answer_typed
+from rc_mex.micro_agents import DEFAULT_MODEL, adjudicate_answer_candidates
 from rc_mex.run_proof_state_search_smoke import extract_answer_concept
 from rc_mex.run_webqsp_path_family import build_kb
 
@@ -108,10 +108,14 @@ def main() -> None:
             old_blocks.append(f"{c['answer_label']} (path: {readable})")
             types = graph.entity_type_names(str(c["answer_id"]), limit=4)
             type_str = ", ".join(types) if types else "unknown"
-            new_blocks.append(f"{c['answer_label']} [type: {type_str}] -- via {candidate_clean_path(c)}")
+            new_blocks.append(f"{c['answer_label']} [type: {type_str}] via {candidate_clean_path(c)}")
 
+        # Hold the proven adjudicator prompt constant; vary ONLY the candidate
+        # representation (types + clean relation) and a question-side answer-type
+        # hint. Isolates "is the selector info-starved?" from any prompt quirk.
+        new_question = pred["question"] + (f" (the answer is a {answer_type})" if answer_type else "")
         old = adjudicate_answer_candidates(pred["question"], start_name, old_blocks, model=args.model)
-        new = select_answer_typed(pred["question"], start_name, answer_type, new_blocks, model=args.model)
+        new = adjudicate_answer_candidates(new_question, start_name, new_blocks, model=args.model)
         if args.show_cases and shown < args.show_cases:
             shown += 1
             print(f"--- case {shown}: {pred['question'][:60]!r} | answer_type={answer_type!r}")
