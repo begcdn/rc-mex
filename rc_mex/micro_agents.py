@@ -197,24 +197,38 @@ def call_local_llm(
         if "qwen" in model.lower():
             # Disable qwen3 thinking mode; strict verifiers expect the bare answer.
             request_body["think"] = False
-    payload = json.dumps(request_body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
-    request = urllib.request.Request(OLLAMA_URL, data=payload, headers=headers)
-    try:
+
+    def _request(body_dict: dict[str, Any]) -> tuple[str, int, int]:
+        payload = json.dumps(body_dict).encode("utf-8")
+        request = urllib.request.Request(OLLAMA_URL, data=payload, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
         if LLM_API_STYLE == "openai":
             raw_text = str((body.get("choices") or [{}])[0].get("message", {}).get("content", ""))
             usage = body.get("usage", {}) or {}
-            prompt_tokens = int(usage.get("prompt_tokens", 0))
-            completion_tokens = int(usage.get("completion_tokens", 0))
-        else:
-            raw_text = str(body.get("response", ""))
-            prompt_tokens = int(body.get("prompt_eval_count", 0))
-            completion_tokens = int(body.get("eval_count", 0))
-        text = THINK_BLOCK_PATTERN.sub("", raw_text).strip()
+            return THINK_BLOCK_PATTERN.sub("", raw_text).strip(), int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+        raw_text = str(body.get("response", ""))
+        return THINK_BLOCK_PATTERN.sub("", raw_text).strip(), int(body.get("prompt_eval_count", 0)), int(body.get("eval_count", 0))
+
+    try:
+        text, prompt_tokens, completion_tokens = _request(request_body)
+        # qwen3 + ollama occasionally returns an empty completion when thinking
+        # is disabled on a long prompt (observed on 25-candidate adjudication
+        # prompts). Salvage once by letting it think, then strip the block.
+        if not text and "qwen" in model.lower():
+            retry_body = dict(request_body)
+            retry_body.pop("think", None)
+            retry_body.pop("chat_template_kwargs", None)
+            if LLM_API_STYLE != "openai":
+                retry_body["options"] = {**retry_body.get("options", {}), "num_predict": max(num_predict, 1024)}
+            else:
+                retry_body["max_tokens"] = max(num_predict, 1024)
+            retry_text, retry_pt, retry_ct = _request(retry_body)
+            if retry_text:
+                text, prompt_tokens, completion_tokens = retry_text, retry_pt, retry_ct
     except Exception as exc:
         return {"text": "", "from_cache": False, "error": f"{type(exc).__name__}: {exc}", "prompt_tokens": 0, "completion_tokens": 0}
     cache[key] = {"text": text, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
