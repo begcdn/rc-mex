@@ -509,6 +509,34 @@ def select_answer_typed(
     }
 
 
+RELATION_DESCRIPTION_PROMPT_VERSION = "relation_description_v1"
+RELATION_DESCRIPTION_PROMPT_TEMPLATE = """A question is answered by looking up one property of the entity "{start}" in a knowledge base.
+
+Question: "{question}"
+
+What property of "{start}" gives the answer? Reply with a short property name of 2 to 5 words, for example: "place of birth", "team played for", "capital city", "profession". Reply with only the property name."""
+
+
+def describe_target_relation(
+    question: str,
+    start_entity_name: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Micro-agent for HyDE-style schema linking: the LLM names the property
+    that answers the question (semantic intent), WITHOUT seeing the schema.
+    The caller embeds this and matches it against the real relations, so the
+    LLM supplies meaning and the embedding supplies scale."""
+    prompt = RELATION_DESCRIPTION_PROMPT_TEMPLATE.format(start=start_entity_name, question=question)
+    result = call_local_llm(prompt, RELATION_DESCRIPTION_PROMPT_VERSION, model=model, timeout=120.0)
+    text = result["text"].strip().strip('".').splitlines()[0] if result["text"].strip() else ""
+    return {
+        "text": text,
+        "error": result["error"],
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
