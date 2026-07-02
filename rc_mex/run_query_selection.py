@@ -210,7 +210,7 @@ def main() -> None:
 
     if not semantic_relation_model_available():
         sys.exit("FATAL: sentence-transformers/MiniLM unavailable — refusing to run degraded (check PYTHONPATH/HF_HOME/HF_HUB_OFFLINE).")
-    probe = probe_llm_endpoint()
+    probe = probe_llm_endpoint(model=selector_model)
     if not probe["ok"]:
         sys.exit(f"FATAL: LLM endpoint unavailable ({probe['error']}) — v2 requires 2 calls/question.")
     print(f"LLM endpoint OK: {probe['url']} model={probe['model']}")
