@@ -45,6 +45,7 @@ from rc_mex.micro_agents import (
     describe_target_relation,
     probe_llm_endpoint,
     select_query_path,
+    select_set_member,
 )
 from rc_mex.run_proof_state_search_smoke import (
     rank_relations_hybrid,
@@ -55,8 +56,11 @@ from rc_mex.run_webqsp_path_family import build_kb
 
 QUESTION_CHANNEL_K = 10
 DESCRIPTION_CHANNEL_K = 8
-MAX_OPTIONS = 14
+RAW_UNION_CAP = 18
+DISTINCT_OPTIONS = 10
 EXAMPLES_PER_OPTION = 3
+REFINE_MIN_SET = 2
+REFINE_MAX_SET = 12
 JUNK_PREDICATE_MARKERS = (
     "freebase.valuenotation",
     "common.image",
@@ -122,29 +126,51 @@ def build_candidate_paths(kb, graph, starts, question, described_names):
                 channel_b.append((predicate, direction))
 
     # interleave (description channel first: it carries the semantic intent),
-    # dedupe, cap
+    # dedupe by (predicate, direction), cap the raw union
     union, seen = [], set()
-    for pair_list in zip(*[iter_pad(channel_b, MAX_OPTIONS), iter_pad(channel_a, MAX_OPTIONS)]):
+    for pair_list in zip(*[iter_pad(channel_b, RAW_UNION_CAP), iter_pad(channel_a, RAW_UNION_CAP)]):
         for pair in pair_list:
             if pair and pair not in seen:
                 seen.add(pair)
                 union.append(pair)
-    union = union[:MAX_OPTIONS]
+    union = union[:RAW_UNION_CAP]
 
+    # execute, then merge options whose ANSWER SETS are identical (3.4 of ~13
+    # options per question were duplicate sets — pure noise for the selector).
+    # Merging never drops a distinct set, so union recall is untouched.
     paths = []
+    by_targets: dict[frozenset, dict] = {}
     for predicate, direction in union:
         targets = set()
         for sid in starts:
             for rel in kb["entities"][sid]["relations"]:
                 if rel["predicate"] == predicate and rel["direction"] == direction:
                     targets.add(rel["object"])
-        if targets:
-            paths.append({"predicate": predicate, "direction": direction, "targets": sorted(targets)})
+        if not targets:
+            continue
+        key = frozenset(targets)
+        if key in by_targets:
+            by_targets[key]["also"].append(display_relation(predicate))
+            continue
+        path = {"predicate": predicate, "direction": direction, "targets": sorted(targets), "also": []}
+        by_targets[key] = path
+        paths.append(path)
+        if len(paths) >= DISTINCT_OPTIONS:
+            break
     return paths
 
 
 def iter_pad(items, n):
     return items + [None] * (n - len(items))
+
+
+def display_relation(predicate: str) -> str:
+    """Selector-facing gloss: clean_relation plus collapsing repeated
+    composite segments ('venue / venue' -> 'venue'). Kept separate from
+    clean_relation so the offline probes' measurements stay comparable."""
+    segments = [s.strip() for s in clean_relation(predicate).split("/")]
+    deduped = list(dict.fromkeys(s for s in segments if s))
+    return " / ".join(deduped)
 
 
 def order_members(kb, targets: list[str], question_types: list[str]) -> list[str]:
@@ -160,7 +186,7 @@ def path_block(kb, graph, path, question_types) -> str:
     type_counts = Counter(t for m in members for t in entity_type_names(kb, m))
     type_str = f" [type: {', '.join(t for t, _ in type_counts.most_common(2))}]" if type_counts else ""
     reversed_str = " (reversed)" if path["direction"] == "backward" else ""
-    return f"{clean_relation(path['predicate'])}{reversed_str} — {len(members)} answer(s): {examples}{type_str}"
+    return f"{display_relation(path['predicate'])}{reversed_str} — {len(members)} answer(s): {examples}{type_str}"
 
 
 def f1(p: float, r: float) -> float:
@@ -251,10 +277,41 @@ def main() -> None:
                     row["fallback"] = True
                 if chosen is not None:
                     members = order_members(kb, chosen["targets"], question_types)
+                    # Refinement (top-1 only): when the set has several members
+                    # and may answer a singular question, one micro-call picks
+                    # THE member. It reorders top-1 and never mutates the set,
+                    # so plural questions and answer-F1 cannot regress.
+                    if REFINE_MIN_SET <= len(members) <= REFINE_MAX_SET:
+                        member_blocks = []
+                        for m in members:
+                            types = entity_type_names(kb, m)
+                            member_blocks.append(
+                                graph.entity_name(m) + (f" [{', '.join(types[:2])}]" if types else "")
+                            )
+                        refinement = select_set_member(
+                            question=question,
+                            start_entity_name=start_name,
+                            property_name=display_relation(chosen["predicate"]),
+                            member_blocks=member_blocks,
+                            model=args.model,
+                        )
+                        usage["calls"] += 1
+                        usage["prompt_tokens"] += refinement["prompt_tokens"]
+                        usage["completion_tokens"] += refinement["completion_tokens"]
+                        if not refinement["raw_response"] and not refinement["error"]:
+                            stats["empty_completion"] += 1
+                        if refinement["pick"] is not None:
+                            picked_member = members[refinement["pick"]]
+                            members = [picked_member] + [m for m in members if m != picked_member]
+                            stats["refined_top1"] += 1
+                        elif refinement["whole_set"]:
+                            stats["refine_whole_set"] += 1
+                        row["refined"] = refinement["pick"] is not None
                     row["selected"] = {
                         "predicate": chosen["predicate"],
                         "direction": chosen["direction"],
-                        "readable": clean_relation(chosen["predicate"]),
+                        "readable": display_relation(chosen["predicate"]),
+                        "also": chosen.get("also", []),
                     }
                     row["predicted"] = [graph.entity_name(m) for m in members]
                     predicted_ids = set(chosen["targets"])
@@ -283,6 +340,8 @@ def main() -> None:
         "mean_answer_f1": f1_sum / n,
         "total": stats["total"],
         "gold_in_subgraph": stats["gold_in_subgraph"],
+        "refined_top1": stats["refined_top1"],
+        "refine_whole_set": stats["refine_whole_set"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "no_candidates": stats["no_candidates"],

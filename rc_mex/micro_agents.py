@@ -620,6 +620,57 @@ def select_query_path(
     }
 
 
+MEMBER_SELECTOR_PROMPT_VERSION = "member_selector_v1"
+MEMBER_SELECTOR_PROMPT_TEMPLATE = """A question was answered by looking up the property "{property_name}" of "{start}" in a knowledge base. The property has several values; the question may ask for one of them.
+
+Question: "{question}"
+
+Values:
+{members}
+0. the question asks for all of these, not one
+
+Which value answers the question? Reply with only the number."""
+
+
+def select_set_member(
+    question: str,
+    start_entity_name: str,
+    property_name: str,
+    member_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Refinement micro-decision: pick THE member of an already-selected
+    answer set when the question implies a single answer. 0 = the set itself
+    is the answer (plural question) — caller keeps the set order unchanged.
+    This call may only reorder top-1; it never mutates the answer set."""
+    if not member_blocks:
+        return {"pick": None, "whole_set": False, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(member_blocks, start=1))
+    prompt = MEMBER_SELECTOR_PROMPT_TEMPLATE.format(
+        property_name=property_name, start=start_entity_name, question=question, members=numbered
+    )
+    result = call_local_llm(prompt, MEMBER_SELECTOR_PROMPT_VERSION, model=model, timeout=120.0)
+    if result["error"]:
+        return {"pick": None, "whole_set": False, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    numbers = re.findall(r"\d+", result["text"])
+    pick = None
+    whole_set = False
+    if numbers:
+        first = int(numbers[0])
+        if first == 0:
+            whole_set = True
+        elif 1 <= first <= len(member_blocks):
+            pick = first - 1
+    return {
+        "pick": pick,
+        "whole_set": whole_set,
+        "raw_response": result["text"][:120],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
