@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import deque
-
 import numpy as np
 
 from cigr_d_mvp1.kg import KnowledgeGraph, normalize_text
@@ -39,24 +37,19 @@ from rc_mex.run_webqsp_path_family import build_kb
 from rc_mex.diag_selection_quality_eval import clean_relation
 
 
-def bfs_first_relation(kb: dict, starts: set[str], golds: set[str], maxd: int = 1):
-    ents = kb["entities"]
-    seen = {s: (0, None) for s in starts}
-    q = deque(starts)
-    while q:
-        e = q.popleft()
-        d, r1 = seen[e]
-        if d >= maxd:
-            continue
-        for rel in ents.get(e, {}).get("relations", []):
-            nb = rel["object"]
-            if nb in seen:
-                continue
-            seen[nb] = (d + 1, r1 if d >= 1 else rel["predicate"])
-            if nb in golds:
-                return seen[nb]
-            q.append(nb)
-    return (None, None)
+def gold_relations_depth1(kb: dict, starts: set[str], golds: set[str]) -> set[str]:
+    """ALL predicates that reach a gold answer in one hop from any topic entity.
+
+    Scoring against a single BFS-arbitrary gold path penalized the LLM for
+    naming a better property than the annotation-degenerate one (e.g.
+    'founder' vs a backward-nationality shotgun path); success is now any
+    gold-reaching relation landing in the top-K."""
+    out: set[str] = set()
+    for sid in starts:
+        for rel in kb["entities"].get(sid, {}).get("relations", []):
+            if rel["object"] in golds:
+                out.add(rel["predicate"])
+    return out
 
 
 def cosine(a, b) -> float:
@@ -64,6 +57,19 @@ def cosine(a, b) -> float:
     b = np.asarray(b)
     n = np.linalg.norm(a) * np.linalg.norm(b)
     return float(np.dot(a, b) / n) if n else 0.0
+
+
+def relation_similarity(name_vecs: list, relation_id: str) -> float:
+    """Max over LLM-suggested names x relation gloss segments. Composite CVT
+    relations ('official symbols / symbol') are matched per-segment so one
+    informative segment is enough."""
+    glosses = [clean_relation(relation_id)]
+    glosses += [seg.strip() for seg in glosses[0].split("/") if seg.strip() and seg.strip() != glosses[0]]
+    best = 0.0
+    for nv in name_vecs:
+        for gloss in glosses:
+            best = max(best, cosine(nv, semantic_embedding(gloss)))
+    return best
 
 
 def main() -> None:
@@ -99,38 +105,38 @@ def main() -> None:
         starts = {normalize_text(e) for e in d.get("q_entity") or []} & set(kb["entities"])
         if not golds or not starts:
             continue
-        depth, needed = bfs_first_relation(kb, starts, golds)
-        if depth != 1 or not needed:
+        gold_rels = gold_relations_depth1(kb, starts, golds)
+        if not gold_rels:
             continue
         start_id = sorted(starts)[0]
-        frontier = graph.candidate_relations([start_id], cap=100000, sample_entities=25)
+        frontier = graph.candidate_relations(sorted(starts), cap=100000, sample_entities=25)
         ranked = rank_relations_hybrid(pred["question"], frontier)
-        keys = [c["relation_id"] for c in ranked]
-        if needed not in keys:
+        keys = list(dict.fromkeys(c["relation_id"] for c in ranked))
+        present = [r for r in gold_rels if r in keys]
+        if not present:
             continue
-        old_rank = keys.index(needed)
+        old_rank = min(keys.index(r) for r in present)
         if old_rank < RELATION_PROPOSAL_K:
-            continue  # only the buried ones
+            continue  # only the buried ones (no gold relation in the old top-K)
         tested += 1
         old_ranks.append(old_rank)
 
         described = describe_target_relation(pred["question"], pred["start_entity"]["name"], model=args.model)
-        if described["error"] or not described["text"]:
+        if described["error"] or not described["names"]:
             llm_err += 1
             new_ranks.append(old_rank)
             continue
-        target_vec = semantic_embedding(described["text"])
-        sims = sorted(
-            ((cosine(target_vec, semantic_embedding(clean_relation(rid))), rid) for rid in dict.fromkeys(keys)),
-            reverse=True,
-        )
-        new_rank = next(i for i, (_, rid) in enumerate(sims) if rid == needed)
+        name_vecs = [semantic_embedding(n) for n in described["names"]]
+        sims = sorted(((relation_similarity(name_vecs, rid), rid) for rid in keys), reverse=True)
+        order = [rid for _, rid in sims]
+        new_rank = min(order.index(r) for r in present)
         new_ranks.append(new_rank)
         if new_rank < RELATION_PROPOSAL_K:
             rescued += 1
         if shown < args.show:
             shown += 1
-            print(f"q={pred['question'][:50]!r} | LLM said {described['text']!r} | needed {clean_relation(needed)!r} | rank {old_rank}->{new_rank}")
+            best_rel = min(present, key=lambda r: order.index(r))
+            print(f"q={pred['question'][:50]!r} | LLM said {described['names']!r} | best gold rel {clean_relation(best_rel)!r} | rank {old_rank}->{new_rank}")
 
     import statistics as st
 

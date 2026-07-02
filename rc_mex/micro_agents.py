@@ -509,12 +509,12 @@ def select_answer_typed(
     }
 
 
-RELATION_DESCRIPTION_PROMPT_VERSION = "relation_description_v1"
+RELATION_DESCRIPTION_PROMPT_VERSION = "relation_description_v2"
 RELATION_DESCRIPTION_PROMPT_TEMPLATE = """A question is answered by looking up one property of the entity "{start}" in a knowledge base.
 
 Question: "{question}"
 
-What property of "{start}" gives the answer? Reply with a short property name of 2 to 5 words, for example: "place of birth", "team played for", "capital city", "profession". Reply with only the property name."""
+Name the property of "{start}" that gives the answer. Name the property itself, not the answer. Reply with 2 or 3 alternative short property names, comma-separated, most likely first. Example — for "where was he born?": place of birth, birthplace, hometown."""
 
 
 def describe_target_relation(
@@ -524,25 +524,35 @@ def describe_target_relation(
 ) -> dict[str, Any]:
     """Micro-agent for HyDE-style schema linking: the LLM names the property
     that answers the question (semantic intent), WITHOUT seeing the schema.
-    The caller embeds this and matches it against the real relations, so the
-    LLM supplies meaning and the embedding supplies scale."""
+    The caller embeds the name(s) and matches them against the real relations,
+    so the LLM supplies meaning and the embedding supplies scale. v2 asks for
+    2-3 alternative names (max-pooled by the caller) to kill single-sample
+    phrasing variance on vague questions ("what did X do")."""
     prompt = RELATION_DESCRIPTION_PROMPT_TEMPLATE.format(start=start_entity_name, question=question)
     result = call_local_llm(prompt, RELATION_DESCRIPTION_PROMPT_VERSION, model=model, timeout=120.0)
-    text = result["text"].strip().strip('".').splitlines()[0] if result["text"].strip() else ""
+    first_line = result["text"].strip().splitlines()[0] if result["text"].strip() else ""
+    # Small models wrap the answer in prose ('The property ... is "X"'); keep
+    # only what follows the final ' is '.
+    boilerplate = re.search(r"\bis[:\s]+(.+)$", first_line)
+    if boilerplate and len(first_line.split()) > 6:
+        first_line = boilerplate.group(1)
+    names = [n.strip().strip('".') for n in first_line.split(",")]
+    names = [n for n in names if n][:3]
     return {
-        "text": text,
+        "names": names,
+        "text": names[0] if names else "",
         "error": result["error"],
         "prompt_tokens": int(result.get("prompt_tokens", 0)),
         "completion_tokens": int(result.get("completion_tokens", 0)),
     }
 
 
-ANSWER_TYPE_DESCRIPTION_PROMPT_VERSION = "answer_type_description_v1"
+ANSWER_TYPE_DESCRIPTION_PROMPT_VERSION = "answer_type_description_v2"
 ANSWER_TYPE_DESCRIPTION_PROMPT_TEMPLATE = """A question will be answered with an entity from a knowledge base.
 
 Question: "{question}"
 
-What type of entity is the answer? Reply with only a short type name of 1 to 4 words, for example: "city", "high school", "language", "person", "sports team"."""
+What type of entity is the ANSWER (not the person or thing the question is about)? Example — for "where was Barack Obama born?" the answer is a city, so reply "city", not "person". Reply with only a short type name of 1 to 4 words."""
 
 
 def describe_answer_type(question: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
