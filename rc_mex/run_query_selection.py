@@ -142,17 +142,27 @@ def build_candidate_paths(kb, graph, starts, question, described_names):
     by_targets: dict[frozenset, dict] = {}
     for predicate, direction in union:
         targets = set()
+        member_quals: dict[str, dict] = {}
         for sid in starts:
             for rel in kb["entities"][sid]["relations"]:
                 if rel["predicate"] == predicate and rel["direction"] == direction:
                     targets.add(rel["object"])
+                    for qname, values in (rel.get("qualifiers") or {}).items():
+                        slot = member_quals.setdefault(rel["object"], {}).setdefault(qname, [])
+                        slot.extend(v for v in values if v not in slot)
         if not targets:
             continue
         key = frozenset(targets)
         if key in by_targets:
             by_targets[key]["also"].append(display_relation(predicate))
             continue
-        path = {"predicate": predicate, "direction": direction, "targets": sorted(targets), "also": []}
+        path = {
+            "predicate": predicate,
+            "direction": direction,
+            "targets": sorted(targets),
+            "also": [],
+            "member_quals": member_quals,
+        }
         by_targets[key] = path
         paths.append(path)
         if len(paths) >= DISTINCT_OPTIONS:
@@ -171,6 +181,40 @@ def display_relation(predicate: str) -> str:
     segments = [s.strip() for s in clean_relation(predicate).split("/")]
     deduped = list(dict.fromkeys(s for s in segments if s))
     return " / ".join(deduped)
+
+
+DATE_PATTERN = __import__("re").compile(r"\b(1[6-9]\d\d|20\d\d)(?:-\d\d)?(?:-\d\d)?\b")
+ORDINAL_MIN = __import__("re").compile(r"\b(first|earliest|oldest|original|debut)\b", __import__("re").I)
+ORDINAL_MAX = __import__("re").compile(r"\b(last|latest|newest|most recent|final|current)\b", __import__("re").I)
+SCOPE_STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "for", "and", "or", "to", "with"}
+
+
+def qualifier_matches_question(question_norm: str, quals: dict) -> bool:
+    """Zero-LLM scope test: does any qualifier VALUE of this member appear in
+    the question ('in star wars' vs film qualifier 'Star Wars Episode I...')?
+    Full-substring or >=2 significant-word overlap."""
+    q_words = set(question_norm.split())
+    for values in quals.values():
+        for value in values:
+            vn = normalize_text(str(value))
+            if len(vn) >= 4 and vn in question_norm:
+                return True
+            vw = [w for w in vn.split() if w not in SCOPE_STOPWORDS and len(w) > 2]
+            if vw and sum(1 for w in vw if w in q_words) >= min(2, len(vw)):
+                return True
+    return False
+
+
+def member_date(quals: dict, latest: bool) -> str | None:
+    dates = []
+    for values in quals.values():
+        for value in values:
+            found = DATE_PATTERN.search(str(value))
+            if found:
+                dates.append(found.group(0))
+    if not dates:
+        return None
+    return max(dates) if latest else min(dates)
 
 
 def order_members(kb, targets: list[str], question_types: list[str]) -> list[str]:
@@ -285,11 +329,36 @@ def main() -> None:
                     row["fallback"] = True
                 if chosen is not None:
                     members = order_members(kb, chosen["targets"], question_types)
-                    # Refinement (top-1 only): when the set has several members
-                    # and may answer a singular question, one micro-call picks
-                    # THE member. It reorders top-1 and never mutates the set,
-                    # so plural questions and answer-F1 cannot regress.
-                    if REFINE_MIN_SET <= len(members) <= REFINE_MAX_SET:
+                    member_quals = chosen.get("member_quals") or {}
+                    question_norm = normalize_text(question)
+                    # Constraint refinement, algorithmic first.
+                    # (1) SCOPE: keep members whose qualifiers mention an
+                    # entity from the question ("in star wars"). This MUTATES
+                    # the answer set by design (the scoped subset IS the
+                    # answer); guarded: only applies to a non-empty strict
+                    # subset.
+                    if len(members) > 1 and member_quals:
+                        scoped = [m for m in members if qualifier_matches_question(question_norm, member_quals.get(m, {}))]
+                        if scoped and len(scoped) < len(members):
+                            members = scoped
+                            stats["scope_filtered"] += 1
+                            row["scope_filtered"] = True
+                    # (2) ORDINAL: first/last questions with dated qualifiers
+                    # — reorder top-1 to the argmin/argmax member (set kept).
+                    ordinal_applied = False
+                    if len(members) > 1:
+                        latest = bool(ORDINAL_MAX.search(question))
+                        if latest or ORDINAL_MIN.search(question):
+                            dated = [(member_date(member_quals.get(m, {}), latest), m) for m in members]
+                            dated = [(d, m) for d, m in dated if d]
+                            if len(dated) >= 2:
+                                best = max(dated)[1] if latest else min(dated)[1]
+                                members = [best] + [m for m in members if m != best]
+                                ordinal_applied = True
+                                stats["ordinal_applied"] += 1
+                                row["ordinal_applied"] = True
+                    # (3) member micro-call for what the operators didn't settle
+                    if not ordinal_applied and REFINE_MIN_SET <= len(members) <= REFINE_MAX_SET:
                         member_blocks = []
                         for m in members:
                             types = entity_type_names(kb, m)
@@ -322,7 +391,7 @@ def main() -> None:
                         "also": chosen.get("also", []),
                     }
                     row["predicted"] = [graph.entity_name(m) for m in members]
-                    predicted_ids = set(chosen["targets"])
+                    predicted_ids = set(members)
                     top1 = members[0]
                     stats["hits_at_1"] += top1 in golds
                     p = len(predicted_ids & golds) / len(predicted_ids) if predicted_ids else 0.0
@@ -350,6 +419,8 @@ def main() -> None:
         "gold_in_subgraph": stats["gold_in_subgraph"],
         "refined_top1": stats["refined_top1"],
         "refine_whole_set": stats["refine_whole_set"],
+        "scope_filtered": stats["scope_filtered"],
+        "ordinal_applied": stats["ordinal_applied"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "selection_errors": stats["selection_error"],

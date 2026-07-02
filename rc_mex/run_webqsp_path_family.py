@@ -108,7 +108,15 @@ def compress_cvt_nodes(triples: list[list[str]], max_pairs_per_cvt: int = 64) ->
             for r2, target in outgoing:
                 if source == target or pairs >= max_pairs_per_cvt:
                     continue
-                kept.append([source, f"{r1} / {r2}", target])
+                # The CVT's OTHER legs are the qualifiers of this fact
+                # (marriage dates, ceremony location, season of a roster
+                # spot). Constraint operators need them; carry them on the
+                # composite edge instead of discarding them.
+                qualifiers: dict[str, list[str]] = {}
+                for side, leg_rel, leg_value in edges:
+                    if side == "out" and not (leg_rel == r2 and leg_value == target):
+                        qualifiers.setdefault(leg_rel.split(".")[-1].replace("_", " "), []).append(leg_value)
+                kept.append([source, f"{r1} / {r2}", target, qualifiers])
                 pairs += 1
     return kept
 
@@ -125,14 +133,21 @@ def build_kb(triples: list[list[str]], type_concepts: bool = True, cvt_compressi
         return entity_id
 
     for triple in triples:
-        if len(triple) != 3:
+        if len(triple) < 3:
             continue
-        head, relation, tail = (str(part).strip() for part in triple)
+        head, relation, tail = (str(part).strip() for part in triple[:3])
         if not head or not relation or not tail:
             continue
+        qualifiers = triple[3] if len(triple) > 3 and isinstance(triple[3], dict) else None
         head_id, tail_id = ensure(head), ensure(tail)
-        entities[head_id]["relations"].append({"predicate": relation, "object": tail_id, "direction": "forward"})
-        entities[tail_id]["relations"].append({"predicate": relation, "object": head_id, "direction": "backward"})
+        forward = {"predicate": relation, "object": tail_id, "direction": "forward"}
+        backward = {"predicate": relation, "object": head_id, "direction": "backward"}
+        if qualifiers:
+            # extra key; every existing consumer reads only predicate/object/direction
+            forward["qualifiers"] = qualifiers
+            backward["qualifiers"] = qualifiers
+        entities[head_id]["relations"].append(forward)
+        entities[tail_id]["relations"].append(backward)
 
     concepts: dict[str, dict] = {}
     if type_concepts:
