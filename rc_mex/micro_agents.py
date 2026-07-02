@@ -537,6 +537,29 @@ def describe_target_relation(
     }
 
 
+ANSWER_TYPE_DESCRIPTION_PROMPT_VERSION = "answer_type_description_v1"
+ANSWER_TYPE_DESCRIPTION_PROMPT_TEMPLATE = """A question will be answered with an entity from a knowledge base.
+
+Question: "{question}"
+
+What type of entity is the answer? Reply with only a short type name of 1 to 4 words, for example: "city", "high school", "language", "person", "sports team"."""
+
+
+def describe_answer_type(question: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
+    """HyDE-style type linking: the LLM names the expected answer type without
+    seeing the KB's type inventory; the caller embeds it and matches against
+    the actual types present."""
+    prompt = ANSWER_TYPE_DESCRIPTION_PROMPT_TEMPLATE.format(question=question)
+    result = call_local_llm(prompt, ANSWER_TYPE_DESCRIPTION_PROMPT_VERSION, model=model, timeout=120.0)
+    text = result["text"].strip().strip('".').splitlines()[0] if result["text"].strip() else ""
+    return {
+        "text": text,
+        "error": result["error"],
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
