@@ -159,6 +159,7 @@ def call_local_llm(
     model: str = DEFAULT_MODEL,
     timeout: float = 90.0,
     num_predict: int = 256,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     """Cached, deterministic single-shot generation.
 
@@ -167,7 +168,7 @@ def call_local_llm(
     text (older cache entries are plain strings with unknown token counts)."""
     cache = _load_cache()
     key = _cache_key(prompt_version, model, prompt)
-    if key in cache:
+    if use_cache and key in cache:
         cached = cache[key]
         if isinstance(cached, dict):
             return {
@@ -696,7 +697,10 @@ def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
 
     Cached like everything else, so a healthy endpoint is probed at most once
     per (model, prompt version). Returns {ok, error, url, api_style, model}."""
-    result = call_local_llm("Reply with the single word: ok", "endpoint_probe_v1", model=model, timeout=30.0)
+    # Never satisfied from cache: a cached OK must not mask a now-dead or
+    # misconfigured endpoint (observed: deepseek model name sent to ollama
+    # passed startup because the probe hit cache).
+    result = call_local_llm("Reply with the single word: ok", "endpoint_probe_v1", model=model, timeout=30.0, use_cache=False)
     return {
         "ok": not result["error"],
         "error": result["error"],
