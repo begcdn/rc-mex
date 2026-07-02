@@ -252,8 +252,12 @@ def call_local_llm(
                 text, prompt_tokens, completion_tokens = retry_text, retry_pt, retry_ct
     except Exception as exc:
         return {"text": "", "from_cache": False, "error": f"{type(exc).__name__}: {exc}", "prompt_tokens": 0, "completion_tokens": 0}
-    cache[key] = {"text": text, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
-    _save_cache()
+    if text:
+        # Never cache empty completions: the ollama empty-response state is
+        # transient server trouble, and caching it would replay the outage
+        # forever (observed: 614 empties in one run).
+        cache[key] = {"text": text, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        _save_cache()
     return {"text": text, "from_cache": False, "error": "", "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
 
 
