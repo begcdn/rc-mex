@@ -200,7 +200,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--intent-model", default=None, help="Model for call 1 (defaults to --model).")
+    parser.add_argument("--selector-model", default=None, help="Model for call 2 (defaults to --model).")
+    parser.add_argument("--refiner-model", default=None, help="Model for the member-refinement call (defaults to --model).")
     args = parser.parse_args()
+    intent_model = args.intent_model or args.model
+    selector_model = args.selector_model or args.model
+    refiner_model = args.refiner_model or args.model
 
     if not semantic_relation_model_available():
         sys.exit("FATAL: sentence-transformers/MiniLM unavailable — refusing to run degraded (check PYTHONPATH/HF_HOME/HF_HUB_OFFLINE).")
@@ -244,7 +250,7 @@ def main() -> None:
             "predicted": [],
         }
         if starts:
-            described = describe_target_relation(question, start_name, model=args.model)
+            described = describe_target_relation(question, start_name, model=intent_model)
             usage["calls"] += 1
             usage["prompt_tokens"] += described["prompt_tokens"]
             usage["completion_tokens"] += described["completion_tokens"]
@@ -260,7 +266,7 @@ def main() -> None:
             ]
             if paths:
                 blocks = [path_block(kb, graph, p, question_types) for p in paths]
-                selection = select_query_path(question, start_name, blocks, model=args.model)
+                selection = select_query_path(question, start_name, blocks, model=selector_model)
                 usage["calls"] += 1
                 usage["prompt_tokens"] += selection["prompt_tokens"]
                 usage["completion_tokens"] += selection["completion_tokens"]
@@ -293,7 +299,7 @@ def main() -> None:
                             start_entity_name=start_name,
                             property_name=display_relation(chosen["predicate"]),
                             member_blocks=member_blocks,
-                            model=args.model,
+                            model=refiner_model,
                         )
                         usage["calls"] += 1
                         usage["prompt_tokens"] += refinement["prompt_tokens"]
