@@ -570,6 +570,56 @@ def describe_answer_type(question: str, model: str = DEFAULT_MODEL) -> dict[str,
     }
 
 
+QUERY_PATH_SELECTOR_PROMPT_VERSION = "query_path_selector_v1"
+QUERY_PATH_SELECTOR_PROMPT_TEMPLATE = """A question is answered by choosing ONE property of "{start}" in a knowledge base.
+
+Question: "{question}"
+
+Each numbered option is a property and the answer(s) it would give:
+{options}
+0. none of these properties answers the question
+
+Pick the option whose answers correctly answer the question. Reply with only the number."""
+
+
+def select_query_path(
+    question: str,
+    start_entity_name: str,
+    option_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Query-selection core: pick ONE property (not one entity) whose target
+    set answers the question, with an explicit abstain option (0). Returns
+    pick=None with abstain=True when the model declines — the caller falls
+    back, never forces."""
+    if not option_blocks:
+        return {"pick": None, "abstain": True, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(option_blocks, start=1))
+    prompt = QUERY_PATH_SELECTOR_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, options=numbered
+    )
+    result = call_local_llm(prompt, QUERY_PATH_SELECTOR_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"pick": None, "abstain": False, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    numbers = re.findall(r"\d+", result["text"])
+    pick = None
+    abstain = False
+    if numbers:
+        first = int(numbers[0])
+        if first == 0:
+            abstain = True
+        elif 1 <= first <= len(option_blocks):
+            pick = first - 1
+    return {
+        "pick": pick,
+        "abstain": abstain,
+        "raw_response": result["text"][:120],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def probe_llm_endpoint(model: str = DEFAULT_MODEL) -> dict[str, Any]:
     """One cheap generation to verify the endpoint before a long run.
 
