@@ -279,6 +279,8 @@ def main() -> None:
                     row["abstained"] = selection["abstain"]
                     stats["abstained"] += selection["abstain"]
                     stats["selection_error"] += bool(selection["error"])
+                    if selection["error"]:
+                        row["selection_error"] = selection["error"][:160]
                     chosen = paths[0] if paths else None  # channel floor
                     row["fallback"] = True
                 if chosen is not None:
@@ -350,6 +352,7 @@ def main() -> None:
         "refine_whole_set": stats["refine_whole_set"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
+        "selection_errors": stats["selection_error"],
         "no_candidates": stats["no_candidates"],
         "unresolved_start": stats["unresolved_start"],
         "empty_completions": stats["empty_completion"],

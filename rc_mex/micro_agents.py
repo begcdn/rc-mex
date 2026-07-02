@@ -22,6 +22,8 @@ import hashlib
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -213,8 +215,26 @@ def call_local_llm(
         raw_text = str(body.get("response", ""))
         return THINK_BLOCK_PATTERN.sub("", raw_text).strip(), int(body.get("prompt_eval_count", 0)), int(body.get("eval_count", 0))
 
+    def _request_with_backoff(body_dict: dict[str, Any]) -> tuple[str, int, int]:
+        # Remote APIs rate-limit bursts (observed: 114/150 deepseek selection
+        # calls failing when intent calls were cache hits and selections fired
+        # back-to-back). Retry transient failures with growing pauses.
+        last_exc: Exception | None = None
+        for pause in (0, 2, 5, 10):
+            if pause:
+                time.sleep(pause)
+            try:
+                return _request(body_dict)
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code not in (429, 500, 502, 503, 504):
+                    raise
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_exc = exc
+        raise last_exc  # type: ignore[misc]
+
     try:
-        text, prompt_tokens, completion_tokens = _request(request_body)
+        text, prompt_tokens, completion_tokens = _request_with_backoff(request_body)
         # qwen3 + ollama occasionally returns an empty completion when thinking
         # is disabled on a long prompt (observed on 25-candidate adjudication
         # prompts). Salvage once by letting it think, then strip the block.
@@ -226,7 +246,7 @@ def call_local_llm(
                 retry_body["options"] = {**retry_body.get("options", {}), "num_predict": max(num_predict, 1024)}
             else:
                 retry_body["max_tokens"] = max(num_predict, 1024)
-            retry_text, retry_pt, retry_ct = _request(retry_body)
+            retry_text, retry_pt, retry_ct = _request_with_backoff(retry_body)
             if retry_text:
                 text, prompt_tokens, completion_tokens = retry_text, retry_pt, retry_ct
     except Exception as exc:
