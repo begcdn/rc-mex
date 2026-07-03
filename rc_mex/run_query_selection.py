@@ -42,6 +42,7 @@ from rc_mex.diag_relation_description_eval import relation_similarity
 from rc_mex.diag_selection_quality_eval import clean_relation
 from rc_mex.micro_agents import (
     DEFAULT_MODEL,
+    audit_answer,
     describe_relation_chain,
     describe_target_relation,
     probe_llm_endpoint,
@@ -310,6 +311,66 @@ def merge_mixed_menu(hop1_paths, chain_paths, cap: int = MIXED_MENU_CAP):
         if len(merged) >= cap:
             break
     return merged
+
+
+EXTEND_MENU_CAP = 8  # gold extension visible: top-6 41/49, top-10 45/49 (cwq_dev300f probe)
+
+
+def build_extension_menu(kb, starts, chosen, question, gap_phrase):
+    """Round-2 menu for the audit's MISSING verdict: every (predicate,
+    direction) executed from the CHOSEN set's full frontier, ranked by the
+    better of two grounding channels — the audit's stated gap phrase (post-
+    evidence, replaces the intent second-name channel that caused the
+    off-menu class) and the question itself. Deduped by target set, capped.
+    Topic entities and the frontier itself are never answers here: an
+    extension that returns its own sources is the identity, not a hop."""
+    frontier = set(chosen["targets"])
+    if not frontier or len(frontier) > HOP2_FANOUT_CAP:
+        return []
+    exclude = starts | frontier
+    groups: dict[tuple[str, str], set] = {}
+    quals: dict[tuple[str, str], dict] = {}
+    for sid in frontier:
+        for rel in kb["entities"].get(sid, {}).get("relations", []):
+            if is_junk_predicate(rel["predicate"]):
+                continue
+            key = (rel["predicate"], rel["direction"])
+            groups.setdefault(key, set()).add(rel["object"])
+            for qname, values in (rel.get("qualifiers") or {}).items():
+                slot = quals.setdefault(key, {}).setdefault(rel["object"], {}).setdefault(qname, [])
+                slot.extend(v for v in values if v not in slot)
+    groups = {k: v - exclude for k, v in groups.items() if v - exclude}
+    if not groups:
+        return []
+    channel_vecs = [semantic_embedding(question)]
+    if gap_phrase:
+        channel_vecs.append(semantic_embedding(gap_phrase))
+    scored = sorted(
+        ((max(cosine(v, semantic_embedding(display_relation(prd))) for v in channel_vecs), (prd, drn))
+         for prd, drn in groups),
+        reverse=True,
+    )
+    base_label = chosen.get("chain_label") or display_relation(chosen["predicate"])
+    out, seen = [], set()
+    for _, (prd, drn) in scored:
+        key = frozenset(groups[(prd, drn)])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "predicate": prd,
+                "direction": drn,
+                "targets": sorted(groups[(prd, drn)]),
+                "also": [],
+                "member_quals": {m: q for m, q in quals.get((prd, drn), {}).items() if m in groups[(prd, drn)]},
+                "chain_label": f"{base_label} → {display_relation(prd)}",
+                "extension_of": {"predicate": chosen["predicate"], "direction": chosen["direction"]},
+            }
+        )
+        if len(out) >= EXTEND_MENU_CAP:
+            break
+    return out
 
 
 def display_relation(predicate: str) -> str:
@@ -633,6 +694,17 @@ def main() -> None:
         "ended as misses, 17 with gold ON the menu. Needs its own WebQSP A/B before use there.",
     )
     parser.add_argument(
+        "--audit-extend",
+        action="store_true",
+        help="Propose→audit→revise loop: after refinement, a narrow TYPE check on the "
+        "proposed answers (ACCEPT / MISSING:<property>); on MISSING, one extension round "
+        "executed from the chosen set's frontier, grounded by the gap phrase + question, "
+        "then a round-2 selection + refinement. Measured motivation (cwq_dev300f): 49/96 "
+        "answerable misses predicted the correct INTERMEDIATE entity; the gold extension "
+        "is embedding-visible in a top-8 mini-menu for 41. An extension only replaces the "
+        "answer when round-2 affirmatively picks — ACCEPT or any failure keeps v2 behavior.",
+    )
+    parser.add_argument(
         "--verify-final",
         action="store_true",
         help="Binary verification call between the selected query and its STRUCTURAL "
@@ -800,24 +872,27 @@ def main() -> None:
 
                 if chosen is not None:
 
-                    def live_member_call(members, blocks):
-                        refinement = select_set_member(
-                            question=question,
-                            start_entity_name=start_name,
-                            property_name=chosen.get("chain_label") or display_relation(chosen["predicate"]),
-                            member_blocks=blocks,
-                            model=refiner_model,
-                        )
-                        usage["calls"] += 1
-                        usage["prompt_tokens"] += refinement["prompt_tokens"]
-                        usage["completion_tokens"] += refinement["completion_tokens"]
-                        if not refinement["raw_response"] and not refinement["error"]:
-                            stats["empty_completion"] += 1
-                        if refinement["pick"] is not None:
-                            return members[refinement["pick"]]
-                        if refinement["whole_set"]:
-                            return "ALL"
-                        return None
+                    def make_member_call(chosen_path):
+                        def live_member_call(members, blocks):
+                            refinement = select_set_member(
+                                question=question,
+                                start_entity_name=start_name,
+                                property_name=chosen_path.get("chain_label") or display_relation(chosen_path["predicate"]),
+                                member_blocks=blocks,
+                                model=refiner_model,
+                            )
+                            usage["calls"] += 1
+                            usage["prompt_tokens"] += refinement["prompt_tokens"]
+                            usage["completion_tokens"] += refinement["completion_tokens"]
+                            if not refinement["raw_response"] and not refinement["error"]:
+                                stats["empty_completion"] += 1
+                            if refinement["pick"] is not None:
+                                return members[refinement["pick"]]
+                            if refinement["whole_set"]:
+                                return "ALL"
+                            return None
+
+                        return live_member_call
 
                     members, rflags = refine_members(
                         kb,
@@ -825,9 +900,61 @@ def main() -> None:
                         question,
                         question_types,
                         chosen,
-                        member_call=live_member_call,
+                        member_call=make_member_call(chosen),
                         topic_names=[graph.entity_name(s) for s in starts],
                     )
+                    if args.audit_extend and members:
+                        audit = audit_answer(
+                            question,
+                            chosen.get("chain_label") or display_relation(chosen["predicate"]),
+                            [graph.entity_name(m) for m in members[:8]],
+                            model=selector_model,
+                        )
+                        usage["calls"] += 1
+                        usage["prompt_tokens"] += audit["prompt_tokens"]
+                        usage["completion_tokens"] += audit["completion_tokens"]
+                        if not audit["raw_response"] and not audit["error"]:
+                            stats["empty_completion"] += 1
+                        stats["audit_calls"] += 1
+                        if audit["verdict"] == "missing":
+                            stats["audit_missing"] += 1
+                            row["audit_gap"] = audit["gap"]
+                            ext_paths = build_extension_menu(kb, starts, chosen, question, audit["gap"])
+                            if ext_paths:
+                                ext_blocks = [
+                                    path_block(kb, graph, p, question_types, topic_name=start_name)
+                                    for p in ext_paths
+                                ]
+                                round2 = select_query_path(
+                                    question,
+                                    f"the results of \"{chosen.get('chain_label') or display_relation(chosen['predicate'])}\"",
+                                    ext_blocks,
+                                    model=selector_model,
+                                    think=args.think_select,
+                                )
+                                usage["calls"] += 1
+                                usage["prompt_tokens"] += round2["prompt_tokens"]
+                                usage["completion_tokens"] += round2["completion_tokens"]
+                                if not round2["raw_response"] and not round2["error"]:
+                                    stats["empty_completion"] += 1
+                                if round2["pick"] is not None:
+                                    chosen2 = ext_paths[round2["pick"]]
+                                    members2, rflags2 = refine_members(
+                                        kb,
+                                        graph,
+                                        question,
+                                        question_types,
+                                        chosen2,
+                                        member_call=make_member_call(chosen2),
+                                        topic_names=[graph.entity_name(s) for s in starts],
+                                    )
+                                    # The revision only lands when round 2 both
+                                    # picked and produced members — never trade a
+                                    # concrete answer for nothing.
+                                    if members2:
+                                        chosen, members, rflags = chosen2, members2, rflags2
+                                        stats["extended"] += 1
+                                        row["extended"] = True
                     stats["scope_filtered"] += rflags["scope"]
                     stats["ordinal_applied"] += rflags["ordinal"]
                     stats["refined_top1"] += rflags["refined"]
@@ -880,6 +1007,9 @@ def main() -> None:
         "verify_calls": stats["verify_calls"],
         "verify_switched": stats["verify_switched"],
         "abstain_recovered": stats["abstain_recovered"],
+        "audit_calls": stats["audit_calls"],
+        "audit_missing": stats["audit_missing"],
+        "extended": stats["extended"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "selection_errors": stats["selection_error"],
