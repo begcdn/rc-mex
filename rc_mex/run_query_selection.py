@@ -187,6 +187,17 @@ DATE_PATTERN = __import__("re").compile(r"\b(1[6-9]\d\d|20\d\d)(?:-\d\d)?(?:-\d\
 ORDINAL_MIN = __import__("re").compile(r"\b(first|earliest|oldest|original|debut)\b", __import__("re").I)
 ORDINAL_MAX = __import__("re").compile(r"\b(last|latest|newest|most recent|final|current|now|today)\b", __import__("re").I)
 SCOPE_STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "for", "and", "or", "to", "with"}
+# Freebase reification bookkeeping legs, not facts about the member. 'has no
+# value: To' is the one that CARRIES meaning (open validity interval = the
+# fact is current); the rest is noise that can spuriously scope-match the
+# question ('is reviewed: Spouse' vs a spouse question) or waste block space.
+ARTIFACT_QUAL_DIMS = {"is reviewed", "has value", "has no value"}
+
+
+def is_current_fact(quals: dict) -> bool:
+    """Open-ended validity: Freebase marks an ongoing tenure/marriage/roster
+    spot with a 'has no value' leg for its To date."""
+    return any(str(v).strip().lower() == "to" for v in quals.get("has no value", []))
 
 
 def value_match_strength(question_norm: str, value: str) -> tuple[int, int]:
@@ -225,7 +236,7 @@ def scope_members(question_norm: str, members: list[str], member_quals: dict) ->
     if len(members) <= 1 or not member_quals:
         return None
     strength: dict[str, tuple[int, int]] = {m: (0, 0) for m in members}
-    dims = {d for m in members for d in member_quals.get(m, {})}
+    dims = {d for m in members for d in member_quals.get(m, {})} - ARTIFACT_QUAL_DIMS
     for dim in dims:
         per_member = {}
         for m in members:
@@ -252,9 +263,15 @@ def scope_members(question_norm: str, members: list[str], member_quals: dict) ->
 def member_date(quals: dict, latest: bool, member_name: str = "") -> str | None:
     """Best date evidence for a member: qualifier values first; failing that,
     the member's own name — event entities carry their date there ('2014
-    Stanley Cup Finals'), and direct edges have no qualifiers at all."""
+    Stanley Cup Finals'), and direct edges have no qualifiers at all. An
+    open-ended validity interval outranks every dated one for 'latest'
+    questions: the fact that is still true IS the most recent."""
+    if latest and is_current_fact(quals):
+        return "9999"
     dates = []
-    for values in quals.values():
+    for dim, values in quals.items():
+        if dim in ARTIFACT_QUAL_DIMS:
+            continue
         for value in values:
             found = DATE_PATTERN.search(str(value))
             if found:
@@ -282,7 +299,9 @@ def member_block(kb, graph, member: str, quals: dict, informative_dims: set[str]
     if types:
         parts.append(f"[{', '.join(types[:2])}]")
     shown = []
-    for dim in sorted(informative_dims):
+    if is_current_fact(quals):
+        shown.append("current")
+    for dim in sorted(informative_dims - ARTIFACT_QUAL_DIMS):
         values = quals.get(dim, [])
         if values:
             shown.append(f"{dim}: {', '.join(str(v) for v in values[:3])}")
