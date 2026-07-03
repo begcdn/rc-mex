@@ -654,6 +654,18 @@ QUERY_PATH_SELECTOR_ZERO_DEFAULT = "none of these properties answers the questio
 # The hop-2 stop prompt is versioned separately: it changes the MEANING of 0
 # from menu-abstention to a positive "the current answers suffice" choice.
 QUERY_PATH_SELECTOR_STOP_VERSION = "query_path_selector_stop_v1"
+# Mixed-depth menus (CWQ): options may be two-step chains; separate intro
+# line and version, 1-hop menus keep the original prompt byte-identical.
+QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v1"
+QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", or a two-step chain "property → property of its result".
+
+Question: "{question}"
+
+Each numbered option is a query and the answer(s) it would give:
+{options}
+0. {zero_option}
+
+Pick the option whose answers correctly answer the question. Reply with only the number."""
 
 
 def select_query_path(
@@ -662,6 +674,7 @@ def select_query_path(
     option_blocks: list[str],
     model: str = DEFAULT_MODEL,
     stop_line: str | None = None,
+    mixed: bool = False,
 ) -> dict[str, Any]:
     """Query-selection core: pick ONE property (not one entity) whose target
     set answers the question, with an explicit abstain option (0). Returns
@@ -673,13 +686,19 @@ def select_query_path(
     if not option_blocks:
         return {"pick": None, "abstain": True, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
     numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(option_blocks, start=1))
-    prompt = QUERY_PATH_SELECTOR_PROMPT_TEMPLATE.format(
+    template = QUERY_PATH_SELECTOR_MIXED_TEMPLATE if mixed else QUERY_PATH_SELECTOR_PROMPT_TEMPLATE
+    prompt = template.format(
         start=start_entity_name,
         question=question,
         options=numbered,
         zero_option=stop_line or QUERY_PATH_SELECTOR_ZERO_DEFAULT,
     )
-    version = QUERY_PATH_SELECTOR_STOP_VERSION if stop_line else QUERY_PATH_SELECTOR_PROMPT_VERSION
+    if mixed:
+        version = QUERY_PATH_SELECTOR_MIXED_VERSION
+    elif stop_line:
+        version = QUERY_PATH_SELECTOR_STOP_VERSION
+    else:
+        version = QUERY_PATH_SELECTOR_PROMPT_VERSION
     result = call_local_llm(prompt, version, model=model, timeout=180.0)
     if result["error"]:
         return {"pick": None, "abstain": False, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}

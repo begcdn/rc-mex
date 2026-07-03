@@ -176,6 +176,83 @@ def iter_pad(items, n):
     return items + [None] * (n - len(items))
 
 
+"""Mixed-menu structural constants — set at the measured ceiling knee on CWQ
+dev300 (gold-on-menu / oracle F1 / mean size): M4K3cap12 = 87.3%/.699/11.3,
+M6K4cap14 = 90.4%/.732/13.6, M8K4cap16 = 90.8%/.737/15.3 (plateau).
+Grounding hop-2 with hop-1 names when the intent omits line 2 measured +0.0
+— under-triggering is not the binding constraint; no fallback."""
+MIXED_MENU_CAP = 14
+CHAIN_BASES = 6
+CHAINS_PER_BASE = 4
+
+
+def build_chain_candidates(kb, graph, starts, hop1_paths, hop2_names):
+    """Two-hop query candidates: for the first CHAIN_BASES hop-1 options,
+    ground the intent's second property name on that base's target-set
+    frontier and EXECUTE the chain (hop 2 runs from the full hop-1 target
+    set — query semantics). The selector then compares finished result sets;
+    depth is never a blind decision."""
+    if not hop2_names:
+        return []
+    name_vecs = [semantic_embedding(n) for n in hop2_names]
+    out = []
+    for base in hop1_paths[:CHAIN_BASES]:
+        starts2 = set(base["targets"])
+        if len(starts2) > HOP2_FANOUT_CAP:
+            continue
+        frontier = graph.candidate_relations(sorted(starts2), cap=100000, sample_entities=25)
+        directions: dict[str, list[str]] = {}
+        for c in frontier:
+            if not is_junk_predicate(c.predicate):
+                directions.setdefault(c.predicate, []).append(c.direction)
+        scored = sorted(((relation_similarity(name_vecs, p), p) for p in directions), reverse=True)
+        for _, pred2 in scored[:CHAINS_PER_BASE]:
+            for dir2 in dict.fromkeys(directions[pred2]):
+                targets = set()
+                member_quals: dict[str, dict] = {}
+                for sid in starts2:
+                    for rel in kb["entities"][sid]["relations"]:
+                        if rel["predicate"] == pred2 and rel["direction"] == dir2:
+                            targets.add(rel["object"])
+                            for qname, values in (rel.get("qualifiers") or {}).items():
+                                slot = member_quals.setdefault(rel["object"], {}).setdefault(qname, [])
+                                slot.extend(v for v in values if v not in slot)
+                targets -= starts
+                if not targets or targets == starts2:
+                    continue
+                out.append(
+                    {
+                        "predicate": pred2,
+                        "direction": dir2,
+                        "targets": sorted(targets),
+                        "also": [],
+                        "member_quals": member_quals,
+                        "chain_base": {"predicate": base["predicate"], "direction": base["direction"]},
+                        "chain_label": f"{display_relation(base['predicate'])} → {display_relation(pred2)}",
+                    }
+                )
+    return out
+
+
+def merge_mixed_menu(hop1_paths, chain_paths, cap: int = MIXED_MENU_CAP):
+    """One menu of finished queries: hop-1 options keep their order (and
+    their selection-cache stability); chains join after, deduped against
+    everything by identical target set (a chain that reproduces a 1-hop set
+    adds nothing but its name)."""
+    by_targets: dict[frozenset, dict] = {frozenset(p["targets"]): p for p in hop1_paths}
+    merged = list(hop1_paths)
+    for c in chain_paths:
+        key = frozenset(c["targets"])
+        if key in by_targets:
+            by_targets[key]["also"].append(c["chain_label"])
+            continue
+        by_targets[key] = c
+        merged.append(c)
+        if len(merged) >= cap:
+            break
+    return merged
+
+
 def display_relation(predicate: str) -> str:
     """Selector-facing gloss: clean_relation plus collapsing repeated
     composite segments ('venue / venue' -> 'venue'). Kept separate from
@@ -406,15 +483,20 @@ def path_block(kb, graph, path, question_types, label_collides: bool = False, to
         examples += ", ..."
     type_counts = Counter(t for m in members for t in entity_type_names(kb, m))
     type_str = f" [type: {', '.join(t for t, _ in type_counts.most_common(2))}]" if type_counts else ""
-    label = display_relation(path["predicate"])
-    if path["direction"] == "backward":
-        # When the same label appears in both directions on one menu, a bare
-        # "(reversed)" leaves the two options indistinguishable ("contains"
-        # vs "contains" for the Balkans). Spell the backward one out as
-        # "<label> <topic>": its answers <label> the topic entity.
-        if label_collides and topic_name:
-            label = f"{label} {topic_name}"
-        label += " (reversed)"
+    if path.get("chain_label"):
+        label = path["chain_label"]
+        if path["direction"] == "backward":
+            label += " (reversed)"
+    else:
+        label = display_relation(path["predicate"])
+        if path["direction"] == "backward":
+            # When the same label appears in both directions on one menu, a
+            # bare "(reversed)" leaves the two options indistinguishable
+            # ("contains" vs "contains" for the Balkans). Spell the backward
+            # one out as "<label> <topic>": its answers <label> the topic.
+            if label_collides and topic_name:
+                label = f"{label} {topic_name}"
+            label += " (reversed)"
     return f"{label} — {len(members)} answer(s): {examples}{type_str}"
 
 
@@ -500,12 +582,23 @@ def main() -> None:
             hop2_names = described.get("names_2") or []
             question_types = question_type_evidence(kb, question)
             paths = build_candidate_paths(kb, graph, starts, question, described["names"])
+            has_chains = False
+            if args.max_hops >= 2 and hop2_names and paths:
+                chains = build_chain_candidates(kb, graph, starts, paths, hop2_names)
+                if chains:
+                    paths = merge_mixed_menu(paths, chains)
+                    has_chains = any(p.get("chain_label") for p in paths)
             row["described_names"] = described["names"]
             if hop2_names:
                 row["described_names_2"] = hop2_names
             row["question_types"] = question_types
             row["candidates"] = [
-                {"predicate": p["predicate"], "direction": p["direction"], "size": len(p["targets"])}
+                {
+                    "predicate": p["predicate"],
+                    "direction": p["direction"],
+                    "size": len(p["targets"]),
+                    **({"chain_base": p["chain_base"]} if p.get("chain_base") else {}),
+                }
                 for p in paths
             ]
             if paths:
@@ -526,7 +619,7 @@ def main() -> None:
                     )
                     for p in paths
                 ]
-                selection = select_query_path(question, start_name, blocks, model=selector_model)
+                selection = select_query_path(question, start_name, blocks, model=selector_model, mixed=has_chains)
                 usage["calls"] += 1
                 usage["prompt_tokens"] += selection["prompt_tokens"]
                 usage["completion_tokens"] += selection["completion_tokens"]
@@ -543,72 +636,9 @@ def main() -> None:
                         row["selection_error"] = selection["error"][:160]
                     chosen = paths[0] if paths else None  # channel floor
                     row["fallback"] = True
-                # Chain extension (CWQ): the intent sketched a second
-                # property. Ground it on the CHOSEN target set's frontier and
-                # select again — the same bounded micro-decision, one level
-                # deeper. Abstain (0) keeps the hop-1 answer: the chain is an
-                # offer, never forced.
-                if (
-                    args.max_hops >= 2
-                    and hop2_names
-                    and chosen is not None
-                    and len(chosen["targets"]) <= HOP2_FANOUT_CAP
-                ):
-                    starts2 = set(chosen["targets"])
-                    paths2 = []
-                    for p2 in build_candidate_paths(kb, graph, starts2, question, hop2_names):
-                        final = [t for t in p2["targets"] if t not in starts]
-                        if not final or set(final) == starts2:
-                            continue
-                        p2["targets"] = final
-                        paths2.append(p2)
-                    if paths2:
-                        hop1_label = display_relation(chosen["predicate"])
-                        pred_counts2 = Counter(p["predicate"] for p in paths2)
-                        blocks2 = [
-                            path_block(
-                                kb,
-                                graph,
-                                p,
-                                question_types,
-                                label_collides=pred_counts2[p["predicate"]] > 1,
-                                topic_name=hop1_label,
-                            )
-                            for p in paths2
-                        ]
-                        hop1_members = order_members(kb, chosen["targets"], question_types)
-                        hop1_examples = ", ".join(graph.entity_name(m) for m in hop1_members[:EXAMPLES_PER_OPTION])
-                        if len(hop1_members) > EXAMPLES_PER_OPTION:
-                            hop1_examples += ", ..."
-                        selection2 = select_query_path(
-                            question,
-                            f"the {hop1_label} of {start_name}",
-                            blocks2,
-                            model=selector_model,
-                            stop_line=(
-                                f"stop — the current answers already answer the question: {hop1_examples}"
-                            ),
-                        )
-                        usage["calls"] += 1
-                        usage["prompt_tokens"] += selection2["prompt_tokens"]
-                        usage["completion_tokens"] += selection2["completion_tokens"]
-                        if not selection2["raw_response"] and not selection2["error"]:
-                            stats["empty_completion"] += 1
-                        row["candidates_hop2"] = [
-                            {"predicate": p["predicate"], "direction": p["direction"], "size": len(p["targets"])}
-                            for p in paths2
-                        ]
-                        if selection2["pick"] is not None:
-                            row["selected_hop1"] = {
-                                "predicate": chosen["predicate"],
-                                "direction": chosen["direction"],
-                                "readable": hop1_label,
-                            }
-                            chosen = paths2[selection2["pick"]]
-                            row["chained"] = True
-                            stats["chained"] += 1
-                        else:
-                            stats["chain_abstained"] += 1
+                if chosen is not None and chosen.get("chain_label"):
+                    row["chained"] = True
+                    stats["chained"] += 1
 
                 if chosen is not None:
 
@@ -616,7 +646,7 @@ def main() -> None:
                         refinement = select_set_member(
                             question=question,
                             start_entity_name=start_name,
-                            property_name=display_relation(chosen["predicate"]),
+                            property_name=chosen.get("chain_label") or display_relation(chosen["predicate"]),
                             member_blocks=blocks,
                             model=refiner_model,
                         )
@@ -652,8 +682,9 @@ def main() -> None:
                     row["selected"] = {
                         "predicate": chosen["predicate"],
                         "direction": chosen["direction"],
-                        "readable": display_relation(chosen["predicate"]),
+                        "readable": chosen.get("chain_label") or display_relation(chosen["predicate"]),
                         "also": chosen.get("also", []),
+                        **({"chain_base": chosen["chain_base"]} if chosen.get("chain_base") else {}),
                     }
                     row["predicted"] = [graph.entity_name(m) for m in members]
                     predicted_ids = set(members)
