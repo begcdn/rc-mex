@@ -576,11 +576,18 @@ def main() -> None:
                             )
                             for p in paths2
                         ]
+                        hop1_members = order_members(kb, chosen["targets"], question_types)
+                        hop1_examples = ", ".join(graph.entity_name(m) for m in hop1_members[:EXAMPLES_PER_OPTION])
+                        if len(hop1_members) > EXAMPLES_PER_OPTION:
+                            hop1_examples += ", ..."
                         selection2 = select_query_path(
                             question,
                             f"the {hop1_label} of {start_name}",
                             blocks2,
                             model=selector_model,
+                            stop_line=(
+                                f"stop — the current answers already answer the question: {hop1_examples}"
+                            ),
                         )
                         usage["calls"] += 1
                         usage["prompt_tokens"] += selection2["prompt_tokens"]

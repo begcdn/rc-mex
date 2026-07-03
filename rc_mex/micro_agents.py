@@ -647,9 +647,13 @@ Question: "{question}"
 
 Each numbered option is a property and the answer(s) it would give:
 {options}
-0. none of these properties answers the question
+0. {zero_option}
 
 Pick the option whose answers correctly answer the question. Reply with only the number."""
+QUERY_PATH_SELECTOR_ZERO_DEFAULT = "none of these properties answers the question"
+# The hop-2 stop prompt is versioned separately: it changes the MEANING of 0
+# from menu-abstention to a positive "the current answers suffice" choice.
+QUERY_PATH_SELECTOR_STOP_VERSION = "query_path_selector_stop_v1"
 
 
 def select_query_path(
@@ -657,18 +661,26 @@ def select_query_path(
     start_entity_name: str,
     option_blocks: list[str],
     model: str = DEFAULT_MODEL,
+    stop_line: str | None = None,
 ) -> dict[str, Any]:
     """Query-selection core: pick ONE property (not one entity) whose target
     set answers the question, with an explicit abstain option (0). Returns
     pick=None with abstain=True when the model declines — the caller falls
-    back, never forces."""
+    back, never forces. stop_line (hop-2 chaining) replaces the 0 option with
+    'stop — the current answers already answer the question: ...' so the
+    decision to extend the chain is made AGAINST the hop-1 answers, not
+    blind."""
     if not option_blocks:
         return {"pick": None, "abstain": True, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
     numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(option_blocks, start=1))
     prompt = QUERY_PATH_SELECTOR_PROMPT_TEMPLATE.format(
-        start=start_entity_name, question=question, options=numbered
+        start=start_entity_name,
+        question=question,
+        options=numbered,
+        zero_option=stop_line or QUERY_PATH_SELECTOR_ZERO_DEFAULT,
     )
-    result = call_local_llm(prompt, QUERY_PATH_SELECTOR_PROMPT_VERSION, model=model, timeout=180.0)
+    version = QUERY_PATH_SELECTOR_STOP_VERSION if stop_line else QUERY_PATH_SELECTOR_PROMPT_VERSION
+    result = call_local_llm(prompt, version, model=model, timeout=180.0)
     if result["error"]:
         return {"pick": None, "abstain": False, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
     numbers = re.findall(r"\d+", result["text"])
