@@ -664,8 +664,11 @@ QUERY_PATH_SELECTOR_ZERO_DEFAULT = "none of these properties answers the questio
 QUERY_PATH_SELECTOR_STOP_VERSION = "query_path_selector_stop_v1"
 # Mixed-depth menus (CWQ): options may be two-step chains; separate intro
 # line and version, 1-hop menus keep the original prompt byte-identical.
-QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v2"
-QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", a two-step chain "property → property of its result", or the overlap of two other options ("both option i AND option j").
+# v2 (provenance suffixes + extension-semantics instruction) measured WORSE
+# than v1 for the one-token pick (38.3% vs 41.0% on cwq_dev300) and is
+# retired; thinking at the seat fixes the same failure class and won (44.0%).
+QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v1"
+QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", a two-step chain "property → property of its result", or "both: A AND B" (answers satisfying two conditions at once).
 
 Question: "{question}"
 
@@ -673,7 +676,7 @@ Each numbered option is a query and the answer(s) it would give:
 {options}
 0. {zero_option}
 
-An option marked "a property of option k's answers" goes one step PAST option k: choose it only if the question asks about a property of those answers, not when option k's answers already answer the question. Pick the option whose answers correctly answer the question. Reply with only the number."""
+Pick the option whose answers correctly answer the question. Reply with only the number."""
 
 
 def select_query_path(

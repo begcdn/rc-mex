@@ -280,7 +280,7 @@ def build_intersection_candidates(menu_paths, max_added: int = INTERSECTIONS_ADD
                     "targets": sorted(x),
                     "also": [],
                     "member_quals": quals,
-                    "chain_label": f"both option {src_indices[0]} AND option {src_indices[1]} ({la} ∩ {lb})",
+                    "chain_label": f"both: {la} AND {lb}",
                     "intersection_of": [
                         {"predicate": pa["predicate"], "direction": pa["direction"]},
                         {"predicate": pb["predicate"], "direction": pb["direction"]},
@@ -542,14 +542,13 @@ def path_block(kb, graph, path, question_types, label_collides: bool = False, to
     type_counts = Counter(t for m in members for t in entity_type_names(kb, m))
     type_str = f" [type: {', '.join(t for t, _ in type_counts.most_common(2))}]" if type_counts else ""
     if path.get("chain_label"):
+        # Provenance suffixes ('a property of option k's answers') were
+        # A/B-tested and HURT the one-token pick (38.3% vs 41.0% on
+        # cwq_dev300): the bias arrives without the capacity to apply it.
+        # Thinking mode at the seat fixes the same failure and won (+9).
         label = path["chain_label"]
         if path["direction"] == "backward" and not path.get("src_indices"):
             label += " (reversed)"
-        if path.get("base_index"):
-            # The overshoot signature: the model picks an extension of a base
-            # whose answers were already right, because nothing showed the
-            # options are RELATED. Make the structure visible.
-            label += f" — a property of option {path['base_index']}'s answers"
     else:
         label = display_relation(path["predicate"])
         if path["direction"] == "backward":
