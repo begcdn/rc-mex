@@ -664,8 +664,8 @@ QUERY_PATH_SELECTOR_ZERO_DEFAULT = "none of these properties answers the questio
 QUERY_PATH_SELECTOR_STOP_VERSION = "query_path_selector_stop_v1"
 # Mixed-depth menus (CWQ): options may be two-step chains; separate intro
 # line and version, 1-hop menus keep the original prompt byte-identical.
-QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v1"
-QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", a two-step chain "property → property of its result", or "both: A AND B" (answers satisfying two conditions at once).
+QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v2"
+QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", a two-step chain "property → property of its result", or the overlap of two other options ("both option i AND option j").
 
 Question: "{question}"
 
@@ -673,7 +673,7 @@ Each numbered option is a query and the answer(s) it would give:
 {options}
 0. {zero_option}
 
-Pick the option whose answers correctly answer the question. Reply with only the number."""
+An option marked "a property of option k's answers" goes one step PAST option k: choose it only if the question asks about a property of those answers, not when option k's answers already answer the question. Pick the option whose answers correctly answer the question. Reply with only the number."""
 
 
 def select_query_path(
@@ -740,6 +740,46 @@ Values:
 0. the question asks for all of these, not one
 
 Which value answers the question? Reply with only the number."""
+
+
+QUERY_VERIFY_PROMPT_VERSION = "query_verify_v1"
+QUERY_VERIFY_PROMPT_TEMPLATE = """A question was answered by choosing between two queries on "{start}" in a knowledge base. Decide which one is right.
+
+Question: "{question}"
+
+1. {block_a}
+2. {block_b}
+
+Which option's answers correctly answer the question? Reply with only the number (1 or 2)."""
+
+
+def verify_query_choice(
+    question: str,
+    start_entity_name: str,
+    block_a: str,
+    block_b: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Final-verification seat: a binary comparison between the selected
+    query and the runner-up, each shown with MORE evidence than the menu had
+    room for. Binary choice with rich evidence is an easier task shape than
+    a 14-way pick — the dissection showed close-sibling flips and overshoot
+    both come from choosing between near neighbours."""
+    prompt = QUERY_VERIFY_PROMPT_TEMPLATE.format(
+        start=start_entity_name, question=question, block_a=block_a, block_b=block_b
+    )
+    result = call_local_llm(prompt, QUERY_VERIFY_PROMPT_VERSION, model=model, timeout=180.0)
+    if result["error"]:
+        return {"pick": None, "error": result["error"], "raw_response": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbers = re.findall(r"[12]", result["text"])
+    pick = int(numbers[0]) - 1 if numbers else None
+    return {
+        "pick": pick,
+        "error": "",
+        "raw_response": result["text"][:80],
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
 
 
 def select_set_member(

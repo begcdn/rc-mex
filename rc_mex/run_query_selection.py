@@ -47,6 +47,7 @@ from rc_mex.micro_agents import (
     probe_llm_endpoint,
     select_query_path,
     select_set_member,
+    verify_query_choice,
 )
 from rc_mex.run_proof_state_search_smoke import (
     rank_relations_hybrid,
@@ -152,6 +153,12 @@ def build_candidate_paths(kb, graph, starts, question, described_names):
                     for qname, values in (rel.get("qualifiers") or {}).items():
                         slot = member_quals.setdefault(rel["object"], {}).setdefault(qname, [])
                         slot.extend(v for v in values if v not in slot)
+        # A question never asks for its own anchor: topic entities are not
+        # answers (observed: 'Lyon' predicted for a question naming Lyon).
+        # Guarded — an option that ONLY returns topics stays as-is rather
+        # than vanishing (it may still be the least-wrong fallback).
+        if targets - starts:
+            targets -= starts
         if not targets:
             continue
         key = frozenset(targets)
@@ -206,6 +213,7 @@ def build_chain_candidates(kb, graph, starts, hop1_paths, hop2_names):
             if not is_junk_predicate(c.predicate):
                 directions.setdefault(c.predicate, []).append(c.direction)
         scored = sorted(((relation_similarity(name_vecs, p), p) for p in directions), reverse=True)
+        base_index = hop1_paths.index(base) + 1  # menu position (hop-1 options render first)
         for _, pred2 in scored[:CHAINS_PER_BASE]:
             for dir2 in dict.fromkeys(directions[pred2]):
                 targets = set()
@@ -228,6 +236,7 @@ def build_chain_candidates(kb, graph, starts, hop1_paths, hop2_names):
                         "also": [],
                         "member_quals": member_quals,
                         "chain_base": {"predicate": base["predicate"], "direction": base["direction"]},
+                        "base_index": base_index,
                         "chain_label": f"{display_relation(base['predicate'])} → {display_relation(pred2)}",
                     }
                 )
@@ -254,6 +263,7 @@ def build_intersection_candidates(menu_paths, max_added: int = INTERSECTIONS_ADD
             x = a & b
             if not x or x == a or x == b:
                 continue
+            src_indices = (i + 1, j + 1)  # menu positions of the two parents
             quals = {}
             for src in (pa, pb):
                 for m, q in (src.get("member_quals") or {}).items():
@@ -270,11 +280,12 @@ def build_intersection_candidates(menu_paths, max_added: int = INTERSECTIONS_ADD
                     "targets": sorted(x),
                     "also": [],
                     "member_quals": quals,
-                    "chain_label": f"both: {la} AND {lb}",
+                    "chain_label": f"both option {src_indices[0]} AND option {src_indices[1]} ({la} ∩ {lb})",
                     "intersection_of": [
                         {"predicate": pa["predicate"], "direction": pa["direction"]},
                         {"predicate": pb["predicate"], "direction": pb["direction"]},
                     ],
+                    "src_indices": src_indices,
                 }
             )
     out.sort(key=lambda p: len(p["targets"]))
@@ -532,8 +543,13 @@ def path_block(kb, graph, path, question_types, label_collides: bool = False, to
     type_str = f" [type: {', '.join(t for t, _ in type_counts.most_common(2))}]" if type_counts else ""
     if path.get("chain_label"):
         label = path["chain_label"]
-        if path["direction"] == "backward":
+        if path["direction"] == "backward" and not path.get("src_indices"):
             label += " (reversed)"
+        if path.get("base_index"):
+            # The overshoot signature: the model picks an extension of a base
+            # whose answers were already right, because nothing showed the
+            # options are RELATED. Make the structure visible.
+            label += f" — a property of option {path['base_index']}'s answers"
     else:
         label = display_relation(path["predicate"])
         if path["direction"] == "backward":
@@ -549,6 +565,39 @@ def path_block(kb, graph, path, question_types, label_collides: bool = False, to
 
 def f1(p: float, r: float) -> float:
     return 2 * p * r / (p + r) if p + r else 0.0
+
+
+def structural_neighbour(paths, chosen):
+    """The alternative most confusable with the chosen option, known from
+    STRUCTURE alone: a chain's base (overshoot), the chosen base's extension
+    (undershoot), or an intersection's larger parent. None when the pick has
+    no structural neighbour — the verify seat only fires when the menu
+    geometry says the decision was genuinely close."""
+    if chosen.get("src_indices"):
+        i = chosen["src_indices"][0] - 1
+        return paths[i] if i < len(paths) else None
+    if chosen.get("base_index"):
+        i = chosen["base_index"] - 1
+        return paths[i] if i < len(paths) else None
+    for p in paths:
+        if p.get("base_index") and paths[p["base_index"] - 1] is chosen:
+            return p
+    return None
+
+
+def verify_block(kb, graph, path, question_types, max_members: int = 10) -> str:
+    """Richer evidence than the menu block: more members, plus the
+    qualifiers that vary — the binary comparison can afford it."""
+    members = order_members(kb, path["targets"], question_types)
+    quals = path.get("member_quals") or {}
+    dims = informative_qualifier_dims(members, quals)
+    label = path.get("chain_label") or display_relation(path["predicate"])
+    lines = [f"{label} — {len(members)} answer(s):"]
+    for m in members[:max_members]:
+        lines.append("   " + member_block(kb, graph, m, quals.get(m, {}), dims))
+    if len(members) > max_members:
+        lines.append(f"   ... and {len(members) - max_members} more")
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -575,6 +624,13 @@ def main() -> None:
         action="store_true",
         help="Enable qwen3 thinking mode at the SELECTION seat only (cache-keyed separately). "
         "A/B lever: the pick is a 14-way decision currently made in one token.",
+    )
+    parser.add_argument(
+        "--verify-final",
+        action="store_true",
+        help="Binary verification call between the selected query and its STRUCTURAL "
+        "neighbour (chain vs its base / intersection vs parent), each shown with full "
+        "evidence. Fires only when menu geometry says the pick was close; never on 1-hop menus.",
     )
     args = parser.parse_args()
     intent_model = args.intent_model or args.model
@@ -694,6 +750,27 @@ def main() -> None:
                         row["selection_error"] = selection["error"][:160]
                     chosen = paths[0] if paths else None  # channel floor
                     row["fallback"] = True
+                if args.verify_final and chosen is not None and not row["fallback"]:
+                    rival = structural_neighbour(paths, chosen)
+                    if rival is not None:
+                        verdict = verify_query_choice(
+                            question,
+                            start_name,
+                            verify_block(kb, graph, chosen, question_types),
+                            verify_block(kb, graph, rival, question_types),
+                            model=selector_model,
+                        )
+                        usage["calls"] += 1
+                        usage["prompt_tokens"] += verdict["prompt_tokens"]
+                        usage["completion_tokens"] += verdict["completion_tokens"]
+                        if not verdict["raw_response"] and not verdict["error"]:
+                            stats["empty_completion"] += 1
+                        stats["verify_calls"] += 1
+                        if verdict["pick"] == 1:
+                            chosen = rival
+                            stats["verify_switched"] += 1
+                            row["verify_switched"] = True
+
                 if chosen is not None and chosen.get("chain_label"):
                     row["chained"] = True
                     stats["chained"] += 1
@@ -777,6 +854,8 @@ def main() -> None:
         "ordinal_applied": stats["ordinal_applied"],
         "chained": stats["chained"],
         "chain_abstained": stats["chain_abstained"],
+        "verify_calls": stats["verify_calls"],
+        "verify_switched": stats["verify_switched"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "selection_errors": stats["selection_error"],
