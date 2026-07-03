@@ -42,6 +42,7 @@ from rc_mex.diag_relation_description_eval import relation_similarity
 from rc_mex.diag_selection_quality_eval import clean_relation
 from rc_mex.micro_agents import (
     DEFAULT_MODEL,
+    describe_relation_chain,
     describe_target_relation,
     probe_llm_endpoint,
     select_query_path,
@@ -61,6 +62,7 @@ DISTINCT_OPTIONS = 10
 EXAMPLES_PER_OPTION = 3
 REFINE_MIN_SET = 2
 REFINE_MAX_SET = 12
+HOP2_FANOUT_CAP = 300  # don't expand a second hop from a degenerate hop-1 set
 JUNK_PREDICATE_MARKERS = (
     "freebase.valuenotation",
     "common.image",
@@ -430,6 +432,15 @@ def main() -> None:
     parser.add_argument("--intent-model", default=None, help="Model for call 1 (defaults to --model).")
     parser.add_argument("--selector-model", default=None, help="Model for call 2 (defaults to --model).")
     parser.add_argument("--refiner-model", default=None, help="Model for the member-refinement call (defaults to --model).")
+    parser.add_argument(
+        "--max-hops",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="2 enables the chain extension (CWQ): intent may sketch a second property; "
+        "after hop-1 selection it is grounded on the chosen target set and selected in a "
+        "second bounded call. 1 = exact WebQSP behavior, caches untouched.",
+    )
     args = parser.parse_args()
     intent_model = args.intent_model or args.model
     selector_model = args.selector_model or args.model
@@ -477,15 +488,21 @@ def main() -> None:
             "predicted": [],
         }
         if starts:
-            described = describe_target_relation(question, start_name, model=intent_model)
+            if args.max_hops >= 2:
+                described = describe_relation_chain(question, start_name, model=intent_model)
+            else:
+                described = describe_target_relation(question, start_name, model=intent_model)
             usage["calls"] += 1
             usage["prompt_tokens"] += described["prompt_tokens"]
             usage["completion_tokens"] += described["completion_tokens"]
             if not described["names"] and not described["error"]:
                 stats["empty_completion"] += 1
+            hop2_names = described.get("names_2") or []
             question_types = question_type_evidence(kb, question)
             paths = build_candidate_paths(kb, graph, starts, question, described["names"])
             row["described_names"] = described["names"]
+            if hop2_names:
+                row["described_names_2"] = hop2_names
             row["question_types"] = question_types
             row["candidates"] = [
                 {"predicate": p["predicate"], "direction": p["direction"], "size": len(p["targets"])}
@@ -526,6 +543,66 @@ def main() -> None:
                         row["selection_error"] = selection["error"][:160]
                     chosen = paths[0] if paths else None  # channel floor
                     row["fallback"] = True
+                # Chain extension (CWQ): the intent sketched a second
+                # property. Ground it on the CHOSEN target set's frontier and
+                # select again — the same bounded micro-decision, one level
+                # deeper. Abstain (0) keeps the hop-1 answer: the chain is an
+                # offer, never forced.
+                if (
+                    args.max_hops >= 2
+                    and hop2_names
+                    and chosen is not None
+                    and len(chosen["targets"]) <= HOP2_FANOUT_CAP
+                ):
+                    starts2 = set(chosen["targets"])
+                    paths2 = []
+                    for p2 in build_candidate_paths(kb, graph, starts2, question, hop2_names):
+                        final = [t for t in p2["targets"] if t not in starts]
+                        if not final or set(final) == starts2:
+                            continue
+                        p2["targets"] = final
+                        paths2.append(p2)
+                    if paths2:
+                        hop1_label = display_relation(chosen["predicate"])
+                        pred_counts2 = Counter(p["predicate"] for p in paths2)
+                        blocks2 = [
+                            path_block(
+                                kb,
+                                graph,
+                                p,
+                                question_types,
+                                label_collides=pred_counts2[p["predicate"]] > 1,
+                                topic_name=hop1_label,
+                            )
+                            for p in paths2
+                        ]
+                        selection2 = select_query_path(
+                            question,
+                            f"the {hop1_label} of {start_name}",
+                            blocks2,
+                            model=selector_model,
+                        )
+                        usage["calls"] += 1
+                        usage["prompt_tokens"] += selection2["prompt_tokens"]
+                        usage["completion_tokens"] += selection2["completion_tokens"]
+                        if not selection2["raw_response"] and not selection2["error"]:
+                            stats["empty_completion"] += 1
+                        row["candidates_hop2"] = [
+                            {"predicate": p["predicate"], "direction": p["direction"], "size": len(p["targets"])}
+                            for p in paths2
+                        ]
+                        if selection2["pick"] is not None:
+                            row["selected_hop1"] = {
+                                "predicate": chosen["predicate"],
+                                "direction": chosen["direction"],
+                                "readable": hop1_label,
+                            }
+                            chosen = paths2[selection2["pick"]]
+                            row["chained"] = True
+                            stats["chained"] += 1
+                        else:
+                            stats["chain_abstained"] += 1
+
                 if chosen is not None:
 
                     def live_member_call(members, blocks):
@@ -602,6 +679,8 @@ def main() -> None:
         "refine_whole_set": stats["refine_whole_set"],
         "scope_filtered": stats["scope_filtered"],
         "ordinal_applied": stats["ordinal_applied"],
+        "chained": stats["chained"],
+        "chain_abstained": stats["chain_abstained"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "selection_errors": stats["selection_error"],

@@ -542,6 +542,51 @@ Question: "{question}"
 Name the property of "{start}" that gives the answer. Name the property itself, not the answer. Reply with 2 or 3 alternative short property names, comma-separated, most likely first. Example — for "where was he born?": place of birth, birthplace, hometown."""
 
 
+RELATION_CHAIN_PROMPT_VERSION = "relation_chain_v1"
+RELATION_CHAIN_PROMPT_TEMPLATE = """A question is answered by following one or two properties from the entity "{start}" in a knowledge base.
+
+Question: "{question}"
+
+If one property of "{start}" gives the answer directly, reply with ONE line: 2 or 3 alternative short names for that property, comma-separated.
+If an intermediate step is needed (a property of "{start}", then a property of that result), reply with TWO lines: line 1 names the first property, line 2 names the second.
+Name the properties themselves, not the answer. Example — for "in what city was his wife born?":
+spouse, wife
+place of birth, birthplace"""
+
+
+def describe_relation_chain(
+    question: str,
+    start_entity_name: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Chain-sketch intent (CWQ): like describe_target_relation, but the LLM
+    may name a second property when the answer needs an intermediate hop.
+    Separate prompt version so 1-hop runs and their caches are untouched.
+    Returns names (hop 1) and names_2 (hop 2, empty when direct)."""
+    prompt = RELATION_CHAIN_PROMPT_TEMPLATE.format(start=start_entity_name, question=question)
+    result = call_local_llm(prompt, RELATION_CHAIN_PROMPT_VERSION, model=model, timeout=120.0)
+
+    def parse_line(line: str) -> list[str]:
+        boilerplate = re.search(r"\bis[:\s]+(.+)$", line)
+        if boilerplate and len(line.split()) > 6:
+            line = boilerplate.group(1)
+        names = [n.strip().strip('".') for n in line.split(",")]
+        # a property NAME is short; prose ("I couldn't find any direct
+        # property") is a failed completion, not a name
+        return [n for n in names if n and len(n.split()) <= 4][:3]
+
+    lines = [l for l in (result["text"] or "").strip().splitlines() if l.strip()][:2]
+    names = parse_line(lines[0]) if lines else []
+    names_2 = parse_line(lines[1]) if len(lines) > 1 else []
+    return {
+        "names": names,
+        "names_2": names_2,
+        "error": result["error"],
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def describe_target_relation(
     question: str,
     start_entity_name: str,
