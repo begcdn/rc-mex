@@ -160,12 +160,19 @@ def call_local_llm(
     timeout: float = 90.0,
     num_predict: int = 256,
     use_cache: bool = True,
+    think: bool = False,
 ) -> dict[str, Any]:
     """Cached, deterministic single-shot generation.
 
     Returns {text, from_cache, error, prompt_tokens, completion_tokens}.
     Token counts come from the serving backend and are cached alongside the
-    text (older cache entries are plain strings with unknown token counts)."""
+    text (older cache entries are plain strings with unknown token counts).
+    think=True lets a hybrid-reasoning model (qwen3) reason before answering;
+    the think block is stripped, and the cache key carries a +think suffix so
+    the two modes never collide."""
+    if think:
+        prompt_version = f"{prompt_version}+think"
+        num_predict = max(num_predict, 1024)
     cache = _load_cache()
     key = _cache_key(prompt_version, model, prompt)
     if use_cache and key in cache:
@@ -188,8 +195,8 @@ def call_local_llm(
             "max_tokens": num_predict,
         }
         if "qwen" in model.lower():
-            # vLLM-style switch to disable qwen3 thinking mode.
-            request_body["chat_template_kwargs"] = {"enable_thinking": False}
+            # vLLM-style switch for qwen3 thinking mode.
+            request_body["chat_template_kwargs"] = {"enable_thinking": think}
     else:
         request_body = {
             "model": model,
@@ -198,8 +205,9 @@ def call_local_llm(
             "options": {"temperature": 0, "seed": 7, "num_predict": num_predict},
         }
         if "qwen" in model.lower():
-            # Disable qwen3 thinking mode; strict verifiers expect the bare answer.
-            request_body["think"] = False
+            # qwen3 thinking mode off by default; strict verifiers expect the
+            # bare answer. think=True enables it (block stripped on read).
+            request_body["think"] = think
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
@@ -657,7 +665,7 @@ QUERY_PATH_SELECTOR_STOP_VERSION = "query_path_selector_stop_v1"
 # Mixed-depth menus (CWQ): options may be two-step chains; separate intro
 # line and version, 1-hop menus keep the original prompt byte-identical.
 QUERY_PATH_SELECTOR_MIXED_VERSION = "query_path_selector_mixed_v1"
-QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", or a two-step chain "property → property of its result".
+QUERY_PATH_SELECTOR_MIXED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base. A query is a property of "{start}", a two-step chain "property → property of its result", or "both: A AND B" (answers satisfying two conditions at once).
 
 Question: "{question}"
 
@@ -675,6 +683,7 @@ def select_query_path(
     model: str = DEFAULT_MODEL,
     stop_line: str | None = None,
     mixed: bool = False,
+    think: bool = False,
 ) -> dict[str, Any]:
     """Query-selection core: pick ONE property (not one entity) whose target
     set answers the question, with an explicit abstain option (0). Returns
@@ -699,7 +708,7 @@ def select_query_path(
         version = QUERY_PATH_SELECTOR_STOP_VERSION
     else:
         version = QUERY_PATH_SELECTOR_PROMPT_VERSION
-    result = call_local_llm(prompt, version, model=model, timeout=180.0)
+    result = call_local_llm(prompt, version, model=model, timeout=300.0 if think else 180.0, think=think)
     if result["error"]:
         return {"pick": None, "abstain": False, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
     numbers = re.findall(r"\d+", result["text"])

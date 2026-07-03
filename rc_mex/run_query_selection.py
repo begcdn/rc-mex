@@ -234,6 +234,53 @@ def build_chain_candidates(kb, graph, starts, hop1_paths, hop2_names):
     return out
 
 
+INTERSECTIONS_ADDED = 3
+
+
+def build_intersection_candidates(menu_paths, max_added: int = INTERSECTIONS_ADDED):
+    """Conjunction queries: pairwise intersections of menu option sets.
+
+    54% of answerable CWQ has two topic entities whose constraints intersect
+    ('team owned by Jerry Jones' AND 'coached by X'); measured oracle F1
+    +0.027 on dev300. Coverage never changes (the parts are already on the
+    menu) — this sharpens the SET. Smallest intersections first: a
+    conjunction narrows."""
+    sets = [(set(p["targets"]), p) for p in menu_paths]
+    out = []
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            a, pa = sets[i]
+            b, pb = sets[j]
+            x = a & b
+            if not x or x == a or x == b:
+                continue
+            quals = {}
+            for src in (pa, pb):
+                for m, q in (src.get("member_quals") or {}).items():
+                    if m in x:
+                        for k, v in q.items():
+                            slot = quals.setdefault(m, {}).setdefault(k, [])
+                            slot.extend(vv for vv in v if vv not in slot)
+            la = pa.get("chain_label") or display_relation(pa["predicate"])
+            lb = pb.get("chain_label") or display_relation(pb["predicate"])
+            out.append(
+                {
+                    "predicate": pa["predicate"],
+                    "direction": pa["direction"],
+                    "targets": sorted(x),
+                    "also": [],
+                    "member_quals": quals,
+                    "chain_label": f"both: {la} AND {lb}",
+                    "intersection_of": [
+                        {"predicate": pa["predicate"], "direction": pa["direction"]},
+                        {"predicate": pb["predicate"], "direction": pb["direction"]},
+                    ],
+                }
+            )
+    out.sort(key=lambda p: len(p["targets"]))
+    return out[:max_added]
+
+
 def merge_mixed_menu(hop1_paths, chain_paths, cap: int = MIXED_MENU_CAP):
     """One menu of finished queries: hop-1 options keep their order (and
     their selection-cache stability); chains join after, deduped against
@@ -523,6 +570,12 @@ def main() -> None:
         "after hop-1 selection it is grounded on the chosen target set and selected in a "
         "second bounded call. 1 = exact WebQSP behavior, caches untouched.",
     )
+    parser.add_argument(
+        "--think-select",
+        action="store_true",
+        help="Enable qwen3 thinking mode at the SELECTION seat only (cache-keyed separately). "
+        "A/B lever: the pick is a 14-way decision currently made in one token.",
+    )
     args = parser.parse_args()
     intent_model = args.intent_model or args.model
     selector_model = args.selector_model or args.model
@@ -583,11 +636,14 @@ def main() -> None:
             question_types = question_type_evidence(kb, question)
             paths = build_candidate_paths(kb, graph, starts, question, described["names"])
             has_chains = False
-            if args.max_hops >= 2 and hop2_names and paths:
+            if args.max_hops >= 2 and paths:
                 chains = build_chain_candidates(kb, graph, starts, paths, hop2_names)
                 if chains:
                     paths = merge_mixed_menu(paths, chains)
-                    has_chains = any(p.get("chain_label") for p in paths)
+                intersections = build_intersection_candidates(paths)
+                if intersections:
+                    paths = merge_mixed_menu(paths, intersections, cap=MIXED_MENU_CAP + INTERSECTIONS_ADDED)
+                has_chains = any(p.get("chain_label") for p in paths)
             row["described_names"] = described["names"]
             if hop2_names:
                 row["described_names_2"] = hop2_names
@@ -619,7 +675,9 @@ def main() -> None:
                     )
                     for p in paths
                 ]
-                selection = select_query_path(question, start_name, blocks, model=selector_model, mixed=has_chains)
+                selection = select_query_path(
+                    question, start_name, blocks, model=selector_model, mixed=has_chains, think=args.think_select
+                )
                 usage["calls"] += 1
                 usage["prompt_tokens"] += selection["prompt_tokens"]
                 usage["completion_tokens"] += selection["completion_tokens"]
