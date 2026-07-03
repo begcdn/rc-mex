@@ -696,13 +696,13 @@ def main() -> None:
     parser.add_argument(
         "--audit-extend",
         action="store_true",
-        help="Propose→audit→revise loop: after refinement, a narrow TYPE check on the "
-        "proposed answers (ACCEPT / MISSING:<property>); on MISSING, one extension round "
-        "executed from the chosen set's frontier, grounded by the gap phrase + question, "
-        "then a round-2 selection + refinement. Measured motivation (cwq_dev300f): 49/96 "
-        "answerable misses predicted the correct INTERMEDIATE entity; the gold extension "
-        "is embedding-visible in a top-8 mini-menu for 41. An extension only replaces the "
-        "answer when round-2 affirmatively picks — ACCEPT or any failure keeps v2 behavior.",
+        help="Propose→audit→revise loop, boolean form: after refinement, a strictly "
+        "True/False TYPE check on the proposed answers; on False, ONE extension round "
+        "executed from the chosen set's frontier (question-grounded, top-8) with a "
+        "FORCED round-2 pick — the condition decides, the body commits, no second veto. "
+        "Single iteration by design. Motivation: 49/96 cwq_dev300f answerable misses "
+        "predicted the correct INTERMEDIATE entity; v1 (gap-phrase audit + abstainable "
+        "round 2) measured +4 with 108 over-fires and 55 deadlocked revisions on dev300g.",
     )
     parser.add_argument(
         "--verify-final",
@@ -918,14 +918,18 @@ def main() -> None:
                         stats["audit_calls"] += 1
                         if audit["verdict"] == "missing":
                             stats["audit_missing"] += 1
-                            row["audit_gap"] = audit["gap"]
-                            ext_paths = build_extension_menu(kb, starts, chosen, question, audit["gap"])
+                            row["audit_missing"] = True
+                            ext_paths = build_extension_menu(kb, starts, chosen, question, "")
                             if ext_paths:
                                 ext_blocks = [
                                     path_block(kb, graph, p, question_types, topic_name=start_name)
                                     for p in ext_paths
                                 ]
-                                round2 = select_query_path(
+                                # The condition already decided to revise; the
+                                # body must commit (no second veto). Measured on
+                                # cwq_dev300g: 55/62 revision rounds deadlocked
+                                # when round 2 could abstain.
+                                round2 = select_query_path_forced(
                                     question,
                                     f"the results of \"{chosen.get('chain_label') or display_relation(chosen['predicate'])}\"",
                                     ext_blocks,

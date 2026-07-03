@@ -829,7 +829,7 @@ def verify_query_choice(
     }
 
 
-ANSWER_AUDIT_VERSION = "answer_audit_v1"
+ANSWER_AUDIT_VERSION = "answer_audit_bool_v1"
 ANSWER_AUDIT_TEMPLATE = """A question was answered by a knowledge-base query. Check only ONE thing: are the returned results the KIND of thing the question asks for?
 
 Question: "{question}"
@@ -837,12 +837,9 @@ Question: "{question}"
 Query used: {label}
 Results: {members}
 
-If the results are the kind of thing the question asks for, reply exactly:
-ACCEPT
-If they are the right objects but the question actually asks for some property OF them (for example their currency, location, date, or team), reply:
-MISSING: <one to three words naming that property>
+Examples of False: the question asks for a currency and the results are countries; the question asks for a year and the results are teams.
 
-Reply with one line."""
+Reply with exactly one word: True or False."""
 
 
 def audit_answer(
@@ -851,33 +848,32 @@ def audit_answer(
     member_names: list[str],
     model: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
-    """Answer-audit seat: a narrow TYPE check on the proposed answer set,
-    grounded in the actual retrieved names. Motivation (cwq_dev300f
-    dissection): 49 of 96 answerable misses predicted the correct
-    INTERMEDIATE entity ('Ukraine' for a currency question, 'Michael Jordan'
-    for a draft question) — a mismatch an 8b model can see, but the one-way
-    pipeline never asks. MISSING's gap phrase becomes the grounding query for
-    the extension round — post-evidence, replacing the fragile intent
-    second-name channel. Any unparseable reply degrades to ACCEPT: the audit
-    may only trigger a revision, never discard an answer by itself."""
+    """Answer-audit seat: a strictly BOOLEAN type check on the proposed
+    answer set, grounded in the actual retrieved names. Motivation
+    (cwq_dev300f dissection): 49 of 96 answerable misses predicted the
+    correct INTERMEDIATE entity ('Ukraine' for a currency question) — a
+    mismatch the pipeline never looked for. v1 asked for MISSING:<property>;
+    measured on cwq_dev300g it over-fired 108 vs the ~49 true pool (naming a
+    property invites believing one is absent — generation begets
+    affirmation) and its gap phrases pointed at the wrong side of the
+    question ('political party' when the ask was the party's CREATOR).
+    Boolean discrimination replaces gap generation; extension grounding is
+    question-only (measured 41/49 top-6 without the gap channel). Any
+    unparseable reply degrades to True: the audit may only trigger a
+    revision, never discard an answer by itself."""
     if not member_names:
-        return {"verdict": "accept", "gap": "", "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+        return {"verdict": "accept", "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
     prompt = ANSWER_AUDIT_TEMPLATE.format(
         question=question, label=option_label, members="; ".join(member_names)
     )
     result = call_local_llm(prompt, ANSWER_AUDIT_VERSION, model=model, timeout=120.0)
     if result["error"]:
-        return {"verdict": "accept", "gap": "", "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+        return {"verdict": "accept", "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
     text = result["text"].strip()
-    verdict, gap = "accept", ""
-    m = re.search(r"MISSING\s*:?\s*(.+)", text, re.IGNORECASE)
-    if m and not text.upper().startswith("ACCEPT"):
-        candidate = " ".join(m.group(1).split()[:6]).strip(" .\"'")
-        if candidate:
-            verdict, gap = "missing", candidate
+    word = re.search(r"\b(true|false)\b", text, re.IGNORECASE)
+    verdict = "missing" if word and word.group(1).lower() == "false" else "accept"
     return {
         "verdict": verdict,
-        "gap": gap,
         "raw_response": text[:120],
         "error": "",
         "prompt_tokens": int(result.get("prompt_tokens", 0)),
