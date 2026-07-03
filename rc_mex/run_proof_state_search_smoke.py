@@ -2361,8 +2361,12 @@ def get_semantic_relation_model() -> Any | None:
         return _SEMANTIC_RELATION_MODEL
     _SEMANTIC_RELATION_MODEL_ATTEMPTED = True
     try:
+        import os
+
         from sentence_transformers import SentenceTransformer  # type: ignore
-        _SEMANTIC_RELATION_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        _SEMANTIC_RELATION_MODEL = SentenceTransformer(
+            os.environ.get("RC_MEX_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        )
     except Exception:
         _SEMANTIC_RELATION_MODEL = None
     return _SEMANTIC_RELATION_MODEL
