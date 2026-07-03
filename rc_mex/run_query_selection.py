@@ -185,33 +185,84 @@ def display_relation(predicate: str) -> str:
 
 DATE_PATTERN = __import__("re").compile(r"\b(1[6-9]\d\d|20\d\d)(?:-\d\d)?(?:-\d\d)?\b")
 ORDINAL_MIN = __import__("re").compile(r"\b(first|earliest|oldest|original|debut)\b", __import__("re").I)
-ORDINAL_MAX = __import__("re").compile(r"\b(last|latest|newest|most recent|final|current)\b", __import__("re").I)
+ORDINAL_MAX = __import__("re").compile(r"\b(last|latest|newest|most recent|final|current|now|today)\b", __import__("re").I)
 SCOPE_STOPWORDS = {"the", "a", "an", "of", "in", "on", "at", "for", "and", "or", "to", "with"}
 
 
-def qualifier_matches_question(question_norm: str, quals: dict) -> bool:
-    """Zero-LLM scope test: does any qualifier VALUE of this member appear in
-    the question ('in star wars' vs film qualifier 'Star Wars Episode I...')?
-    Full-substring or >=2 significant-word overlap."""
+def value_match_strength(question_norm: str, value: str) -> tuple[int, int]:
+    """How strongly a qualifier VALUE matches the question. Tiered so that a
+    more specific constraint wins ('Superman Returns' over 'Superman'):
+      (3, len)  full value appears in the question
+      (2, n)    >=2 significant words overlap
+      (1, len)  one significant word (>=4 chars) overlaps
+      (0, 0)    no match"""
     q_words = set(question_norm.split())
-    for values in quals.values():
-        for value in values:
-            vn = normalize_text(str(value))
-            if len(vn) >= 4 and vn in question_norm:
-                return True
-            vw = [w for w in vn.split() if w not in SCOPE_STOPWORDS and len(w) > 2]
-            if vw and sum(1 for w in vw if w in q_words) >= min(2, len(vw)):
-                return True
-    return False
+    vn = normalize_text(str(value))
+    if len(vn) >= 4 and vn in question_norm:
+        return (3, len(vn))
+    vw = [w for w in vn.split() if w not in SCOPE_STOPWORDS and len(w) > 2]
+    overlap = [w for w in vw if w in q_words]
+    if len(vw) > 1 and len(overlap) >= 2:
+        return (2, len(overlap))
+    if overlap and max(len(w) for w in overlap) >= 4:
+        return (1, max(len(w) for w in overlap))
+    return (0, 0)
 
 
-def member_date(quals: dict, latest: bool) -> str | None:
+def scope_members(question_norm: str, members: list[str], member_quals: dict) -> list[str] | None:
+    """Zero-LLM scope filter: keep the members whose qualifiers best satisfy a
+    constraint mentioned in the question ('in superman returns').
+
+    Two rules make this discriminating rather than decorative:
+    - A qualifier DIMENSION that matches the question for every member is a
+      topic echo (arriving via the character makes character=X match on all
+      members) — it carries zero information and is ignored.
+    - Among matching members, only those at the MAXIMUM match strength stay
+      ('Superman Returns' full-value match beats a bare 'Superman' overlap).
+
+    Returns the scoped subset, or None when no informative dimension
+    discriminates (caller keeps the full set)."""
+    if len(members) <= 1 or not member_quals:
+        return None
+    strength: dict[str, tuple[int, int]] = {m: (0, 0) for m in members}
+    dims = {d for m in members for d in member_quals.get(m, {})}
+    for dim in dims:
+        per_member = {}
+        for m in members:
+            best = (0, 0)
+            for value in member_quals.get(m, {}).get(dim, []):
+                if normalize_text(str(value)) == m:
+                    continue  # self-reference (a CVT leg naming the member) is identity, not constraint evidence
+                best = max(best, value_match_strength(question_norm, value))
+            per_member[m] = best
+        matched = [m for m, s in per_member.items() if s > (0, 0)]
+        if not matched or len(matched) == len(members):
+            continue  # dimension matches nobody or everybody: uninformative
+        for m in members:
+            strength[m] = max(strength[m], per_member[m])
+    top = max(strength.values())
+    if top == (0, 0):
+        return None
+    scoped = [m for m in members if strength[m] == top]
+    if scoped and len(scoped) < len(members):
+        return scoped
+    return None
+
+
+def member_date(quals: dict, latest: bool, member_name: str = "") -> str | None:
+    """Best date evidence for a member: qualifier values first; failing that,
+    the member's own name — event entities carry their date there ('2014
+    Stanley Cup Finals'), and direct edges have no qualifiers at all."""
     dates = []
     for values in quals.values():
         for value in values:
             found = DATE_PATTERN.search(str(value))
             if found:
                 dates.append(found.group(0))
+    if not dates and member_name:
+        found = DATE_PATTERN.search(member_name)
+        if found:
+            dates.append(found.group(0))
     if not dates:
         return None
     return max(dates) if latest else min(dates)
@@ -222,15 +273,128 @@ def order_members(kb, targets: list[str], question_types: list[str]) -> list[str
     return sorted(targets, key=lambda t: (not (set(entity_type_names(kb, t)) & qtypes), t))
 
 
-def path_block(kb, graph, path, question_types) -> str:
+def member_block(kb, graph, member: str, quals: dict, informative_dims: set[str]) -> str:
+    """One member line for the refinement micro-call: name, types, and the
+    qualifiers that vary across the set (marriage vs civil union, the film a
+    performance belongs to) — the constraint evidence the picker needs."""
+    parts = [graph.entity_name(member)]
+    types = entity_type_names(kb, member)
+    if types:
+        parts.append(f"[{', '.join(types[:2])}]")
+    shown = []
+    for dim in sorted(informative_dims):
+        values = quals.get(dim, [])
+        if values:
+            shown.append(f"{dim}: {', '.join(str(v) for v in values[:3])}")
+        if len(shown) >= 2:
+            break
+    if shown:
+        parts.append(f"({'; '.join(shown)})")
+    return " ".join(parts)
+
+
+def informative_qualifier_dims(members: list[str], member_quals: dict) -> set[str]:
+    """Dimensions whose value sets VARY across members — the only ones that
+    can justify picking one member over another."""
+    dims = {d for m in members for d in member_quals.get(m, {})}
+    out = set()
+    for dim in dims:
+        seen = {tuple(sorted(map(str, member_quals.get(m, {}).get(dim, [])))) for m in members}
+        if len(seen) > 1:
+            out.add(dim)
+    return out
+
+
+def name_evidence(question_norm: str, topic_norms: list[str], member_name: str) -> int:
+    """Question words that appear in the member's NAME but belong to neither
+    the topic entity nor the stopword list ('high school' for 'Ringgold High
+    School'). This is the question naming the answer type/shape; topic words
+    are excluded because sharing the topic's name (a spouse's surname) is an
+    echo, not evidence."""
+    topic_words = {w for t in topic_norms for w in t.split()}
+    mn_words = set(normalize_text(member_name).split())
+    matched = sum(
+        1
+        for w in question_norm.split()
+        if w in mn_words and w not in topic_words and w not in SCOPE_STOPWORDS and len(w) > 2
+    )
+    # one shared word is coincidence-prone ('world' promoting 'The World' for
+    # a Dubai question); a type phrase like 'high school' needs two
+    return matched if matched >= 2 else 0
+
+
+def refine_members(kb, graph, question: str, question_types: list[str], chosen: dict, member_call=None, topic_names: list[str] | None = None):
+    """The deterministic refinement chain: name-evidence ordering -> scope ->
+    ordinal -> member micro-call. member_call(members, blocks) is injected so
+    the live runner and the offline replay harness exercise the same code.
+
+    Ordering note: name evidence is applied HERE and not in order_members —
+    the selection menus embed the first members as examples, and reordering
+    them would perturb every selection prompt (and invalidate its cache).
+    Returns (members, flags)."""
+    flags = {"scope": False, "ordinal": False, "refined": False, "whole_set": False}
+    members = order_members(kb, chosen["targets"], question_types)
+    member_quals = chosen.get("member_quals") or {}
+    question_norm = normalize_text(question)
+    topic_norms = [normalize_text(t) for t in (topic_names or []) if str(t).strip()]
+    if len(members) > 1:
+        # stable: only name evidence differentiates; ties keep type/name order
+        members = sorted(
+            members,
+            key=lambda m: -name_evidence(question_norm, topic_norms, graph.entity_name(m)),
+        )
+
+    # (1) SCOPE: constraint filtering on informative qualifier dimensions.
+    # MUTATES the answer set by design — the scoped subset IS the answer.
+    scoped = scope_members(question_norm, members, member_quals)
+    if scoped:
+        members = scoped
+        flags["scope"] = True
+
+    # (2) ORDINAL: first/last questions — argmin/argmax over date evidence
+    # (qualifiers, else the member names themselves); reorders top-1 only.
+    if len(members) > 1:
+        latest = bool(ORDINAL_MAX.search(question))
+        if latest or ORDINAL_MIN.search(question):
+            dated = [(member_date(member_quals.get(m, {}), latest, graph.entity_name(m)), m) for m in members]
+            dated = [(d, m) for d, m in dated if d]
+            if len(dated) >= 2:
+                best = max(dated)[1] if latest else min(dated)[1]
+                members = [best] + [m for m in members if m != best]
+                flags["ordinal"] = True
+
+    # (3) member micro-call for what the operators didn't settle.
+    # member_call returns a member id (promote to top-1), "ALL" (the set is
+    # the answer), or None (error/no signal — leave untouched).
+    if not flags["ordinal"] and member_call is not None and REFINE_MIN_SET <= len(members) <= REFINE_MAX_SET:
+        show_dims = informative_qualifier_dims(members, member_quals)
+        blocks = [member_block(kb, graph, m, member_quals.get(m, {}), show_dims) for m in members]
+        outcome = member_call(members, blocks)
+        if outcome == "ALL":
+            flags["whole_set"] = True
+        elif outcome in members:
+            members = [outcome] + [m for m in members if m != outcome]
+            flags["refined"] = True
+    return members, flags
+
+
+def path_block(kb, graph, path, question_types, label_collides: bool = False, topic_name: str = "") -> str:
     members = order_members(kb, path["targets"], question_types)
     examples = ", ".join(graph.entity_name(m) for m in members[:EXAMPLES_PER_OPTION])
     if len(members) > EXAMPLES_PER_OPTION:
         examples += ", ..."
     type_counts = Counter(t for m in members for t in entity_type_names(kb, m))
     type_str = f" [type: {', '.join(t for t, _ in type_counts.most_common(2))}]" if type_counts else ""
-    reversed_str = " (reversed)" if path["direction"] == "backward" else ""
-    return f"{display_relation(path['predicate'])}{reversed_str} — {len(members)} answer(s): {examples}{type_str}"
+    label = display_relation(path["predicate"])
+    if path["direction"] == "backward":
+        # When the same label appears in both directions on one menu, a bare
+        # "(reversed)" leaves the two options indistinguishable ("contains"
+        # vs "contains" for the Balkans). Spell the backward one out as
+        # "<label> <topic>": its answers <label> the topic entity.
+        if label_collides and topic_name:
+            label = f"{label} {topic_name}"
+        label += " (reversed)"
+    return f"{label} — {len(members)} answer(s): {examples}{type_str}"
 
 
 def f1(p: float, r: float) -> float:
@@ -309,7 +473,23 @@ def main() -> None:
                 for p in paths
             ]
             if paths:
-                blocks = [path_block(kb, graph, p, question_types) for p in paths]
+                # Only the same-predicate-both-directions pair is truly
+                # indistinguishable ("contains" vs "contains (reversed)" for
+                # a region). Label-level collisions are far broader (38% of
+                # menus) and rewording them all is an unvalidated
+                # perturbation; predicate-level is 16% and surgical.
+                pred_counts = Counter(p["predicate"] for p in paths)
+                blocks = [
+                    path_block(
+                        kb,
+                        graph,
+                        p,
+                        question_types,
+                        label_collides=pred_counts[p["predicate"]] > 1,
+                        topic_name=start_name,
+                    )
+                    for p in paths
+                ]
                 selection = select_query_path(question, start_name, blocks, model=selector_model)
                 usage["calls"] += 1
                 usage["prompt_tokens"] += selection["prompt_tokens"]
@@ -328,48 +508,13 @@ def main() -> None:
                     chosen = paths[0] if paths else None  # channel floor
                     row["fallback"] = True
                 if chosen is not None:
-                    members = order_members(kb, chosen["targets"], question_types)
-                    member_quals = chosen.get("member_quals") or {}
-                    question_norm = normalize_text(question)
-                    # Constraint refinement, algorithmic first.
-                    # (1) SCOPE: keep members whose qualifiers mention an
-                    # entity from the question ("in star wars"). This MUTATES
-                    # the answer set by design (the scoped subset IS the
-                    # answer); guarded: only applies to a non-empty strict
-                    # subset.
-                    if len(members) > 1 and member_quals:
-                        scoped = [m for m in members if qualifier_matches_question(question_norm, member_quals.get(m, {}))]
-                        if scoped and len(scoped) < len(members):
-                            members = scoped
-                            stats["scope_filtered"] += 1
-                            row["scope_filtered"] = True
-                    # (2) ORDINAL: first/last questions with dated qualifiers
-                    # — reorder top-1 to the argmin/argmax member (set kept).
-                    ordinal_applied = False
-                    if len(members) > 1:
-                        latest = bool(ORDINAL_MAX.search(question))
-                        if latest or ORDINAL_MIN.search(question):
-                            dated = [(member_date(member_quals.get(m, {}), latest), m) for m in members]
-                            dated = [(d, m) for d, m in dated if d]
-                            if len(dated) >= 2:
-                                best = max(dated)[1] if latest else min(dated)[1]
-                                members = [best] + [m for m in members if m != best]
-                                ordinal_applied = True
-                                stats["ordinal_applied"] += 1
-                                row["ordinal_applied"] = True
-                    # (3) member micro-call for what the operators didn't settle
-                    if not ordinal_applied and REFINE_MIN_SET <= len(members) <= REFINE_MAX_SET:
-                        member_blocks = []
-                        for m in members:
-                            types = entity_type_names(kb, m)
-                            member_blocks.append(
-                                graph.entity_name(m) + (f" [{', '.join(types[:2])}]" if types else "")
-                            )
+
+                    def live_member_call(members, blocks):
                         refinement = select_set_member(
                             question=question,
                             start_entity_name=start_name,
                             property_name=display_relation(chosen["predicate"]),
-                            member_blocks=member_blocks,
+                            member_blocks=blocks,
                             model=refiner_model,
                         )
                         usage["calls"] += 1
@@ -378,12 +523,29 @@ def main() -> None:
                         if not refinement["raw_response"] and not refinement["error"]:
                             stats["empty_completion"] += 1
                         if refinement["pick"] is not None:
-                            picked_member = members[refinement["pick"]]
-                            members = [picked_member] + [m for m in members if m != picked_member]
-                            stats["refined_top1"] += 1
-                        elif refinement["whole_set"]:
-                            stats["refine_whole_set"] += 1
-                        row["refined"] = refinement["pick"] is not None
+                            return members[refinement["pick"]]
+                        if refinement["whole_set"]:
+                            return "ALL"
+                        return None
+
+                    members, rflags = refine_members(
+                        kb,
+                        graph,
+                        question,
+                        question_types,
+                        chosen,
+                        member_call=live_member_call,
+                        topic_names=[graph.entity_name(s) for s in starts],
+                    )
+                    stats["scope_filtered"] += rflags["scope"]
+                    stats["ordinal_applied"] += rflags["ordinal"]
+                    stats["refined_top1"] += rflags["refined"]
+                    stats["refine_whole_set"] += rflags["whole_set"]
+                    if rflags["scope"]:
+                        row["scope_filtered"] = True
+                    if rflags["ordinal"]:
+                        row["ordinal_applied"] = True
+                    row["refined"] = rflags["refined"]
                     row["selected"] = {
                         "predicate": chosen["predicate"],
                         "direction": chosen["direction"],
