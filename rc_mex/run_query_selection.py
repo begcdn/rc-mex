@@ -46,6 +46,7 @@ from rc_mex.micro_agents import (
     describe_target_relation,
     probe_llm_endpoint,
     select_query_path,
+    select_query_path_forced,
     select_set_member,
     verify_query_choice,
 )
@@ -625,6 +626,13 @@ def main() -> None:
         "A/B lever: the pick is a 14-way decision currently made in one token.",
     )
     parser.add_argument(
+        "--recover-abstain",
+        action="store_true",
+        help="On selection abstain, re-ask the same menu with no escape hatch before the "
+        "blind channel-floor fallback. Measured motivation (cwq_dev300e): 22/30 abstains "
+        "ended as misses, 17 with gold ON the menu. Needs its own WebQSP A/B before use there.",
+    )
+    parser.add_argument(
         "--verify-final",
         action="store_true",
         help="Binary verification call between the selected query and its STRUCTURAL "
@@ -747,8 +755,24 @@ def main() -> None:
                     stats["selection_error"] += bool(selection["error"])
                     if selection["error"]:
                         row["selection_error"] = selection["error"][:160]
-                    chosen = paths[0] if paths else None  # channel floor
-                    row["fallback"] = True
+                    # Abstain recovery: re-ask the same menu with no escape
+                    # hatch before falling to the blind channel floor.
+                    if args.recover_abstain and selection["abstain"] and paths:
+                        forced = select_query_path_forced(
+                            question, start_name, blocks, model=selector_model, think=args.think_select
+                        )
+                        usage["calls"] += 1
+                        usage["prompt_tokens"] += forced["prompt_tokens"]
+                        usage["completion_tokens"] += forced["completion_tokens"]
+                        if not forced["raw_response"] and not forced["error"]:
+                            stats["empty_completion"] += 1
+                        if forced["pick"] is not None:
+                            chosen = paths[forced["pick"]]
+                            stats["abstain_recovered"] += 1
+                            row["abstain_recovered"] = True
+                    if chosen is None:
+                        chosen = paths[0] if paths else None  # channel floor
+                        row["fallback"] = True
                 if args.verify_final and chosen is not None and not row["fallback"]:
                     rival = structural_neighbour(paths, chosen)
                     if rival is not None:
@@ -855,6 +879,7 @@ def main() -> None:
         "chain_abstained": stats["chain_abstained"],
         "verify_calls": stats["verify_calls"],
         "verify_switched": stats["verify_switched"],
+        "abstain_recovered": stats["abstain_recovered"],
         "abstained": stats["abstained"],
         "fallbacks": stats["abstained"] + stats["selection_error"],
         "selection_errors": stats["selection_error"],

@@ -745,6 +745,50 @@ Values:
 Which value answers the question? Reply with only the number."""
 
 
+QUERY_PATH_FORCED_VERSION = "query_path_selector_forced_v1"
+QUERY_PATH_FORCED_TEMPLATE = """A question is answered by choosing ONE query on "{start}" in a knowledge base.
+
+Question: "{question}"
+
+Each numbered option is a query and the answer(s) it would give:
+{options}
+
+None of the options is a perfect match — choose the SINGLE BEST available one anyway. Reply with only the number."""
+
+
+def select_query_path_forced(
+    question: str,
+    start_entity_name: str,
+    option_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+    think: bool = False,
+) -> dict[str, Any]:
+    """Abstain-recovery seat: the same menu, no escape hatch. Fires only
+    after the primary selection abstained — measured on cwq_dev300e: 22 of
+    30 abstains ended as misses with gold ON the menu in 17, while the blind
+    channel-top fallback ignores every piece of evidence the menu shows."""
+    if not option_blocks:
+        return {"pick": None, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(option_blocks, start=1))
+    prompt = QUERY_PATH_FORCED_TEMPLATE.format(start=start_entity_name, question=question, options=numbered)
+    result = call_local_llm(prompt, QUERY_PATH_FORCED_VERSION, model=model, timeout=300.0 if think else 180.0, think=think)
+    if result["error"]:
+        return {"pick": None, "raw_response": "", "error": result["error"], "prompt_tokens": 0, "completion_tokens": 0}
+    numbers = re.findall(r"\d+", result["text"])
+    pick = None
+    if numbers:
+        first = int(numbers[0])
+        if 1 <= first <= len(option_blocks):
+            pick = first - 1
+    return {
+        "pick": pick,
+        "raw_response": result["text"][:80],
+        "error": "",
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 QUERY_VERIFY_PROMPT_VERSION = "query_verify_v1"
 QUERY_VERIFY_PROMPT_TEMPLATE = """A question was answered by choosing between two queries on "{start}" in a knowledge base. Decide which one is right.
 
