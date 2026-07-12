@@ -19,9 +19,11 @@ and ordering. A question activates only the relevant subset. KG-specific
 adapters are responsible for storage details such as Freebase CVTs or Wikidata
 qualifiers; those details do not belong in the question semantics.
 
-This first experiment changes only the existing selector bottleneck. Retrieval
-breadth and answer post-processing stay fixed, so the evaluation firewall can
-attribute any change cleanly. It is not yet the full proposed architecture.
+This first experiment changes the semantic representation used for relation
+proposal and final query selection. Retrieval mechanics and budgets, graph
+execution, and answer post-processing stay fixed. The evaluation firewall
+therefore reports separately whether gains come from better menu recall or
+better conditional selection. This is not yet the full proposed architecture.
 
 # Evaluation firewall and architecture ceilings
 

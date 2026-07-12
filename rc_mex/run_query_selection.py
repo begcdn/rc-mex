@@ -1,9 +1,9 @@
 """Structured executable-hypothesis inference over WebQSP/CWQ subgraphs.
 
 This is the first architecture experiment after the evaluation firewall. It
-keeps retrieval breadth, graph execution, and answer refinement fixed while
-replacing the old serial commitments (one relation-chain description followed
-by an unexplained menu index) with two explicit operations:
+keeps the retrieval algorithm and budgets, graph execution, and answer
+refinement fixed while replacing the old serial commitments (one relation-chain
+description followed by an unexplained menu index) with two explicit operations:
 
   1. induce 1-3 schema-independent semantic sketches containing only the
      relation roles, answer types, operators, and constraints activated by the
@@ -12,9 +12,10 @@ by an unexplained menu index) with two explicit operations:
      sketches and record a constraint-satisfaction decision.
 
 The hypothesis is deliberately narrower than the final architecture: uncertain
-semantic structure should convert an already-gold-containing executable menu
-more reliably than one-shot selection. Candidate recall remains a separately
-measured retrieval bottleneck.
+semantic structure should improve semantic relation proposal and convert a
+gold-containing executable menu more reliably than the old one-shot pipeline.
+The evaluation firewall measures menu recall and conditional selection
+separately, so the two effects remain attributable.
 
 Hard-fails at startup if MiniLM or the LLM endpoint is missing (no silent
 degradation), and counts empty LLM completions as a run canary.
