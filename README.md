@@ -1,25 +1,27 @@
-# RC-MEX
+# Executable KGQA Research
 
-Relation-Card Marginalized Execution for KGQA.
+The active direction is reliable multi-hop KGQA through uncertain semantic
+structure and executable evidence. The old RC-MEX relation-card experiments
+remain in the repository as historical ablations; they are not the current
+architecture or research claim.
 
-This repository contains the current MVP code for RC-MEX and the earlier CIGR-D baseline utilities.
+## Current Hypothesis
 
-Start with `README_RC_MEX_MVP1.md`.
+A question should not commit immediately to one path, one relation sequence,
+or one deterministic constraint parse. The current experiment represents the
+question with a small ensemble of schema-independent semantic sketches and
+jointly evaluates those sketches against executable query hypotheses and their
+denotations.
 
-## Current Framing
+The generic sketch vocabulary includes relation roles, answer type, set
+operations, filters, temporal/numeric constraints, comparison, aggregation,
+and ordering. A question activates only the relevant subset. KG-specific
+adapters are responsible for storage details such as Freebase CVTs or Wikidata
+qualifiers; those details do not belong in the question semantics.
 
-RC-MEX is focused on relation-card grounding, not on claiming top-k graph search as novel.
-
-- **MVP1:** Relation cards beat relation-name-only baselines and remain useful under hidden or misleading relation labels.
-- **MVP2:** Question slots can retrieve/rank the correct relation card from a local candidate frontier.
-- **MVP3:** Top-k relation-card execution improves recall but adds noise. This is a diagnostic showing that MVP2's top-k uncertainty contains useful recoverable graph evidence. It is not the novelty claim.
-- **MVP3.5:** Card-vs-name retrieval/execution compares relation cards against raw relation names, anonymized IDs, and misleading labels under the same controlled gold-prefix slot setup.
-
-The main RC-MEX claim is:
-
-> Relation cards provide a more robust semantic interface for KG relations than raw relation names or arbitrary IDs, especially when schema labels are hidden, noisy, or misleading.
-
-See `docs/rc_mex_prior_work_lessons.md` for the prior-work lesson motivating this framing.
+This first experiment changes only the existing selector bottleneck. Retrieval
+breadth and answer post-processing stay fixed, so the evaluation firewall can
+attribute any change cleanly. It is not yet the full proposed architecture.
 
 # Evaluation firewall and architecture ceilings
 

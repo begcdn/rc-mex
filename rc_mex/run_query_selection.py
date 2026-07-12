@@ -1,23 +1,20 @@
-"""Query-selection KGQA (method v2) — WebQSP/CWQ RoG subgraphs.
+"""Structured executable-hypothesis inference over WebQSP/CWQ subgraphs.
 
-The answer to a KGQA question is the RESULT SET of a small query, not a
-ranked entity. Measured basis (WebQSP test substrate): post-CVT, 99% of
-answerable questions are one property from the topic entity, and the correct
-property's full target set has F1 ceiling 0.897 (78% exact set).
+This is the first architecture experiment after the evaluation firewall. It
+keeps retrieval breadth, graph execution, and answer refinement fixed while
+replacing the old serial commitments (one relation-chain description followed
+by an unexplained menu index) with two explicit operations:
 
-Per question (2 LLM calls, short outputs):
-  1. intent    — LLM names 2-3 candidate property names, no schema shown
-  2. grounding — embed those names against the relations actually present
-                 (per-segment max for composite CVT relations), UNION with
-                 the question-embedding channel; junk predicates dropped
-  3. execute   — algorithm walks each grounded (predicate, direction),
-                 collecting full target sets + type evidence (zero-LLM:
-                 question embedding vs subgraph type inventory)
-  4. select    — LLM picks ONE property from ~a dozen options, each shown
-                 with its answers; explicit abstain option; on abstain or
-                 error, fall back to the question-embedding top candidate
-  5. answer    — the selected property's full target set (members ordered
-                 by type-match, then name)
+  1. induce 1-3 schema-independent semantic sketches containing only the
+     relation roles, answer types, operators, and constraints activated by the
+     question;
+  2. jointly compare every executed query/denotation against the alternative
+     sketches and record a constraint-satisfaction decision.
+
+The hypothesis is deliberately narrower than the final architecture: uncertain
+semantic structure should convert an already-gold-containing executable menu
+more reliably than one-shot selection. Candidate recall remains a separately
+measured retrieval bottleneck.
 
 Hard-fails at startup if MiniLM or the LLM endpoint is missing (no silent
 degradation), and counts empty LLM completions as a run canary.
@@ -43,10 +40,9 @@ from rc_mex.diag_selection_quality_eval import clean_relation
 from rc_mex.micro_agents import (
     DEFAULT_MODEL,
     audit_answer,
-    describe_relation_chain,
-    describe_target_relation,
+    induce_semantic_sketches,
     probe_llm_endpoint,
-    select_query_path,
+    select_executable_hypothesis,
     select_query_path_forced,
     select_set_member,
     verify_query_choice,
@@ -75,6 +71,18 @@ JUNK_PREDICATE_MARKERS = (
     "type.object",
     "dataworld.",
 )
+
+
+def sketch_relation_phrases(sketches: list[dict], position: int) -> list[str]:
+    """Relation-language proposal channel at one ordered sketch position."""
+    phrases = []
+    for sketch in sketches:
+        roles = sketch.get("relation_roles") or []
+        if position < len(roles):
+            phrase = str(roles[position].get("phrase", "")).strip()
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+    return phrases
 
 
 def is_junk_predicate(predicate: str) -> bool:
@@ -720,7 +728,7 @@ def main() -> None:
         sys.exit("FATAL: sentence-transformers/MiniLM unavailable — refusing to run degraded (check PYTHONPATH/HF_HOME/HF_HUB_OFFLINE).")
     probe = probe_llm_endpoint(model=selector_model)
     if not probe["ok"]:
-        sys.exit(f"FATAL: LLM endpoint unavailable ({probe['error']}) — v2 requires 2 calls/question.")
+        sys.exit(f"FATAL: LLM endpoint unavailable ({probe['error']}) — structured inference requires 2 calls/question.")
     print(f"LLM endpoint OK: {probe['url']} model={probe['model']}")
 
     rows_in = []
@@ -758,18 +766,18 @@ def main() -> None:
             "predicted": [],
         }
         if starts:
-            if args.max_hops >= 2:
-                described = describe_relation_chain(question, start_name, model=intent_model)
-            else:
-                described = describe_target_relation(question, start_name, model=intent_model)
+            meaning = induce_semantic_sketches(question, start_name, model=intent_model)
             usage["calls"] += 1
-            usage["prompt_tokens"] += described["prompt_tokens"]
-            usage["completion_tokens"] += described["completion_tokens"]
-            if not described["names"] and not described["error"]:
+            usage["prompt_tokens"] += meaning["prompt_tokens"]
+            usage["completion_tokens"] += meaning["completion_tokens"]
+            sketches = meaning["sketches"]
+            described_names = sketch_relation_phrases(sketches, 0)
+            hop2_names = sketch_relation_phrases(sketches, 1) if args.max_hops >= 2 else []
+            if not sketches and not meaning["error"]:
                 stats["empty_completion"] += 1
-            hop2_names = described.get("names_2") or []
+            stats["sketch_parse_failed"] += meaning["parse_failed"]
             question_types = question_type_evidence(kb, question)
-            paths = build_candidate_paths(kb, graph, starts, question, described["names"])
+            paths = build_candidate_paths(kb, graph, starts, question, described_names)
             has_chains = False
             if args.max_hops >= 2 and paths:
                 chains = build_chain_candidates(kb, graph, starts, paths, hop2_names)
@@ -779,7 +787,8 @@ def main() -> None:
                 if intersections:
                     paths = merge_mixed_menu(paths, intersections, cap=MIXED_MENU_CAP + INTERSECTIONS_ADDED)
                 has_chains = any(p.get("chain_label") for p in paths)
-            row["described_names"] = described["names"]
+            row["semantic_sketches"] = sketches
+            row["described_names"] = described_names
             if hop2_names:
                 row["described_names_2"] = hop2_names
             row["question_types"] = question_types
@@ -810,14 +819,27 @@ def main() -> None:
                     )
                     for p in paths
                 ]
-                selection = select_query_path(
-                    question, start_name, blocks, model=selector_model, mixed=has_chains, think=args.think_select
+                selection = select_executable_hypothesis(
+                    question,
+                    start_name,
+                    sketches,
+                    blocks,
+                    model=selector_model,
+                    think=args.think_select,
                 )
                 usage["calls"] += 1
                 usage["prompt_tokens"] += selection["prompt_tokens"]
                 usage["completion_tokens"] += selection["completion_tokens"]
                 if not selection["raw_response"] and not selection["error"]:
                     stats["empty_completion"] += 1
+                stats["hypothesis_parse_failed"] += selection["parse_failed"]
+                row["hypothesis_decision"] = {
+                    "sketch": selection["sketch"],
+                    "constraint_scores": selection["constraint_scores"],
+                    "unsatisfied_constraints": selection["unsatisfied_constraints"],
+                    "reason": selection["reason"],
+                    "raw_response": selection["raw_response"],
+                }
                 chosen = None
                 if selection["pick"] is not None:
                     chosen = paths[selection["pick"]]
@@ -1020,6 +1042,8 @@ def main() -> None:
         "no_candidates": stats["no_candidates"],
         "unresolved_start": stats["unresolved_start"],
         "empty_completions": stats["empty_completion"],
+        "sketch_parse_failures": stats["sketch_parse_failed"],
+        "hypothesis_parse_failures": stats["hypothesis_parse_failed"],
         "llm_cost_per_question": {
             "avg_llm_calls": usage["calls"] / n,
             "avg_prompt_tokens": usage["prompt_tokens"] / n,

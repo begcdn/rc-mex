@@ -595,6 +595,251 @@ def describe_relation_chain(
     }
 
 
+SEMANTIC_SKETCH_PROMPT_VERSION = "semantic_sketch_ensemble_v2"
+SEMANTIC_SKETCH_PROMPT_TEMPLATE = """Translate the question into 1 to 3 schema-independent executable semantic sketches.
+
+Starting entity: "{start}"
+Question: "{question}"
+
+A sketch describes meaning, not knowledge-base relation IDs. Use only constraints actually expressed by this question. Different questions activate different constraints.
+
+Allowed operators: relation, chain, intersection, union, difference, type_filter, value_filter, temporal_filter, comparison, aggregation, ordering.
+Allowed constraint kinds: entity_anchor, relation_role, answer_type, equality, set_membership, temporal, numeric, aggregation, ordering, other.
+
+Return strict JSON with this shape:
+{{
+  "sketches": [
+    {{
+      "answer_role": "short description of what the answer represents",
+      "answer_types": ["specific expected type"],
+      "operators": ["relation"],
+      "relation_roles": [
+        {{"phrase": "semantic predicate", "subject_role": "role", "object_role": "role"}}
+      ],
+      "constraints": [
+        {{"kind": "answer_type", "description": "question-specific requirement"}}
+      ]
+    }}
+  ]
+}}
+
+Rules:
+- Do not mention benchmark names, relation IDs, or database syntax.
+- Preserve conjunction, temporal scope, comparison, ordering, and aggregation when present.
+- Do not invent generic constraints such as university, state, or date unless the question asks for them.
+- Every sketch must be a COMPLETE interpretation from the starting entity to the final answer. Never split successive relation steps into separate sketches.
+- Order relation_roles from the starting entity toward the answer.
+- Use multiple sketches only for genuinely different complete interpretations; keep each sketch compact.
+- A two-step relation chain must have two ordered relation_roles.
+- Do not infer temporal ordering unless the question contains an explicit time expression.
+- Output JSON only."""
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    """Parse the outermost JSON object from a deterministic model reply."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(text[start : end + 1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _clean_semantic_sketches(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    allowed_operators = {
+        "relation", "chain", "intersection", "union", "difference", "type_filter",
+        "value_filter", "temporal_filter", "comparison", "aggregation", "ordering",
+    }
+    allowed_kinds = {
+        "entity_anchor", "relation_role", "answer_type", "equality", "set_membership",
+        "temporal", "numeric", "aggregation", "ordering", "other",
+    }
+    cleaned = []
+    for raw in (payload or {}).get("sketches", [])[:3]:
+        if not isinstance(raw, dict):
+            continue
+        roles = []
+        for role in raw.get("relation_roles", [])[:3]:
+            if not isinstance(role, dict):
+                continue
+            phrase = str(role.get("phrase", "")).strip()
+            if phrase:
+                roles.append(
+                    {
+                        "phrase": phrase,
+                        "subject_role": str(role.get("subject_role", "")).strip(),
+                        "object_role": str(role.get("object_role", "")).strip(),
+                    }
+                )
+        constraints = []
+        for constraint in raw.get("constraints", [])[:8]:
+            if not isinstance(constraint, dict):
+                continue
+            description = str(constraint.get("description", "")).strip()
+            if description:
+                kind = str(constraint.get("kind", "other")).strip().lower()
+                constraints.append(
+                    {"kind": kind if kind in allowed_kinds else "other", "description": description}
+                )
+        operators = [
+            str(operator).strip().lower()
+            for operator in raw.get("operators", [])
+            if str(operator).strip().lower() in allowed_operators
+        ][:6]
+        answer_types = [str(value).strip() for value in raw.get("answer_types", []) if str(value).strip()][:4]
+        if roles or answer_types or constraints:
+            cleaned.append(
+                {
+                    "answer_role": str(raw.get("answer_role", "")).strip(),
+                    "answer_types": answer_types,
+                    "operators": operators or (["chain"] if len(roles) > 1 else ["relation"]),
+                    "relation_roles": roles,
+                    "constraints": constraints,
+                }
+            )
+    return cleaned
+
+
+def induce_semantic_sketches(
+    question: str,
+    start_entity_name: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """Produce uncertain, schema-independent meanings before KG grounding."""
+    prompt = SEMANTIC_SKETCH_PROMPT_TEMPLATE.format(start=start_entity_name, question=question)
+    result = call_local_llm(
+        prompt,
+        SEMANTIC_SKETCH_PROMPT_VERSION,
+        model=model,
+        timeout=180.0,
+        num_predict=900,
+    )
+    parsed = _json_object(result["text"])
+    sketches = _clean_semantic_sketches(parsed)
+    return {
+        "sketches": sketches,
+        "raw_response": result["text"][:2000],
+        "error": result["error"],
+        "parse_failed": bool(result["text"].strip()) and not sketches,
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
+EXECUTABLE_HYPOTHESIS_PROMPT_VERSION = "executable_hypothesis_selector_v2"
+EXECUTABLE_HYPOTHESIS_PROMPT_TEMPLATE = """Select the executable query whose denotation best answers the question.
+
+Starting entity: "{start}"
+Question: "{question}"
+
+Schema-independent semantic sketches (alternative interpretations, not extra requirements):
+{sketches}
+
+Executed query hypotheses:
+{options}
+
+Evaluate every query against the best-fitting sketch. Check relation-role alignment, operator structure, answer type, every question-specific constraint, and the returned evidence. Do not reward a query merely because one returned entity sounds plausible. Do not combine constraints from different alternative sketches.
+
+Return strict JSON only:
+{{
+  "selected": 1,
+  "sketch": 1,
+  "constraint_scores": {{
+    "relation_roles": 0.0,
+    "operator_structure": 0.0,
+    "answer_type": 0.0,
+    "question_constraints": 0.0,
+    "execution_evidence": 0.0
+  }},
+  "unsatisfied_constraints": [],
+  "reason": "one short evidence-grounded reason"
+}}
+
+Use selected=0 only when no executed query satisfies the question. Scores must be between 0 and 1."""
+
+
+def _hypothesis_payload(text: str) -> dict[str, Any] | None:
+    """Accept strict JSON, with a narrow fallback for small-model Markdown."""
+    parsed = _json_object(text)
+    if parsed and "selected" in parsed:
+        return parsed
+    selected = re.search(r"\bselected\b[^0-9]{0,20}(\d+)", text, re.IGNORECASE)
+    if not selected:
+        return None
+    sketch = re.search(r"\bsketch\b[^0-9]{0,20}(\d+)", text, re.IGNORECASE)
+    scores = {}
+    for key in ("relation_roles", "operator_structure", "answer_type", "question_constraints", "execution_evidence"):
+        match = re.search(rf"\b{key}\b[^0-9]{{0,20}}([01](?:\.\d+)?)", text, re.IGNORECASE)
+        if match:
+            scores[key] = float(match.group(1))
+    reason = re.search(r"\breason\b[^:\n]*:\s*[\"']?([^\n\"]+)", text, re.IGNORECASE)
+    return {
+        "selected": int(selected.group(1)),
+        "sketch": int(sketch.group(1)) if sketch else None,
+        "constraint_scores": scores,
+        "unsatisfied_constraints": [],
+        "reason": reason.group(1).strip() if reason else "",
+    }
+
+
+def select_executable_hypothesis(
+    question: str,
+    start_entity_name: str,
+    sketches: list[dict[str, Any]],
+    option_blocks: list[str],
+    model: str = DEFAULT_MODEL,
+    think: bool = False,
+) -> dict[str, Any]:
+    """Jointly adjudicate semantic-sketch, executable-query, and denotation evidence."""
+    if not option_blocks:
+        return {"pick": None, "abstain": True, "raw_response": "", "error": "", "prompt_tokens": 0, "completion_tokens": 0}
+    numbered = "\n".join(f"{i}. {block}" for i, block in enumerate(option_blocks, start=1))
+    prompt = EXECUTABLE_HYPOTHESIS_PROMPT_TEMPLATE.format(
+        start=start_entity_name,
+        question=question,
+        sketches=json.dumps(sketches, ensure_ascii=True),
+        options=numbered,
+    )
+    result = call_local_llm(
+        prompt,
+        EXECUTABLE_HYPOTHESIS_PROMPT_VERSION,
+        model=model,
+        timeout=300.0 if think else 240.0,
+        num_predict=700,
+        think=think,
+    )
+    parsed = _hypothesis_payload(result["text"])
+    selected = parsed.get("selected") if parsed else None
+    try:
+        selected = int(selected)
+    except (TypeError, ValueError):
+        selected = None
+    pick = selected - 1 if selected and 1 <= selected <= len(option_blocks) else None
+    scores = parsed.get("constraint_scores", {}) if parsed else {}
+    clean_scores = {}
+    for key in ("relation_roles", "operator_structure", "answer_type", "question_constraints", "execution_evidence"):
+        try:
+            clean_scores[key] = max(0.0, min(1.0, float(scores.get(key, 0.0))))
+        except (TypeError, ValueError):
+            clean_scores[key] = 0.0
+    return {
+        "pick": pick,
+        "abstain": selected == 0,
+        "sketch": parsed.get("sketch") if parsed else None,
+        "constraint_scores": clean_scores,
+        "unsatisfied_constraints": parsed.get("unsatisfied_constraints", []) if parsed else [],
+        "reason": str(parsed.get("reason", ""))[:500] if parsed else "",
+        "raw_response": result["text"][:2000],
+        "error": result["error"],
+        "parse_failed": bool(result["text"].strip()) and parsed is None,
+        "prompt_tokens": int(result.get("prompt_tokens", 0)),
+        "completion_tokens": int(result.get("completion_tokens", 0)),
+    }
+
+
 def describe_target_relation(
     question: str,
     start_entity_name: str,
