@@ -392,19 +392,21 @@ def earliest_failure(row: dict, has_prediction: bool) -> str:
         return "topic_missing_from_subgraph"
     if not row["gold_in_subgraph"]:
         return "gold_missing_from_subgraph"
-    if not row["structural_ceiling"]["best_up_to_two_hop"]["scores"]["has_gold"]:
-        return "not_reachable_by_bounded_two_hop_chain"
     if not has_prediction:
         return "not_evaluated_without_predictions"
+    if row["actual_answer"]["hits_at_1"]:
+        return "correct"
+    if not row["structural_ceiling"]["best_up_to_two_hop"]["scores"]["has_gold"]:
+        return "not_reachable_by_bounded_two_hop_chain"
     menu = row.get("menu_audit") or {}
     if not menu.get("best_candidate", {}).get("scores", {}).get("has_gold"):
         return "generated_menu_miss"
+    if row.get("prediction_flags", {}).get("extended"):
+        return "audit_extension_pipeline_miss"
     selected = menu.get("selected_candidate")
     if not selected or not selected["scores"]["has_gold"]:
         return "selector_miss"
-    if not row["actual_answer"]["hits_at_1"]:
-        return "post_selection_or_member_ranking_miss"
-    return "correct"
+    return "post_selection_or_member_ranking_miss"
 
 
 def mean(values: Iterable[float]) -> float:
@@ -473,11 +475,24 @@ def aggregate(question_rows: list[dict], predictions_supplied: bool) -> dict:
         "surface_operator_slices": operator_buckets,
     }
     if prediction_rows:
+        reconstructed_menu_rows = [
+            row for row in prediction_rows if row.get("menu_matches_stored") is not None
+        ]
         menu_gold_rows = [
             row for row in prediction_rows if row["menu_audit"]["best_candidate"]["scores"]["has_gold"]
         ]
+        directly_selected_rows = [
+            row for row in prediction_rows if not row.get("prediction_flags", {}).get("extended")
+        ]
+        directly_selected_menu_gold_rows = [
+            row
+            for row in directly_selected_rows
+            if row["menu_audit"]["best_candidate"]["scores"]["has_gold"]
+        ]
         metrics["generated_menu"] = {
-            "menu_reconstruction_match_rate": mean(float(row["menu_matches_stored"]) for row in prediction_rows),
+            "menu_reconstruction_match_rate": mean(
+                float(row["menu_matches_stored"]) for row in reconstructed_menu_rows
+            ),
             "gold_recall": mean(
                 float(row["menu_audit"]["best_candidate"]["scores"]["has_gold"])
                 for row in prediction_rows
@@ -495,12 +510,14 @@ def aggregate(question_rows: list[dict], predictions_supplied: bool) -> dict:
         metrics["selection_and_answer"] = {
             "selected_query_contains_gold": mean(
                 float(bool(row["menu_audit"]["selected_candidate"] and row["menu_audit"]["selected_candidate"]["scores"]["has_gold"]))
-                for row in prediction_rows
+                for row in directly_selected_rows
             ),
             "selected_query_contains_gold_given_menu_gold": mean(
                 float(bool(row["menu_audit"]["selected_candidate"] and row["menu_audit"]["selected_candidate"]["scores"]["has_gold"]))
-                for row in menu_gold_rows
+                for row in directly_selected_menu_gold_rows
             ),
+            "direct_selection_questions": len(directly_selected_rows),
+            "selection_metric_note": "Selected-query metrics exclude audit-extension rows because predictions store only the revised query.",
             "hits_at_1": mean(float(row["actual_answer"]["hits_at_1"]) for row in prediction_rows),
             "exact_match": mean(float(row["actual_answer"]["scores"]["exact_match"]) for row in prediction_rows),
             "mean_answer_f1": mean(float(row["actual_answer"]["scores"]["f1"]) for row in prediction_rows),
@@ -562,6 +579,7 @@ def write_report(path: Path, manifest: dict, metrics: dict) -> None:
                 f"- Prediction join rate: **{pct(metrics['prediction_join_rate'])}**",
                 f"- Exact menu reconstruction: **{pct(menu['menu_reconstruction_match_rate'])}**",
                 f"- Selected query contains gold, given gold is on menu: **{pct(answer['selected_query_contains_gold_given_menu_gold'])}**",
+                f"  (computed on {answer['direct_selection_questions']} non-extension rows; revised queries overwrite the original pick)",
                 f"- Final Hits@1, given gold is on menu: **{pct(answer['hits_at_1_given_menu_gold'])}**",
                 f"- Oracle-menu to actual-answer F1 gap: **{answer['oracle_to_actual_f1_gap']:.3f}**",
             ]
@@ -708,6 +726,12 @@ def main() -> None:
                     "predicted": [],
                     "hits_at_1": False,
                     "scores": set_scores(set(), golds),
+                },
+                "prediction_flags": {
+                    "extended": bool(prediction and prediction.get("extended")),
+                    "audit_missing": bool(prediction and prediction.get("audit_missing")),
+                    "abstained": bool(prediction and prediction.get("abstained")),
+                    "fallback": bool(prediction and prediction.get("fallback")),
                 },
             }
             if prediction is not None and starts:

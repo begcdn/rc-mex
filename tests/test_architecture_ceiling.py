@@ -158,6 +158,34 @@ class ArchitectureCeilingTests(unittest.TestCase):
         self.assertEqual(scores["f1"], 0.5)
         self.assertFalse(scores["exact_match"])
 
+    def test_unresolved_topic_does_not_break_prediction_aggregation(self):
+        from rc_mex.run_architecture_ceiling import aggregate
+
+        row = {
+            "prediction_joined": True,
+            "menu_matches_stored": None,
+            "menu_audit": {
+                "candidate_count": 0,
+                "best_candidate": {"scores": set_scores(set(), {"gold"})},
+                "selected_candidate": None,
+            },
+            "actual_answer": {"hits_at_1": False, "scores": set_scores(set(), {"gold"})},
+            "prediction_flags": {"extended": False},
+            "failure_stage": "topic_missing_from_subgraph",
+            "start_resolved": False,
+            "gold_in_subgraph": False,
+            "all_gold_in_subgraph": False,
+            "gold_subgraph_recall": 0.0,
+            "approx_gold_hops": 0,
+            "surface_operator_tags": ["unmarked"],
+            "structural_ceiling": {
+                "best_one_hop": {"scores": set_scores(set(), {"gold"})},
+                "best_up_to_two_hop": {"scores": set_scores(set(), {"gold"})},
+            },
+        }
+        metrics = aggregate([row], predictions_supplied=True)
+        self.assertEqual(metrics["generated_menu"]["menu_reconstruction_match_rate"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
