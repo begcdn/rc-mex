@@ -5,7 +5,14 @@ import unittest
 from unittest.mock import patch
 
 from rc_mex.micro_agents import induce_semantic_sketches, select_executable_hypothesis
-from rc_mex.run_query_selection import sketch_relation_phrases
+from rc_mex.run_query_selection import (
+    anchor_factor_operator_supported,
+    build_anchor_conditioned_joins,
+    confident_anchor_factor,
+    one_to_one_role_alignment,
+    sketch_relation_phrases,
+    terminal_relation_label,
+)
 
 
 def llm_result(payload: dict) -> dict:
@@ -18,6 +25,79 @@ def llm_result(payload: dict) -> dict:
 
 
 class SemanticHypothesisTests(unittest.TestCase):
+    def test_factor_role_alignment_does_not_reuse_one_path_twice(self):
+        similarities = {
+            ("role-a", "path-a"): 0.9,
+            ("role-a", "path-b"): 0.8,
+            ("role-b", "path-a"): 0.85,
+            ("role-b", "path-b"): 0.1,
+        }
+        with patch(
+            "rc_mex.run_query_selection.cosine",
+            side_effect=lambda left, right: similarities[(left, right)],
+        ):
+            score = one_to_one_role_alignment(["role-a", "role-b"], ["path-a", "path-b"])
+        self.assertAlmostEqual(score, (0.8 + 0.85) / 2)
+
+    def test_terminal_relation_label_keeps_only_output_role(self):
+        self.assertEqual(
+            terminal_relation_label("roster / player → coaches / position (reversed)"),
+            "position",
+        )
+
+    def test_factor_confidence_treats_singleton_as_absolute_not_margin(self):
+        sketches = [{"operators": ["relation"], "constraints": []}]
+        self.assertIsNone(confident_anchor_factor([{"factor_score": 0.44}], sketches))
+        winner = {"factor_score": 0.46}
+        self.assertIs(confident_anchor_factor([winner], sketches), winner)
+
+    def test_factor_abstains_when_sketch_activates_unsupported_operator(self):
+        temporal = [{"operators": ["chain", "temporal_filter"], "constraints": []}]
+        self.assertFalse(anchor_factor_operator_supported(temporal))
+        self.assertIsNone(confident_anchor_factor([{"factor_score": 0.9}], temporal))
+
+    def test_anchor_conditioned_join_preserves_anchor_provenance(self):
+        class FakeGraph:
+            @staticmethod
+            def entity_name(entity_id):
+                return {"anchor-a": "Anchor A", "anchor-b": "Anchor B"}[entity_id]
+
+        left = {
+            "predicate": "domain.left_relation",
+            "direction": "forward",
+            # The second constraint validates this denotation without making
+            # it smaller; provenance-aware joins must still retain it.
+            "targets": ["answer"],
+            "member_quals": {"answer": {"from": ["left"]}},
+        }
+        right = {
+            "predicate": "domain.right_relation",
+            "direction": "backward",
+            "targets": ["answer", "right-only"],
+            "member_quals": {"answer": {"from": ["right"]}},
+        }
+
+        def candidate_paths(_kb, _graph, starts, _question, _descriptions):
+            return [left] if starts == {"anchor-a"} else [right]
+
+        with (
+            patch("rc_mex.run_query_selection.build_candidate_paths", side_effect=candidate_paths),
+            patch("rc_mex.run_query_selection.build_chain_candidates", return_value=[]),
+            patch("rc_mex.run_query_selection.semantic_embedding", return_value=[1.0]),
+            patch("rc_mex.run_query_selection.cosine", return_value=0.8),
+        ):
+            candidates = build_anchor_conditioned_joins(
+                {}, FakeGraph(), ["anchor-a", "anchor-b"], "question", [], []
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["targets"], ["answer"])
+        self.assertEqual(
+            [constraint["anchor_id"] for constraint in candidates[0]["anchor_constraints"]],
+            ["anchor-a", "anchor-b"],
+        )
+        self.assertEqual(candidates[0]["member_quals"]["answer"]["from"], ["left", "right"])
+
     def test_sketches_keep_dynamic_constraints_and_ordered_roles(self):
         payload = {
             "sketches": [

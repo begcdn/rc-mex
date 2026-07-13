@@ -1,21 +1,12 @@
-"""Structured executable-hypothesis inference over WebQSP/CWQ subgraphs.
+"""Query selection with anchor-conditioned factor inference.
 
-This is the first architecture experiment after the evaluation firewall. It
-keeps the retrieval algorithm and budgets, graph execution, and answer
-refinement fixed while replacing the old serial commitments (one relation-chain
-description followed by an unexplained menu index) with two explicit operations:
-
-  1. induce 1-3 schema-independent semantic sketches containing only the
-     relation roles, answer types, operators, and constraints activated by the
-     question;
-  2. jointly compare every executed query/denotation against the alternative
-     sketches and record a constraint-satisfaction decision.
-
-The hypothesis is deliberately narrower than the final architecture: uncertain
-semantic structure should improve semantic relation proposal and convert a
-gold-containing executable menu more reliably than the old one-shot pipeline.
-The evaluation firewall measures menu recall and conditional selection
-separately, so the two effects remain attributable.
+The proven query-selection path remains the fallback. Questions with exactly
+two topic anchors additionally receive a schema-independent semantic sketch.
+Each anchor is executed independently and candidate answer denotations are
+joined, preserving which evidence came from which anchor. A factor can override
+the fallback only when one-to-one relation-role coverage, relation-terminal
+type, and executed entity type agree with sufficient confidence. Unsupported
+operators and weak evidence abstain to the original method.
 
 Hard-fails at startup if MiniLM or the LLM endpoint is missing (no silent
 degradation), and counts empty LLM completions as a run canary.
@@ -28,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from collections import Counter
@@ -41,9 +33,11 @@ from rc_mex.diag_selection_quality_eval import clean_relation
 from rc_mex.micro_agents import (
     DEFAULT_MODEL,
     audit_answer,
+    describe_relation_chain,
+    describe_target_relation,
     induce_semantic_sketches,
     probe_llm_endpoint,
-    select_executable_hypothesis,
+    select_query_path,
     select_query_path_forced,
     select_set_member,
     verify_query_choice,
@@ -320,6 +314,276 @@ def merge_mixed_menu(hop1_paths, chain_paths, cap: int = MIXED_MENU_CAP):
         if len(merged) >= cap:
             break
     return merged
+
+
+def executable_path_label(path: dict) -> str:
+    """Readable relation sequence for scoring and provenance diagnostics."""
+    if path.get("chain_label"):
+        return str(path["chain_label"])
+    label = display_relation(path["predicate"])
+    if path.get("direction") == "backward":
+        label += " (reversed)"
+    return label
+
+
+def build_anchor_conditioned_joins(
+    kb,
+    graph,
+    starts,
+    question,
+    described_names,
+    hop2_names,
+    max_candidates: int | None = None,
+):
+    """Build executable conjunctions without pooling topic-anchor provenance.
+
+    The ordinary candidate builder executes every proposed relation over the
+    union of topic entities. That representation cannot distinguish
+    ``r1(anchor_a, answer) AND r2(anchor_b, answer)`` from evidence produced by
+    the opposite anchor. Here each anchor receives its own bounded one/two-hop
+    proposal menu; only their answer sets are joined. The live selector uses
+    these joins only through the confidence-gated factor override below.
+    """
+    anchor_ids = list(dict.fromkeys(starts))
+    if len(anchor_ids) != 2:
+        return []
+
+    per_anchor = []
+    for anchor_id in anchor_ids:
+        paths = build_candidate_paths(kb, graph, {anchor_id}, question, described_names)
+        chains = build_chain_candidates(kb, graph, {anchor_id}, paths, hop2_names)
+        if chains:
+            paths = merge_mixed_menu(paths, chains)
+        per_anchor.append(paths)
+
+    role_phrases = list(dict.fromkeys([*described_names, *hop2_names]))
+    role_vectors = [semantic_embedding(phrase) for phrase in role_phrases]
+    question_vector = semantic_embedding(question) if not role_vectors else None
+    by_targets = {}
+    for left in per_anchor[0]:
+        left_targets = set(left["targets"])
+        for right in per_anchor[1]:
+            right_targets = set(right["targets"])
+            targets = left_targets & right_targets
+            # Keep non-narrowing joins too. A second anchor can validate the
+            # same denotation without shrinking it, and its anchor-specific
+            # parent hypothesis may not exist in the pooled menu at all.
+            if not targets:
+                continue
+
+            left_label = executable_path_label(left)
+            right_label = executable_path_label(right)
+            if role_vectors:
+                path_vectors = [semantic_embedding(left_label), semantic_embedding(right_label)]
+                # Symmetric set matching rewards both semantic-role coverage
+                # and path specificity. A pair cannot score highly by matching
+                # one relation phrase twice while ignoring the other.
+                role_coverage = sum(
+                    max(cosine(role_vector, path_vector) for path_vector in path_vectors)
+                    for role_vector in role_vectors
+                ) / len(role_vectors)
+                path_specificity = sum(
+                    max(cosine(path_vector, role_vector) for role_vector in role_vectors)
+                    for path_vector in path_vectors
+                ) / len(path_vectors)
+                role_score = (role_coverage + path_specificity) / 2
+            else:
+                role_score = cosine(
+                    question_vector,
+                    semantic_embedding(f"{left_label} and {right_label}"),
+                )
+            member_quals = {}
+            for member in targets:
+                for source in (left, right):
+                    for dim, values in (source.get("member_quals") or {}).get(member, {}).items():
+                        slot = member_quals.setdefault(member, {}).setdefault(dim, [])
+                        slot.extend(value for value in values if value not in slot)
+
+            anchor_constraints = [
+                {
+                    "anchor_id": anchor_id,
+                    "anchor_name": graph.entity_name(anchor_id),
+                    "path_label": executable_path_label(path),
+                    "predicate": path["predicate"],
+                    "direction": path["direction"],
+                    **({"chain_base": path["chain_base"]} if path.get("chain_base") else {}),
+                }
+                for anchor_id, path in zip(anchor_ids, (left, right))
+            ]
+            candidate = {
+                "predicate": left["predicate"],
+                "direction": left["direction"],
+                "targets": sorted(targets),
+                "also": [],
+                "member_quals": member_quals,
+                "chain_label": (
+                    f"both anchors: {anchor_constraints[0]['anchor_name']} via {left_label} "
+                    f"AND {anchor_constraints[1]['anchor_name']} via {right_label}"
+                ),
+                "anchor_constraints": anchor_constraints,
+                "anchor_role_score": role_score,
+            }
+            key = frozenset(targets)
+            incumbent = by_targets.get(key)
+            if incumbent is None or role_score > incumbent["anchor_role_score"]:
+                by_targets[key] = candidate
+
+    candidates = sorted(
+        by_targets.values(),
+        key=lambda candidate: (-candidate["anchor_role_score"], len(candidate["targets"])),
+    )
+    return candidates[:max_candidates] if max_candidates is not None else candidates
+
+
+ANCHOR_FACTOR_TYPE_MIN = 0.35
+ANCHOR_FACTOR_MARGIN_MIN = 0.025
+ANCHOR_FACTOR_SINGLETON_MIN = 0.45
+ANCHOR_FACTOR_UNSUPPORTED_OPERATORS = {
+    "aggregation",
+    "comparison",
+    "difference",
+    "ordering",
+    "temporal_filter",
+    "union",
+    "value_filter",
+}
+ANCHOR_FACTOR_UNSUPPORTED_CONSTRAINTS = {"aggregation", "numeric", "ordering", "temporal"}
+
+
+def sketch_role_phrases(sketches: list[dict]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(role.get("phrase", "")).strip()
+            for sketch in sketches
+            for role in (sketch.get("relation_roles") or [])
+            if str(role.get("phrase", "")).strip()
+        )
+    )
+
+
+def sketch_answer_type_text(sketches: list[dict]) -> str:
+    answer_types = list(
+        dict.fromkeys(
+            str(value).strip()
+            for sketch in sketches
+            for value in (sketch.get("answer_types") or [])
+            if str(value).strip()
+        )
+    )
+    if answer_types:
+        return " ".join(answer_types)
+    return " ".join(
+        dict.fromkeys(
+            str(sketch.get("answer_role", "")).strip()
+            for sketch in sketches
+            if str(sketch.get("answer_role", "")).strip()
+        )
+    )
+
+
+def terminal_relation_label(path_label: str) -> str:
+    """Best schema-side clue for the type produced at a path endpoint."""
+    terminal = str(path_label).split("→")[-1].strip()
+    if "/" in terminal:
+        terminal = terminal.split("/")[-1].strip()
+    return re.sub(r"\s*\(reversed\)\s*$", "", terminal).strip()
+
+
+def one_to_one_role_alignment(role_vectors: list, path_vectors: list) -> float:
+    """Match two semantic constraints to two anchor paths without reuse.
+
+    The previous Chamfer-style score allowed both constraints to be explained
+    by the same path. For the common two-anchor/two-role case, score the best
+    bijection instead. Larger sketches keep the old set-coverage behavior
+    because a compressed anchor path can legitimately cover multiple edges.
+    """
+    if not role_vectors or not path_vectors:
+        return 0.0
+    matrix = [
+        [cosine(role_vector, path_vector) for path_vector in path_vectors]
+        for role_vector in role_vectors
+    ]
+    if len(role_vectors) == len(path_vectors) == 2:
+        return max(
+            (matrix[0][0] + matrix[1][1]) / 2,
+            (matrix[0][1] + matrix[1][0]) / 2,
+        )
+    role_coverage = sum(max(row) for row in matrix) / len(matrix)
+    path_specificity = sum(
+        max(matrix[role_index][path_index] for role_index in range(len(role_vectors)))
+        for path_index in range(len(path_vectors))
+    ) / len(path_vectors)
+    return (role_coverage + path_specificity) / 2
+
+
+def rank_anchor_conditioned_joins(kb, graph, joins: list[dict], sketches: list[dict]) -> list[dict]:
+    """Rank joined denotations as anchor-bound factors, without gold labels.
+
+    Three independent signals receive equal weight: one-to-one relation-role
+    coverage, compatibility between the path terminal and requested answer
+    type, and compatibility between executed answer entities and that type.
+    """
+    roles = sketch_role_phrases(sketches)
+    answer_type = sketch_answer_type_text(sketches)
+    if not roles or not answer_type:
+        return []
+    role_vectors = [semantic_embedding(role) for role in roles]
+    answer_vector = semantic_embedding(answer_type)
+    ranked = []
+    for join in joins:
+        path_labels = [
+            str(constraint.get("path_label", ""))
+            for constraint in (join.get("anchor_constraints") or [])
+        ]
+        path_vectors = [semantic_embedding(path_label) for path_label in path_labels]
+        assignment_score = one_to_one_role_alignment(role_vectors, path_vectors)
+        terminal_score = sum(
+            cosine(answer_vector, semantic_embedding(terminal_relation_label(path_label)))
+            for path_label in path_labels
+        ) / len(path_labels) if path_labels else 0.0
+        member_scores = []
+        for member in join.get("targets") or []:
+            evidence = entity_type_names(kb, member) or [graph.entity_name(member)]
+            member_scores.append(
+                max(cosine(answer_vector, semantic_embedding(value)) for value in evidence)
+            )
+        answer_type_score = min(member_scores) if member_scores else 0.0
+        join["factor_role_alignment"] = assignment_score
+        join["factor_terminal_type"] = terminal_score
+        join["factor_answer_type"] = answer_type_score
+        join["factor_score"] = (assignment_score + terminal_score + answer_type_score) / 3
+        if answer_type_score >= ANCHOR_FACTOR_TYPE_MIN:
+            ranked.append(join)
+    return sorted(ranked, key=lambda join: join["factor_score"], reverse=True)
+
+
+def anchor_factor_operator_supported(sketches: list[dict]) -> bool:
+    """The MVP factor executor represents joins, chains, and type evidence."""
+    for sketch in sketches:
+        if set(sketch.get("operators") or []) & ANCHOR_FACTOR_UNSUPPORTED_OPERATORS:
+            return False
+        if any(
+            constraint.get("kind") in ANCHOR_FACTOR_UNSUPPORTED_CONSTRAINTS
+            for constraint in (sketch.get("constraints") or [])
+        ):
+            return False
+    return True
+
+
+def confident_anchor_factor(ranked: list[dict], sketches: list[dict]) -> dict | None:
+    """Return a factor only when its available evidence supports overriding.
+
+    A singleton has no comparative margin, so it must clear an absolute score;
+    multi-candidate pools use the top-vs-runner-up margin measured in the
+    frozen first-half A/B. Unsupported operators abstain to the base method.
+    """
+    if not ranked or not anchor_factor_operator_supported(sketches):
+        return None
+    if len(ranked) == 1:
+        return ranked[0] if ranked[0]["factor_score"] >= ANCHOR_FACTOR_SINGLETON_MIN else None
+    margin = ranked[0]["factor_score"] - ranked[1]["factor_score"]
+    ranked[0]["factor_margin"] = margin
+    return ranked[0] if margin >= ANCHOR_FACTOR_MARGIN_MIN else None
 
 
 EXTEND_MENU_CAP = 8  # gold extension visible: top-6 41/49, top-10 45/49 (cwq_dev300f probe)
@@ -729,7 +993,7 @@ def main() -> None:
         sys.exit("FATAL: sentence-transformers/MiniLM unavailable — refusing to run degraded (check PYTHONPATH/HF_HOME/HF_HUB_OFFLINE).")
     probe = probe_llm_endpoint(model=selector_model)
     if not probe["ok"]:
-        sys.exit(f"FATAL: LLM endpoint unavailable ({probe['error']}) — structured inference requires 2 calls/question.")
+        sys.exit(f"FATAL: LLM endpoint unavailable ({probe['error']}) — query selection requires a local model.")
     print(f"LLM endpoint OK: {probe['url']} model={probe['model']}")
 
     rows_in = []
@@ -767,16 +1031,24 @@ def main() -> None:
             "predicted": [],
         }
         if starts:
-            meaning = induce_semantic_sketches(question, start_name, model=intent_model)
+            anchor_ids = list(
+                dict.fromkeys(
+                    normalize_text(value)
+                    for value in (src.get("q_entity") or [])
+                    if normalize_text(value) in starts
+                )
+            )
+            if args.max_hops >= 2:
+                described = describe_relation_chain(question, start_name, model=intent_model)
+            else:
+                described = describe_target_relation(question, start_name, model=intent_model)
             usage["calls"] += 1
-            usage["prompt_tokens"] += meaning["prompt_tokens"]
-            usage["completion_tokens"] += meaning["completion_tokens"]
-            sketches = meaning["sketches"]
-            described_names = sketch_relation_phrases(sketches, 0)
-            hop2_names = sketch_relation_phrases(sketches, 1) if args.max_hops >= 2 else []
-            if not sketches and not meaning["error"]:
+            usage["prompt_tokens"] += described["prompt_tokens"]
+            usage["completion_tokens"] += described["completion_tokens"]
+            described_names = described["names"]
+            hop2_names = described.get("names_2") or []
+            if not described_names and not described["error"]:
                 stats["empty_completion"] += 1
-            stats["sketch_parse_failed"] += meaning["parse_failed"]
             question_types = question_type_evidence(kb, question)
             paths = build_candidate_paths(kb, graph, starts, question, described_names)
             has_chains = False
@@ -788,7 +1060,41 @@ def main() -> None:
                 if intersections:
                     paths = merge_mixed_menu(paths, intersections, cap=MIXED_MENU_CAP + INTERSECTIONS_ADDED)
                 has_chains = any(p.get("chain_label") for p in paths)
-            row["semantic_sketches"] = sketches
+            sketches = []
+            factor_choice = None
+            factor_ranked = []
+            if len(anchor_ids) == 2:
+                stats["factor_attempts"] += 1
+                meaning = induce_semantic_sketches(question, start_name, model=intent_model)
+                usage["calls"] += 1
+                usage["prompt_tokens"] += meaning["prompt_tokens"]
+                usage["completion_tokens"] += meaning["completion_tokens"]
+                sketches = meaning["sketches"]
+                stats["sketch_parse_failed"] += meaning["parse_failed"]
+                if not sketches and not meaning["error"]:
+                    stats["empty_completion"] += 1
+                factor_first = sketch_relation_phrases(sketches, 0)
+                factor_second = sketch_relation_phrases(sketches, 1) if args.max_hops >= 2 else []
+                factor_joins = build_anchor_conditioned_joins(
+                    kb,
+                    graph,
+                    anchor_ids,
+                    question,
+                    factor_first,
+                    factor_second,
+                )
+                factor_ranked = rank_anchor_conditioned_joins(kb, graph, factor_joins, sketches)
+                factor_choice = confident_anchor_factor(factor_ranked, sketches)
+                if factor_choice is not None:
+                    stats["factor_overrides"] += 1
+                row["semantic_sketches"] = sketches
+                row["factor_decision"] = {
+                    "candidate_count": len(factor_ranked),
+                    "override": factor_choice is not None,
+                    "top_score": factor_ranked[0]["factor_score"] if factor_ranked else 0.0,
+                    "margin": factor_ranked[0].get("factor_margin", 0.0) if factor_ranked else 0.0,
+                    "operator_supported": anchor_factor_operator_supported(sketches),
+                }
             row["described_names"] = described_names
             if hop2_names:
                 row["described_names_2"] = hop2_names
@@ -802,7 +1108,7 @@ def main() -> None:
                 }
                 for p in paths
             ]
-            if paths:
+            if paths or factor_choice is not None:
                 # Only the same-predicate-both-directions pair is truly
                 # indistinguishable ("contains" vs "contains (reversed)" for
                 # a region). Label-level collisions are far broader (38% of
@@ -820,55 +1126,52 @@ def main() -> None:
                     )
                     for p in paths
                 ]
-                selection = select_executable_hypothesis(
-                    question,
-                    start_name,
-                    sketches,
-                    blocks,
-                    model=selector_model,
-                    think=args.think_select,
-                )
-                usage["calls"] += 1
-                usage["prompt_tokens"] += selection["prompt_tokens"]
-                usage["completion_tokens"] += selection["completion_tokens"]
-                if not selection["raw_response"] and not selection["error"]:
-                    stats["empty_completion"] += 1
-                stats["hypothesis_parse_failed"] += selection["parse_failed"]
-                row["hypothesis_decision"] = {
-                    "sketch": selection["sketch"],
-                    "constraint_scores": selection["constraint_scores"],
-                    "unsatisfied_constraints": selection["unsatisfied_constraints"],
-                    "reason": selection["reason"],
-                    "raw_response": selection["raw_response"],
-                }
-                chosen = None
-                if selection["pick"] is not None:
-                    chosen = paths[selection["pick"]]
-                else:
-                    row["abstained"] = selection["abstain"]
-                    stats["abstained"] += selection["abstain"]
-                    stats["selection_error"] += bool(selection["error"])
-                    if selection["error"]:
-                        row["selection_error"] = selection["error"][:160]
-                    # Abstain recovery: re-ask the same menu with no escape
-                    # hatch before falling to the blind channel floor.
-                    if args.recover_abstain and selection["abstain"] and paths:
-                        forced = select_query_path_forced(
-                            question, start_name, blocks, model=selector_model, think=args.think_select
-                        )
-                        usage["calls"] += 1
-                        usage["prompt_tokens"] += forced["prompt_tokens"]
-                        usage["completion_tokens"] += forced["completion_tokens"]
-                        if not forced["raw_response"] and not forced["error"]:
-                            stats["empty_completion"] += 1
-                        if forced["pick"] is not None:
-                            chosen = paths[forced["pick"]]
-                            stats["abstain_recovered"] += 1
-                            row["abstain_recovered"] = True
-                    if chosen is None:
-                        chosen = paths[0] if paths else None  # channel floor
-                        row["fallback"] = True
-                if args.verify_final and chosen is not None and not row["fallback"]:
+                chosen = factor_choice
+                factor_override = factor_choice is not None
+                if not factor_override:
+                    selection = select_query_path(
+                        question,
+                        start_name,
+                        blocks,
+                        model=selector_model,
+                        mixed=has_chains,
+                        think=args.think_select,
+                    )
+                    usage["calls"] += 1
+                    usage["prompt_tokens"] += selection["prompt_tokens"]
+                    usage["completion_tokens"] += selection["completion_tokens"]
+                    if not selection["raw_response"] and not selection["error"]:
+                        stats["empty_completion"] += 1
+                    if selection["pick"] is not None:
+                        chosen = paths[selection["pick"]]
+                    else:
+                        row["abstained"] = selection["abstain"]
+                        stats["abstained"] += selection["abstain"]
+                        stats["selection_error"] += bool(selection["error"])
+                        if selection["error"]:
+                            row["selection_error"] = selection["error"][:160]
+                        if args.recover_abstain and selection["abstain"] and paths:
+                            forced = select_query_path_forced(
+                                question, start_name, blocks, model=selector_model, think=args.think_select
+                            )
+                            usage["calls"] += 1
+                            usage["prompt_tokens"] += forced["prompt_tokens"]
+                            usage["completion_tokens"] += forced["completion_tokens"]
+                            if not forced["raw_response"] and not forced["error"]:
+                                stats["empty_completion"] += 1
+                            if forced["pick"] is not None:
+                                chosen = paths[forced["pick"]]
+                                stats["abstain_recovered"] += 1
+                                row["abstain_recovered"] = True
+                        if chosen is None:
+                            chosen = paths[0] if paths else None
+                            row["fallback"] = True
+                if (
+                    args.verify_final
+                    and chosen is not None
+                    and not row["fallback"]
+                    and not factor_override
+                ):
                     rival = structural_neighbour(paths, chosen)
                     if rival is not None:
                         verdict = verify_query_choice(
@@ -917,16 +1220,24 @@ def main() -> None:
 
                         return live_member_call
 
-                    members, rflags = refine_members(
-                        kb,
-                        graph,
-                        question,
-                        question_types,
-                        chosen,
-                        member_call=make_member_call(chosen),
-                        topic_names=[graph.entity_name(s) for s in starts],
-                    )
-                    if args.audit_extend and members:
+                    if factor_override:
+                        # The factor score already ranks the complete joined
+                        # denotation. Member refinement would collapse a valid
+                        # multi-answer set, while audit-extension would leave
+                        # the representation whose confidence was measured.
+                        members = list(chosen["targets"])
+                        rflags = {"scope": False, "ordinal": False, "refined": False, "whole_set": True}
+                    else:
+                        members, rflags = refine_members(
+                            kb,
+                            graph,
+                            question,
+                            question_types,
+                            chosen,
+                            member_call=make_member_call(chosen),
+                            topic_names=[graph.entity_name(s) for s in starts],
+                        )
+                    if args.audit_extend and members and not factor_override:
                         audit = audit_answer(
                             question,
                             chosen.get("chain_label") or display_relation(chosen["predicate"]),
@@ -1045,6 +1356,8 @@ def main() -> None:
         "empty_completions": stats["empty_completion"],
         "sketch_parse_failures": stats["sketch_parse_failed"],
         "hypothesis_parse_failures": stats["hypothesis_parse_failed"],
+        "anchor_factor_attempts": stats["factor_attempts"],
+        "anchor_factor_overrides": stats["factor_overrides"],
         "llm_cost_per_question": {
             "avg_llm_calls": usage["calls"] / n,
             "avg_prompt_tokens": usage["prompt_tokens"] / n,
