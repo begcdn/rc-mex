@@ -18,5 +18,8 @@ dependencies = [
 test = ["pytest>=8"]
 retrieval = ["srtk==0.0.7"]
 
+[tool.setuptools]
+packages = ["inverse_verifier"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
