@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from safetensors import safe_open
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from .data import ENTITY_PLACEHOLDER, delexicalize_question, read_jsonl, render_path
@@ -37,6 +38,23 @@ def best_device(requested: str = "auto") -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def load_generator_backbone(model_path: str) -> Any:
+    """Load fine-tuned generators without losing their separate output weights."""
+    path = Path(model_path)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_path, local_files_only=True)
+    fine_tuned = (path / "joint_ranker.json").exists() or (
+        path / "type_aware_generator.json"
+    ).exists()
+    weights_path = path / "model.safetensors"
+    if fine_tuned and weights_path.exists():
+        with safe_open(weights_path, framework="pt", device="cpu") as weights:
+            if "lm_head.weight" in weights.keys():
+                saved_output = weights.get_tensor("lm_head.weight")
+                model.get_output_embeddings().weight = nn.Parameter(saved_output)
+                model.config.tie_word_embeddings = False
+    return model
 
 
 def normalized_sequence_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -868,7 +886,7 @@ def load_joint_ranker(
 ) -> tuple[JointInverseRanker, Any, torch.device]:
     device = best_device(device_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-    generator = AutoModelForSeq2SeqLM.from_pretrained(model_path, local_files_only=True)
+    generator = load_generator_backbone(model_path)
     model = JointInverseRanker(generator)
     state = torch.load(Path(model_path) / "rank_head.pt", map_location="cpu", weights_only=True)
     model.rank_head.load_state_dict(state)
@@ -1020,5 +1038,5 @@ def type_compatibility_scores(
 def load_seq2seq(model_path: str, device_name: str = "auto") -> tuple[Any, Any, torch.device]:
     device = best_device(device_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_path, local_files_only=True).to(device)
+    model = load_generator_backbone(model_path).to(device)
     return model, tokenizer, device
