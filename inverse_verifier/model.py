@@ -144,6 +144,38 @@ class JointPathDataset(Dataset):
         }
 
 
+class FaithfulInverseDataset(Dataset):
+    """Generation targets for every path plus gold-vs-negative likelihood pairs."""
+
+    def __init__(self, rows: list[dict[str, Any]], seed: int = 17):
+        self.rows = rows
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, str]:
+        row = self.rows[index]
+        rng = random.Random(self.seed + self.epoch * len(self.rows) + index)
+        positive = row["positive_path"]
+        negative = row["negative_paths"][rng.randrange(len(row["negative_paths"]))]
+        generate_negative = (self.epoch + index) % 2 == 1
+        generation_path = negative if generate_negative else positive
+        generation_target = negative["question"] if generate_negative else row["question"]
+        return {
+            "generation_source": render_path(generation_path, mask_anchor=True),
+            "generation_target": generation_target,
+            "positive_source": render_path(positive, mask_anchor=True),
+            "negative_source": render_path(negative, mask_anchor=True),
+            "contrast_target": row["question"],
+            "negative_type": negative["negative_type"],
+        }
+
+
 def informative_answer_type(answer_type: str) -> bool:
     return answer_type.strip().casefold() not in UNINFORMATIVE_ANSWER_TYPES
 
@@ -302,6 +334,58 @@ class JointBatchCollator:
             "generation_labels": targets,
             "rank_input_ids": rank["input_ids"],
             "rank_attention_mask": rank["attention_mask"],
+            "batch_size": len(batch),
+            "negative_types": [item["negative_type"] for item in batch],
+        }
+
+
+@dataclass
+class FaithfulInverseCollator:
+    tokenizer: Any
+    max_source_length: int
+    max_target_length: int
+
+    def __call__(self, batch: list[dict[str, str]]) -> dict[str, Any]:
+        generation = self.tokenizer(
+            [item["generation_source"] for item in batch],
+            padding=True,
+            truncation=True,
+            max_length=self.max_source_length,
+            return_tensors="pt",
+        )
+        generation_labels = self.tokenizer(
+            text_target=[item["generation_target"] for item in batch],
+            padding=True,
+            truncation=True,
+            max_length=self.max_target_length,
+            return_tensors="pt",
+        )["input_ids"]
+        generation_labels[generation_labels == self.tokenizer.pad_token_id] = -100
+
+        contrast = self.tokenizer(
+            [item["positive_source"] for item in batch]
+            + [item["negative_source"] for item in batch],
+            padding=True,
+            truncation=True,
+            max_length=self.max_source_length,
+            return_tensors="pt",
+        )
+        contrast_targets = [item["contrast_target"] for item in batch] * 2
+        contrast_labels = self.tokenizer(
+            text_target=contrast_targets,
+            padding=True,
+            truncation=True,
+            max_length=self.max_target_length,
+            return_tensors="pt",
+        )["input_ids"]
+        contrast_labels[contrast_labels == self.tokenizer.pad_token_id] = -100
+        return {
+            "generation_input_ids": generation["input_ids"],
+            "generation_attention_mask": generation["attention_mask"],
+            "generation_labels": generation_labels,
+            "contrast_input_ids": contrast["input_ids"],
+            "contrast_attention_mask": contrast["attention_mask"],
+            "contrast_labels": contrast_labels,
             "batch_size": len(batch),
             "negative_types": [item["negative_type"] for item in batch],
         }
@@ -520,6 +604,49 @@ def evaluate_type_aware_loader(
     }
 
 
+@torch.no_grad()
+def evaluate_faithful_loader(
+    model: Any,
+    loader: DataLoader,
+    device: torch.device,
+    margin: float,
+    temperature: float,
+) -> dict[str, float]:
+    model.eval()
+    totals = {"generation_nll": 0.0, "rank_loss": 0.0, "pair_accuracy": 0.0, "examples": 0}
+    for batch in loader:
+        size = batch["batch_size"]
+        tensors = batch_to_device(batch, device)
+        generated = model(
+            input_ids=tensors["generation_input_ids"],
+            attention_mask=tensors["generation_attention_mask"],
+            labels=tensors["generation_labels"],
+        )
+        generation_nll = normalized_sequence_nll(
+            generated.logits, tensors["generation_labels"]
+        )
+        contrasted = model(
+            input_ids=tensors["contrast_input_ids"],
+            attention_mask=tensors["contrast_attention_mask"],
+            labels=tensors["contrast_labels"],
+        )
+        contrast_nll = normalized_sequence_nll(
+            contrasted.logits, tensors["contrast_labels"]
+        )
+        positive_nll, negative_nll = contrast_nll[:size], contrast_nll[size:]
+        rank_loss = (
+            F.softplus((positive_nll - negative_nll + margin) / temperature) * temperature
+        )
+        totals["generation_nll"] += generation_nll.sum().item()
+        totals["rank_loss"] += rank_loss.sum().item()
+        totals["pair_accuracy"] += positive_nll.lt(negative_nll).sum().item()
+        totals["examples"] += size
+    count = max(int(totals["examples"]), 1)
+    return {key: value / count for key, value in totals.items() if key != "examples"} | {
+        "examples": count
+    }
+
+
 def train_model(
     train_path: Path,
     dev_path: Path,
@@ -551,7 +678,7 @@ def train_model(
         raise ValueError("training and development splits must both be non-empty")
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True)
-    generator = AutoModelForSeq2SeqLM.from_pretrained(base_model, local_files_only=True)
+    generator = load_generator_backbone(base_model)
     is_joint_ranker = objective in {"joint", "ranker"}
     model: Any = JointInverseRanker(generator).to(device) if is_joint_ranker else generator.to(device)
     inherited_rank_head = Path(base_model) / "rank_head.pt"
@@ -574,6 +701,10 @@ def train_model(
         train_dataset = TypeAwareGeneratorDataset(train_rows, seed)
         dev_dataset = TypeAwareGeneratorDataset(dev_rows, seed + 1)
         collator = Seq2SeqTaskCollator(tokenizer, max_source_length, max_target_length)
+    elif objective == "faithful_inverse":
+        train_dataset = FaithfulInverseDataset(train_rows, seed)
+        dev_dataset = FaithfulInverseDataset(dev_rows, seed + 1)
+        collator = FaithfulInverseCollator(tokenizer, max_source_length, max_target_length)
     else:
         raise ValueError(f"unknown objective: {objective}")
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collator)
@@ -614,8 +745,34 @@ def train_model(
                     generation_loss = torch.zeros((), device=device)
                     loss = rank_loss
             else:
-                outputs = model(**tensors)
-                nll = normalized_sequence_nll(outputs.logits, tensors["labels"])
+                if objective == "faithful_inverse":
+                    generated = model(
+                        input_ids=tensors["generation_input_ids"],
+                        attention_mask=tensors["generation_attention_mask"],
+                        labels=tensors["generation_labels"],
+                    )
+                    generation_loss = normalized_sequence_nll(
+                        generated.logits, tensors["generation_labels"]
+                    ).mean()
+                    contrasted = model(
+                        input_ids=tensors["contrast_input_ids"],
+                        attention_mask=tensors["contrast_attention_mask"],
+                        labels=tensors["contrast_labels"],
+                    )
+                    contrast_nll = normalized_sequence_nll(
+                        contrasted.logits, tensors["contrast_labels"]
+                    )
+                    positive_nll, negative_nll = contrast_nll[:size], contrast_nll[size:]
+                    rank_loss = (
+                        F.softplus(
+                            (positive_nll - negative_nll + margin) / temperature
+                        )
+                        * temperature
+                    ).mean()
+                    loss = generation_loss + rank_weight * rank_loss
+                else:
+                    outputs = model(**tensors)
+                    nll = normalized_sequence_nll(outputs.logits, tensors["labels"])
             if objective == "inverse":
                 positive_nll, negative_nll = nll[:size], nll[size:]
                 generation_loss = positive_nll.mean()
@@ -631,6 +788,8 @@ def train_model(
                 generation_loss = nll.mean()
                 rank_loss = torch.zeros((), device=device)
                 loss = generation_loss
+            elif objective == "faithful_inverse":
+                pass
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -667,6 +826,10 @@ def train_model(
                 model, dev_loader, tokenizer, device
             )
             dev_metrics["pair_accuracy"] = dev_metrics["type_accuracy"]
+        elif objective == "faithful_inverse":
+            dev_metrics = evaluate_faithful_loader(
+                model, dev_loader, device, margin, temperature
+            )
         else:
             dev_metrics = evaluate_joint_loader(
                 model,
@@ -696,10 +859,14 @@ def train_model(
             f"pair_accuracy={dev_metrics['pair_accuracy']:.3f}",
             flush=True,
         )
-        selection_loss = dev_metrics["generation_nll"] + dev_metrics.get("type_nll", 0.0)
+        selection_loss = (
+            dev_metrics["generation_nll"] + dev_metrics.get("rank_loss", 0.0)
+            if objective == "faithful_inverse"
+            else dev_metrics["generation_nll"] + dev_metrics.get("type_nll", 0.0)
+        )
         improved = (
             selection_loss < best_dev_loss
-            if objective == "type_aware_generator"
+            if objective in {"type_aware_generator", "faithful_inverse"}
             else dev_metrics["pair_accuracy"] > best_pair_accuracy
         )
         if improved:

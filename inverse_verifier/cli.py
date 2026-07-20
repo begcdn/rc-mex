@@ -9,6 +9,7 @@ from .evaluate import evaluate, evaluate_gold_generation
 from .model import train_model
 from .selector import run_verifier_pipeline
 from .retrieval import SRTK_SCORER, run_retrieval_probe
+from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
 
 
 DEFAULT_DATA_DIR = Path("runs/inverse_verifier/data")
@@ -41,6 +42,48 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--webqsp-train-graphs", type=Path, default=Path("data/webqsp/train.jsonl"))
     prepare.add_argument("--output", type=Path, default=DEFAULT_DATA_DIR)
 
+    synthesize = subparsers.add_parser(
+        "synthesize", help="sample balanced executable paths with faithful question targets"
+    )
+    synthesize.add_argument("--kqa-kb", type=Path, default=Path("data/kqa_pro/kb.json"))
+    synthesize.add_argument(
+        "--webqsp-graphs", type=Path, default=Path("data/webqsp/train.jsonl")
+    )
+    synthesize.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/faithful_data")
+    )
+    synthesize.add_argument("--paths", type=int, default=30_000)
+    synthesize.add_argument("--seed", type=int, default=17)
+
+    naturalize = subparsers.add_parser(
+        "naturalize", help="rewrite controlled faithful questions with a local Ollama model"
+    )
+    naturalize.add_argument(
+        "--data", type=Path, default=Path("runs/inverse_verifier/faithful_data")
+    )
+    naturalize.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/faithful_data_natural")
+    )
+    naturalize.add_argument("--model", default="qwen3:8b")
+    naturalize.add_argument("--ollama-host", default="http://127.0.0.1:11434")
+
+    faithfulness = subparsers.add_parser(
+        "faithfulness", help="compare gold and executable-negative generated questions"
+    )
+    faithfulness.add_argument(
+        "--data",
+        type=Path,
+        default=Path("runs/inverse_verifier/faithful_data_natural/dev_faithful.jsonl"),
+    )
+    faithfulness.add_argument("--model", required=True)
+    faithfulness.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/faithfulness_eval")
+    )
+    faithfulness.add_argument("--semantic-model", default="BAAI/bge-small-en-v1.5")
+    faithfulness.add_argument("--limit", type=int, default=500)
+    faithfulness.add_argument("--batch-size", type=int, default=16)
+    faithfulness.add_argument("--device", default="auto")
+
     train = subparsers.add_parser("train", help="fine-tune the inverse generator")
     train.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
     train.add_argument("--output", type=Path, default=DEFAULT_TRAIN_DIR)
@@ -49,10 +92,21 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--batch-size", type=int, default=8)
     train.add_argument("--learning-rate", type=float, default=2e-4)
     train.add_argument("--rank-weight", type=float, default=1.0)
-    train.add_argument("--regime", choices=("kqa_only", "multi_kg"), default="kqa_only")
+    train.add_argument(
+        "--regime",
+        choices=("kqa_only", "multi_kg", "faithful_synthetic"),
+        default="kqa_only",
+    )
     train.add_argument(
         "--objective",
-        choices=("type_aware_generator", "inverse", "direct", "joint", "ranker"),
+        choices=(
+            "faithful_inverse",
+            "type_aware_generator",
+            "inverse",
+            "direct",
+            "joint",
+            "ranker",
+        ),
         default="type_aware_generator",
     )
     train.add_argument("--device", default="auto")
@@ -150,9 +204,48 @@ def main() -> None:
         print("[3/3] Writing split manifest", flush=True)
         print(json.dumps(manifest["counts"], indent=2))
         print(f"Prepared data in {args.output}")
+    elif args.command == "synthesize":
+        print("[1/3] Loading executable KQA Pro and WebQSP training graphs", flush=True)
+        print("[2/3] Sampling balanced one-, two-, and three-hop paths", flush=True)
+        manifest = synthesize_corpus(
+            args.kqa_kb,
+            args.webqsp_graphs,
+            args.output,
+            total_paths=args.paths,
+            seed=args.seed,
+        )
+        print("[3/3] Writing faithful train/dev corpus", flush=True)
+        print(json.dumps(manifest, indent=2))
+        print(f"Prepared faithful data in {args.output}")
+    elif args.command == "naturalize":
+        print("Naturalizing faithful questions with complete-hop checks", flush=True)
+        manifest = naturalize_corpus(
+            args.data,
+            args.output,
+            model=args.model,
+            host=args.ollama_host,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Prepared natural faithful data in {args.output}")
+    elif args.command == "faithfulness":
+        metrics = evaluate_faithful_generation(
+            args.data,
+            args.model,
+            args.output,
+            semantic_model=args.semantic_model,
+            limit=args.limit,
+            batch_size=args.batch_size,
+            device=args.device,
+        )
+        print(json.dumps(metrics, indent=2))
+        print(f"Wrote faithfulness evaluation to {args.output}")
     elif args.command == "train":
-        train_name = "train_multi_kg.jsonl" if args.regime == "multi_kg" else "train.jsonl"
-        dev_name = "dev_multi_kg.jsonl" if args.regime == "multi_kg" else "dev.jsonl"
+        names = {
+            "kqa_only": ("train.jsonl", "dev.jsonl"),
+            "multi_kg": ("train_multi_kg.jsonl", "dev_multi_kg.jsonl"),
+            "faithful_synthetic": ("train_faithful.jsonl", "dev_faithful.jsonl"),
+        }
+        train_name, dev_name = names[args.regime]
         run = train_model(
             args.data / train_name,
             args.data / dev_name,

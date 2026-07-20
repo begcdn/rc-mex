@@ -21,12 +21,21 @@ from inverse_verifier.data import (
 from inverse_verifier.metrics import ranking_metrics, rouge_l, token_f1
 from inverse_verifier.evaluate import generated_question_similarity_scores, similarity_distribution
 from inverse_verifier.model import (
+    FaithfulInverseDataset,
     TypeAwareGeneratorDataset,
     direct_prompt,
     informative_answer_type,
     normalized_sequence_nll,
     rank_prompt,
     type_compatibility_prompt,
+)
+from inverse_verifier.synthetic import (
+    ConcretePath,
+    Edge,
+    ExecutableGraph,
+    canonical_question,
+    example_from_path,
+    question_covers_path,
 )
 from inverse_verifier.selector import (
     answer_metrics,
@@ -361,3 +370,95 @@ def test_split_assignment_returns_disjoint_heldout_relations() -> None:
     }
     assert heldout
     assert not (train_relations & heldout)
+
+
+def test_canonical_question_preserves_every_relation_and_direction() -> None:
+    path = PathSpec(
+        "Book A",
+        "written work",
+        (
+            Hop("author", "forward", "written work", "person"),
+            Hop("place of birth", "forward", "person", "city"),
+            Hop("country", "forward", "city", "country"),
+        ),
+        "country",
+        "toy",
+    )
+    question = canonical_question(path)
+    assert question_covers_path(question, path)
+    assert question.count("forward") == 3
+    assert all(relation in question for relation in ("author", "place of birth", "country"))
+
+
+def test_executable_synthetic_example_assigns_distinct_questions_to_negatives() -> None:
+    graph = ExecutableGraph(
+        adjacency={
+            "book": [Edge("writer", "author", "forward")],
+            "writer": [
+                Edge("city", "place of birth", "forward"),
+                Edge("book", "author", "backward"),
+            ],
+            "city": [Edge("country", "country", "forward")],
+            "country": [],
+        },
+        labels={
+            "book": "Book A",
+            "writer": "Writer A",
+            "city": "London",
+            "country": "United Kingdom",
+        },
+        types={
+            "book": "written work",
+            "writer": "person",
+            "city": "city",
+            "country": "country",
+        },
+        kg="toy",
+    )
+    path = ConcretePath(
+        PathSpec(
+            "Book A",
+            "written work",
+            (Hop("author", "forward", "written work", "person"),),
+            "person",
+            "toy",
+        ),
+        ("book", "writer"),
+    )
+    example = example_from_path(graph, path, 0, __import__("random").Random(3))
+    assert example is not None
+    added = next(row for row in example["negative_paths"] if row["negative_type"] == "added_hop")
+    assert added["question"] != example["question"]
+    assert "place of birth" in added["question"]
+    assert question_covers_path(added["question"], added)
+
+
+def test_faithful_dataset_generates_negative_intent_and_contrasts_with_gold() -> None:
+    row = {
+        "question": "What person do you reach from [ENTITY] if you follow author forward to a person?",
+        "positive_path": {
+            "anchor": "Book A",
+            "anchor_type": "book",
+            "hops": [{"relation": "author", "direction": "forward", "source_type": "book", "target_type": "person"}],
+            "answer_type": "person",
+            "kg": "toy",
+        },
+        "negative_paths": [{
+            "anchor": "Book A",
+            "anchor_type": "book",
+            "hops": [
+                {"relation": "author", "direction": "forward", "source_type": "book", "target_type": "person"},
+                {"relation": "place of birth", "direction": "forward", "source_type": "person", "target_type": "city"},
+            ],
+            "answer_type": "city",
+            "kg": "toy",
+            "negative_type": "added_hop",
+            "question": "Which city is the birthplace of the author of [ENTITY]?",
+        }],
+    }
+    dataset = FaithfulInverseDataset([row])
+    dataset.set_epoch(1)
+    item = dataset[0]
+    assert item["generation_target"] == row["negative_paths"][0]["question"]
+    assert item["contrast_target"] == row["question"]
+    assert "place of birth" in item["negative_source"]

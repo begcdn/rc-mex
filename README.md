@@ -26,6 +26,8 @@ were not publicly released. The inverse verifier is the component under study.
 - `docs/inverse_verifier_generation_report.md` freezes the generator training,
   results, and known weaknesses.
 - `docs/inverse_verifier_hypothesis.md` states the mechanism and falsifying experiment.
+- `docs/faithful_inverse_training.md` defines the balanced executable corpus and
+  the path-faithfulness objective introduced after the full-pipeline failure analysis.
 - `AGENTS.md` and `docs/research_protocol.md` define the research discipline.
 - `data/` contains local datasets and is ignored by Git.
 - `runs/` contains local experimental outputs and is ignored by Git.
@@ -37,18 +39,31 @@ Intermediate and answer entity names are hidden. KQA relations and relation
 compositions are withheld for dedicated transfer splits, and official WebQSP
 test questions remain disjoint from the multi-KG training data.
 
+The current follow-up generates a balanced executable path corpus, optionally
+naturalizes its controlled questions with a local model, and optimizes both
+complete intent generation and gold-vs-hard-negative sequence likelihood.
+
 ```bash
-python3 -m inverse_verifier prepare
+python3 -m inverse_verifier synthesize \
+  --paths 30000 \
+  --output runs/inverse_verifier/faithful_data
+
+python3 -m inverse_verifier naturalize \
+  --data runs/inverse_verifier/faithful_data \
+  --output runs/inverse_verifier/faithful_data_natural \
+  --model qwen3:8b
 
 python3 -m inverse_verifier train \
+  --data runs/inverse_verifier/faithful_data_natural \
   --base-model runs/inverse_verifier/joint_ranker_multi_kg_b4/model \
-  --regime multi_kg \
-  --objective type_aware_generator \
-  --output runs/inverse_verifier/type_aware_generator_multi_kg
+  --regime faithful_synthetic \
+  --objective faithful_inverse \
+  --output runs/inverse_verifier/faithful_inverse
 
-python3 -m inverse_verifier generate \
-  --model runs/inverse_verifier/type_aware_generator_multi_kg/model \
-  --output runs/inverse_verifier/type_aware_generation_eval
+python3 -m inverse_verifier faithfulness \
+  --data runs/inverse_verifier/faithful_data_natural/dev_faithful.jsonl \
+  --model runs/inverse_verifier/faithful_inverse/model \
+  --output runs/inverse_verifier/faithful_inverse_eval
 ```
 
 For a quick local check, add `--limit 128` to training and
@@ -83,9 +98,10 @@ python3 -m inverse_verifier verify \
   --output runs/inverse_verifier/full_pipeline_old_generator_100
 ```
 
-This run intentionally uses the frozen pre-type-aware generator. The later
-type-aware checkpoint is retained only as an ablation because it reduced
-question-generation quality in the matched gold-path evaluation.
+This run intentionally uses the frozen pre-type-aware generator. Its 100-question
+controlled run reached 90% candidate-path recall but selected the gold path only
+37% of the time. The faithful inverse experiment directly targets the observed
+hop omission and direction failures before full retrieval is rerun.
 
 The current controlled WebQSP run uses the supplied topic entities and local
 question neighborhoods. It therefore tests path retrieval and verification,
