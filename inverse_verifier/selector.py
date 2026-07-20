@@ -19,7 +19,7 @@ from .data import (
     relation_sequence,
     write_jsonl,
 )
-from .model import generate_joint_questions, load_seq2seq, type_compatibility_scores
+from .model import generate_joint_questions, load_seq2seq
 from .retrieval import (
     MAX_HOPS,
     PATH_CAP,
@@ -137,12 +137,6 @@ def run_verifier_pipeline(
     device: str = "auto",
 ) -> dict[str, Any]:
     started = time.time()
-    marker = Path(model_path) / "type_aware_generator.json"
-    if not marker.exists():
-        raise ValueError(
-            "verification now requires a type-aware generator checkpoint; "
-            f"missing {marker}"
-        )
     metadata = supported_questions(questions_path)
     encoder = SentenceTransformer(SEMANTIC_MODEL, local_files_only=True)
     generator, tokenizer, model_device = load_seq2seq(model_path, device)
@@ -193,52 +187,17 @@ def run_verifier_pipeline(
                 similarities = np.sum(
                     reference_embeddings * generated_embeddings, axis=1
                 ).tolist()
-                endpoint_types = [
-                    family["path"].get("answer_type", "answer entity") for family in batch
-                ]
-                original_type_scores = type_compatibility_scores(
-                    generator,
-                    tokenizer,
-                    reference_intents,
-                    endpoint_types,
-                    model_device,
-                    batch_size=VERIFY_BATCH_SIZE,
-                )
-                generated_type_scores = type_compatibility_scores(
-                    generator,
-                    tokenizer,
-                    generated_intents,
-                    endpoint_types,
-                    model_device,
-                    batch_size=VERIFY_BATCH_SIZE,
-                )
-                for position, (family, generated_question, similarity) in enumerate(
-                    zip(batch, generated, similarities, strict=True)
+                for family, generated_question, similarity in zip(
+                    batch, generated, similarities, strict=True
                 ):
-                    original_type_score = original_type_scores[position]
-                    generated_type_score = generated_type_scores[position]
                     verified.append(
                         {
                             **family,
                             "generated_question": generated_question,
                             "semantic_similarity": float(similarity),
-                            "path_endpoint_answer_type": family["path"].get(
-                                "answer_type", "answer entity"
-                            ),
-                            "original_question_type_compatibility": float(
-                                original_type_score
-                            ),
-                            "generated_question_type_compatibility": float(
-                                generated_type_score
-                            ),
-                            "answer_type_compatible": bool(
-                                original_type_score >= 0.5
-                                and generated_type_score >= 0.5
-                            ),
                         }
                     )
-                compatible = [item for item in verified if item["answer_type_compatible"]]
-                if compatible and max(item["semantic_similarity"] for item in compatible) >= ACCEPT_THRESHOLD:
+                if max(item["semantic_similarity"] for item in verified) >= ACCEPT_THRESHOLD:
                     stopped_on_threshold = True
                     break
 
@@ -246,8 +205,7 @@ def run_verifier_pipeline(
                 print(f"{len(results) + 1}/{limit} {graph_row['id']}: no candidate paths", flush=True)
                 continue
 
-            compatible = [item for item in verified if item["answer_type_compatible"]]
-            selected = max(compatible, key=lambda item: item["semantic_similarity"]) if compatible else None
+            selected = max(verified, key=lambda item: item["semantic_similarity"])
             selected_is_gold = bool(
                 selected and tuple(selected["relation_sequence"]) in set(gold_sequences)
             )
@@ -276,9 +234,8 @@ def run_verifier_pipeline(
                 "gold_was_verified": bool(
                     proposal_gold_rank is not None and proposal_gold_rank <= len(verified)
                 ),
-                "no_type_compatible_candidate": not compatible,
                 "low_confidence_unhandled": bool(
-                    selected and selected["semantic_similarity"] < 0.5
+                    selected["semantic_similarity"] < 0.5
                 ),
             }
             results.append(result)
@@ -304,8 +261,7 @@ def run_verifier_pipeline(
         "accept_threshold": ACCEPT_THRESHOLD,
         "semantic_model": SEMANTIC_MODEL,
         "generator_model": model_path,
-        "answer_type_check": "learned question/type compatibility task",
-        "answer_type_threshold": 0.5,
+        "verification_signal": "generated-question semantic similarity",
         "gold_topic_entity_used": True,
         "gold_path_or_hop_count_used_during_search": False,
         "raw_path_recall": sum(row["proposal_gold_rank"] is not None for row in results)
@@ -333,10 +289,6 @@ def run_verifier_pipeline(
         "false_early_accept_rate": sum(row["false_early_accept"] for row in results)
         / max(count, 1),
         "low_confidence_rate": sum(row["low_confidence_unhandled"] for row in results)
-        / max(count, 1),
-        "no_type_compatible_candidate_rate": sum(
-            row["no_type_compatible_candidate"] for row in results
-        )
         / max(count, 1),
         "average_paths_verified": sum(row["paths_verified"] for row in results) / max(count, 1),
         "average_path_families": sum(row["path_families_generated"] for row in results)

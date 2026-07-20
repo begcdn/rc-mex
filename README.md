@@ -9,9 +9,9 @@ The active experiment separates two jobs:
    returns their union subgraph.
 2. A compact inverse generator verbalizes what each path means. Its generated
    question is compared with the user's question to verify the path.
-3. The same generator is fine-tuned on an auxiliary question/type compatibility
-   task. This check is run separately; the path-to-question output remains an
-   ordinary question and there is no path-ranking head in the active method.
+3. Candidate paths are ranked by semantic similarity between the reconstructed
+   question and the user's question. The endpoint entities of the selected
+   executable path become the predicted answers.
 
 The retriever uses the released SRTK iterative relation-path implementation and
 its multi-KG scorer. This is a PullNet-style retrieve-then-reason boundary, not
@@ -78,24 +78,14 @@ Scores below 0.5 are logged but deliberately have no fallback yet.
 
 ```bash
 python3 -m inverse_verifier verify \
-  --model runs/inverse_verifier/type_aware_generator_multi_kg/model \
+  --model runs/inverse_verifier/joint_ranker_multi_kg_b4/model \
   --limit 100 \
-  --output runs/inverse_verifier/type_aware_path_verifier_100
+  --output runs/inverse_verifier/full_pipeline_old_generator_100
 ```
 
-During fine-tuning, every path/question example supplies the ordinary
-path-to-question target. Examples with informative endpoint types also supply a
-second task:
-
-```text
-question + candidate endpoint type -> yes/no type compatibility
-```
-
-Gold endpoint types are positive examples. Synthetic wrong endpoint types are
-negative examples. At verification time, a path may pass only when both the
-original question and the generated question are compatible with its endpoint
-type. These compatibility decisions are separate from semantic question
-similarity and are recorded independently.
+This run intentionally uses the frozen pre-type-aware generator. The later
+type-aware checkpoint is retained only as an ablation because it reduced
+question-generation quality in the matched gold-path evaluation.
 
 The current controlled WebQSP run uses the supplied topic entities and local
 question neighborhoods. It therefore tests path retrieval and verification,

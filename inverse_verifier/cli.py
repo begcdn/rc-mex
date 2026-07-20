@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--graphs", type=Path, default=Path("data/webqsp/test.jsonl"))
     verify.add_argument(
-        "--model", default="runs/inverse_verifier/type_aware_generator_multi_kg/model"
+        "--model", default="runs/inverse_verifier/joint_ranker_multi_kg_b4/model"
     )
     verify.add_argument("--retriever-model", default=SRTK_SCORER)
     verify.add_argument(
