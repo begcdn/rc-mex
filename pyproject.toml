@@ -9,9 +9,9 @@ description = "Inverse path-to-question verification experiments for multi-hop K
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
-  "sentence-transformers>=3.0",
-  "torch>=2.1",
-  "transformers>=4.40",
+  "sentence-transformers==3.3.1",
+  "torch>=2.1,<2.7",
+  "transformers==4.46.3",
 ]
 
 [project.optional-dependencies]
