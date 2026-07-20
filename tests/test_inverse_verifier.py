@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from inverse_verifier.data import (
+    ENTITY_PLACEHOLDER,
+    PathSpec,
+    Hop,
+    delexicalize_question,
+    extract_kqa_examples,
+    make_negative_paths,
+    parse_sparql_path,
+    relation_inventory,
+    render_path,
+    assign_kqa_splits,
+)
+from inverse_verifier.metrics import ranking_metrics, rouge_l, token_f1
+from inverse_verifier.evaluate import generated_question_similarity_scores, similarity_distribution
+from inverse_verifier.model import (
+    TypeAwareGeneratorDataset,
+    direct_prompt,
+    informative_answer_type,
+    normalized_sequence_nll,
+    rank_prompt,
+    type_compatibility_prompt,
+)
+from inverse_verifier.selector import (
+    answer_metrics,
+    enumerate_path_families,
+    first_gold_rank,
+)
+from inverse_verifier.retrieval import (
+    LocalQuestionGraph,
+    decode_edge,
+    encode_edge,
+    gold_path_available,
+    materialize_path,
+)
+
+
+def test_extracts_chain_without_answer_or_intermediate_names(tmp_path: Path) -> None:
+    source = tmp_path / "kqa.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "question": "Which country was the author of Book A born in?",
+                    "answer": "Country Z",
+                    "program": [
+                        {"function": "Find", "inputs": ["Book A"]},
+                        {"function": "Relate", "inputs": ["author", "forward"]},
+                        {"function": "FilterConcept", "inputs": ["human"]},
+                        {"function": "Relate", "inputs": ["place of birth", "forward"]},
+                        {"function": "FilterConcept", "inputs": ["country"]},
+                        {"function": "What", "inputs": []},
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rows = extract_kqa_examples(source)
+    assert len(rows) == 1
+    rendered = render_path(rows[0][2])
+    assert "Book A" in rendered
+    assert "Country Z" not in rendered
+    assert "NODE_1" in rendered and "ANSWER" in rendered
+    assert 'NODE_1 --["place of birth"]--> ANSWER' in rendered
+    assert not render_path(rows[0][2], include_instruction=False).endswith("Question:")
+
+
+def test_sparql_parser_recovers_forward_and_backward_direction() -> None:
+    forward = "ns:m.topic ns:people.person.place_of_birth ?x ."
+    backward = "?x ns:people.person.place_of_birth ns:m.topic ."
+    assert parse_sparql_path(forward, "m.topic", ["people.person.place_of_birth"]) == [
+        ("people.person.place_of_birth", "forward")
+    ]
+    assert parse_sparql_path(backward, "m.topic", ["people.person.place_of_birth"]) == [
+        ("people.person.place_of_birth", "backward")
+    ]
+
+
+def test_hard_negatives_are_structurally_distinct() -> None:
+    positive = PathSpec(
+        "Book A",
+        "written work",
+        (
+            Hop("author", "forward", "written work", "human"),
+            Hop("place of birth", "forward", "human", "country"),
+        ),
+        "country",
+        "toy",
+    )
+    alternate = PathSpec(
+        "Book B",
+        "written work",
+        (Hop("director", "forward", "written work", "human"),),
+        "human",
+        "toy",
+    )
+    inventory = relation_inventory([("a", "q", positive), ("b", "q", alternate)])
+    negatives = make_negative_paths(positive, inventory, "fixed")
+    categories = {row["negative_type"] for row in negatives}
+    assert {"wrong_direction", "wrong_relation", "wrong_order", "missing_hop", "wrong_answer_type"} <= categories
+    assert all(row["hops"] != [hop.__dict__ for hop in positive.hops] for row in negatives)
+
+
+def test_normalized_nll_and_ranking_metrics() -> None:
+    logits = torch.tensor([[[4.0, 0.0], [0.0, 4.0]], [[0.0, 4.0], [4.0, 0.0]]])
+    labels = torch.tensor([[0, 1], [0, 1]])
+    nll = normalized_sequence_nll(logits, labels)
+    assert nll[0] < nll[1]
+    rows = [
+        {
+            "candidates": [
+                {"is_positive": True, "negative_type": "positive", "score": 2.0},
+                {"is_positive": False, "negative_type": "wrong_order", "score": 1.0},
+            ]
+        }
+    ]
+    metrics = ranking_metrics(rows, "score")
+    assert metrics["recall_at_1"] == 1.0
+    assert metrics["pairwise_by_negative_type"]["wrong_order"] == 1.0
+    assert token_f1("who wrote the book", "Who wrote this book?") > 0.5
+    assert rouge_l("who wrote the book", "Who wrote this book?") > 0.5
+
+
+def test_ranking_accepts_any_annotated_positive() -> None:
+    rows = [
+        {
+            "candidates": [
+                {"is_positive": True, "negative_type": "positive", "score": 0.1},
+                {"is_positive": True, "negative_type": "alternate_positive", "score": 0.9},
+                {"is_positive": False, "negative_type": "wrong_relation", "score": 0.8},
+            ]
+        }
+    ]
+    metrics = ranking_metrics(rows, "score")
+    assert metrics["recall_at_1"] == 1.0
+    assert metrics["pairwise_accuracy"] == 1.0
+
+
+def test_ranking_does_not_award_stable_sort_ties() -> None:
+    rows = [
+        {
+            "candidates": [
+                {"is_positive": True, "negative_type": "positive", "score": 1.0},
+                {"is_positive": False, "negative_type": "wrong_direction", "score": 1.0},
+            ]
+        }
+    ]
+    metrics = ranking_metrics(rows, "score")
+    assert metrics["recall_at_1"] == 0.5
+    assert metrics["strict_recall_at_1"] == 0.0
+    assert metrics["top_score_tie_rate"] == 1.0
+
+
+def test_direct_prompt_sees_question_and_same_oriented_path() -> None:
+    path = PathSpec(
+        "Book A",
+        "written work",
+        (Hop("author", "forward", "written work", "person"),),
+        "person",
+        "toy",
+    )
+    prompt = direct_prompt("Who wrote Book A?", json.loads(json.dumps(path, default=lambda x: x.__dict__)))
+    assert "Who wrote Book A?" in prompt
+    assert 'START --["author"]--> ANSWER' in prompt
+
+
+def test_joint_prompt_masks_linked_entity_but_keeps_relation_intent() -> None:
+    path = PathSpec(
+        "Harry Potter",
+        "written work",
+        (
+            Hop("author", "forward", "written work", "person"),
+            Hop("place of birth", "forward", "person", "country"),
+        ),
+        "country",
+        "toy",
+    )
+    path_dict = json.loads(json.dumps(path, default=lambda value: value.__dict__))
+    prompt = rank_prompt("Which country was the author of Harry Potter born in?", path_dict)
+    assert "Harry Potter" not in prompt
+    assert ENTITY_PLACEHOLDER in prompt
+    assert "author" in prompt and "place of birth" in prompt
+
+
+def test_delexicalization_handles_exact_and_conservative_surface_forms() -> None:
+    assert delexicalize_question("Who wrote Harry Potter?", "Harry Potter") == "Who wrote [ENTITY]?"
+    assert delexicalize_question("What do Jamaican people speak?", "Jamaica") == (
+        "What do [ENTITY] people speak?"
+    )
+
+
+def test_generated_similarity_masks_shared_entity_names() -> None:
+    class RecordingEncoder:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def encode(self, texts, **_kwargs):
+            self.calls.append(list(texts))
+            return np.ones((len(texts), 2), dtype=np.float32)
+
+    encoder = RecordingEncoder()
+    path = {"anchor": "Harry Potter"}
+    scores = generated_question_similarity_scores(
+        encoder,
+        ["Who wrote Harry Potter?"],
+        ["Who is the author of Harry Potter?"],
+        [path],
+        batch_size=1,
+    )
+    assert scores == [2.0]
+    assert encoder.calls == [
+        ["Who wrote [ENTITY]?"],
+        ["Who is the author of [ENTITY]?"],
+    ]
+
+
+def test_similarity_distribution_reports_threshold_rates() -> None:
+    metrics = similarity_distribution([0.5, 0.7, 0.8, 0.95])
+    assert metrics["examples"] == 4
+    assert metrics["at_least_0_8"] == 0.5
+    assert metrics["at_least_0_9"] == 0.25
+
+
+def test_selector_enumerates_relation_families_with_all_answer_bindings() -> None:
+    graph_row = {
+        "q_entity": ["Book A"],
+        "graph": [
+            ["Book A", "book.author", "Writer A"],
+            ["Book A", "book.author", "Writer B"],
+            ["Writer A", "person.birthplace", "London"],
+            ["Writer B", "person.birthplace", "Paris"],
+            ["Book A", "common.topic.notable_types", "Book"],
+        ],
+    }
+    families = enumerate_path_families(graph_row)
+    family = next(
+        row
+        for row in families
+        if row["relation_sequence"]
+        == ["book.author::forward", "person.birthplace::forward"]
+    )
+    assert family["answers"] == ["London", "Paris"]
+    assert first_gold_rank([family], [("book.author::forward", "person.birthplace::forward")]) == 1
+
+
+def test_selector_answer_metrics_support_multi_answer_sets() -> None:
+    metrics = answer_metrics(["London", "Paris"], ["Paris", "Rome"])
+    assert metrics["precision"] == 0.5
+    assert metrics["recall"] == 0.5
+    assert metrics["f1"] == 0.5
+    assert metrics["exact_match"] == 0.0
+    assert metrics["has_correct_answer"] == 1.0
+
+
+def test_type_aware_generator_uses_separate_generation_and_type_tasks() -> None:
+    row = {
+        "question": "Which country was the author of Book A born in?",
+        "positive_path": {
+            "anchor": "Book A",
+            "anchor_type": "written work",
+            "hops": [
+                {
+                    "relation": "author",
+                    "direction": "forward",
+                    "source_type": "written work",
+                    "target_type": "person",
+                },
+                {
+                    "relation": "place of birth",
+                    "direction": "forward",
+                    "source_type": "person",
+                    "target_type": "country",
+                },
+            ],
+            "answer_type": "country",
+            "kg": "toy",
+        },
+        "alternate_positive_paths": [],
+        "negative_paths": [
+            {
+                "answer_type": "person",
+                "negative_type": "wrong_answer_type",
+            }
+        ],
+    }
+    dataset = TypeAwareGeneratorDataset([row])
+    generation = dataset[0]
+    assert generation["task"] == "question_generation"
+    assert generation["target"] == "Which country was the author of [ENTITY] born in?"
+    assert "Answer type" not in generation["target"]
+    type_example = dataset[1]
+    assert type_example["task"] == "answer_type_compatibility"
+    assert type_example["target"] in {"yes", "no"}
+    assert "Candidate answer type:" in type_example["source"]
+    assert informative_answer_type("country")
+    assert not informative_answer_type("answer entity")
+    assert "yes or no" in type_compatibility_prompt("Where?", "city")
+
+
+def test_local_retrieval_graph_preserves_relation_direction() -> None:
+    graph = LocalQuestionGraph(
+        [
+            ["Book A", "book.author", "Writer A"],
+            ["Writer A", "person.birthplace", "London"],
+            ["Book A", "common.topic.notable_types", "Book"],
+        ]
+    )
+    assert encode_edge("book.author", "forward") in graph.get_neighbor_relations("Book A")
+    assert encode_edge("book.author", "backward") in graph.get_neighbor_relations("Writer A")
+    assert decode_edge("book.author::backward") == ("book.author", "backward")
+
+
+def test_materialized_candidate_path_keeps_all_answer_bindings_and_subgraph() -> None:
+    graph = LocalQuestionGraph(
+        [
+            ["Book A", "book.author", "Writer A"],
+            ["Book A", "book.author", "Writer B"],
+            ["Writer A", "person.birthplace", "London"],
+            ["Writer B", "person.birthplace", "Paris"],
+        ]
+    )
+    path, answers, triples = materialize_path(
+        graph,
+        "Book A",
+        ("book.author::forward", "person.birthplace::forward"),
+    )
+    assert answers == ["London", "Paris"]
+    assert len(path["hops"]) == 2
+    assert ["Writer A", "person.birthplace", "London"] in triples
+    assert gold_path_available(
+        graph,
+        ["Book A"],
+        [("book.author::forward", "person.birthplace::forward")],
+    )
+    assert not gold_path_available(graph, ["Book A"], [("book.publisher::forward",)])
+
+
+def test_split_assignment_returns_disjoint_heldout_relations() -> None:
+    rows = []
+    for index in range(100):
+        relation = f"relation {index % 10}"
+        path = PathSpec(
+            f"Anchor {index}",
+            "entity",
+            (Hop(relation, "forward", "entity", "thing"),),
+            "thing",
+            "toy",
+        )
+        rows.append((str(index), f"question {index}", path))
+    splits, heldout, _ = assign_kqa_splits(rows)
+    train_relations = {
+        hop.relation for _, _, path in splits["train"] + splits["dev"] for hop in path.hops
+    }
+    assert heldout
+    assert not (train_relations & heldout)

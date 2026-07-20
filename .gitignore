@@ -1,9 +1,11 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-data/
-runs/
-openai_runs/
+/data/
+/runs/
+/openai_runs/
 .env
-cache/
-.claude/
+/cache/
+/.claude/
+/*.pdf
+/*.xlsx

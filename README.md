@@ -1,69 +1,116 @@
-# Executable KGQA Research
+# Multi-Hop KGQA Research
 
-The active direction is reliable multi-hop KGQA through uncertain semantic
-structure and executable evidence. The old RC-MEX relation-card experiments
-remain in the repository as historical ablations; they are not the current
-architecture or research claim.
+This repository is a clean research workspace for a new method for reliable
+multi-hop question answering over knowledge graphs.
 
-## Current Hypothesis
+The active experiment separates two jobs:
 
-A question should not commit immediately to one path, one relation sequence,
-or one deterministic constraint parse. The current experiment represents the
-question with a small ensemble of schema-independent semantic sketches and
-jointly evaluates those sketches against executable query hypotheses and their
-denotations.
+1. A recall-oriented retriever proposes many executable relation paths and
+   returns their union subgraph.
+2. A compact inverse generator verbalizes what each path means. Its generated
+   question is compared with the user's question to verify the path.
+3. The same generator is fine-tuned on an auxiliary question/type compatibility
+   task. This check is run separately; the path-to-question output remains an
+   ordinary question and there is no path-ranking head in the active method.
 
-The generic sketch vocabulary includes relation roles, answer type, set
-operations, filters, temporal/numeric constraints, comparison, aggregation,
-and ordering. A question activates only the relevant subset. KG-specific
-adapters are responsible for storage details such as Freebase CVTs or Wikidata
-qualifiers; those details do not belong in the question semantics.
+The retriever uses the released SRTK iterative relation-path implementation and
+its multi-KG scorer. This is a PullNet-style retrieve-then-reason boundary, not
+an assertion that we are running PullNet itself: PullNet's source and checkpoint
+were not publicly released. The inverse verifier is the component under study.
 
-This first experiment changes the semantic representation used for relation
-proposal and final query selection. Retrieval mechanics and budgets, graph
-execution, and answer post-processing stay fixed. The evaluation firewall
-therefore reports separately whether gains come from better menu recall or
-better conditional selection. This is not yet the full proposed architecture.
+## Current Contents
 
-# Evaluation firewall and architecture ceilings
+- `inverse_verifier/` contains the one active data, training, and evaluation pipeline.
+- `inverse_verifier/retrieval.py` adapts SRTK to local question graphs and emits
+  candidate paths plus a retrieved subgraph.
+- `docs/inverse_verifier_generation_report.md` freezes the generator training,
+  results, and known weaknesses.
+- `docs/inverse_verifier_hypothesis.md` states the mechanism and falsifying experiment.
+- `AGENTS.md` and `docs/research_protocol.md` define the research discipline.
+- `data/` contains local datasets and is ignored by Git.
+- `runs/` contains local experimental outputs and is ignored by Git.
 
-Before changing the reasoning architecture, freeze a deterministic development
-slice and measure where answers disappear. This audit is offline: it makes no
-LLM calls and uses gold answers only for diagnostics.
+## Experiment
 
-```bash
-python3 -m rc_mex.run_architecture_ceiling \
-  --data data/cwq/train.jsonl \
-  --output runs/firewall_cwq500 \
-  --sample-size 500 \
-  --seed 20260711
-```
-
-The command writes `eval_questions.jsonl`, which is the only data file that
-should be used by the method run:
+The controlled data contains one- to three-relation KQA Pro and WebQSP chains.
+Intermediate and answer entity names are hidden. KQA relations and relation
+compositions are withheld for dedicated transfer splits, and official WebQSP
+test questions remain disjoint from the multi-KG training data.
 
 ```bash
-python3 -m rc_mex.run_query_selection \
-  --data runs/firewall_cwq500/eval_questions.jsonl \
-  --output runs/firewall_cwq500_qsel \
-  --max-hops 2 \
-  --model qwen3:8b
+python3 -m inverse_verifier prepare
+
+python3 -m inverse_verifier train \
+  --base-model runs/inverse_verifier/joint_ranker_multi_kg_b4/model \
+  --regime multi_kg \
+  --objective type_aware_generator \
+  --output runs/inverse_verifier/type_aware_generator_multi_kg
+
+python3 -m inverse_verifier generate \
+  --model runs/inverse_verifier/type_aware_generator_multi_kg/model \
+  --output runs/inverse_verifier/type_aware_generation_eval
 ```
 
-Then reconstruct the generated menus and attribute the observed failures:
+For a quick local check, add `--limit 128` to training and
+`--limit-per-split 32` to evaluation. Full outputs are limited to
+`metrics.json`, `predictions.jsonl`, and `report.md`.
+
+## Retrieval And Verification
+
+Install the maintained retrieval dependency:
 
 ```bash
-python3 -m rc_mex.run_architecture_ceiling \
-  --data runs/firewall_cwq500/eval_questions.jsonl \
-  --predictions runs/firewall_cwq500_qsel/predictions.jsonl \
-  --output runs/firewall_cwq500_audit \
-  --max-hops 2
+pip install -e '.[retrieval]'
 ```
 
-To prevent reuse of previously evaluated questions, repeat
-`--exclude-predictions path/to/old/predictions.jsonl` on the first command.
-The output separates supplied-subgraph coverage, exhaustive one/two-hop
-reachability, generated-menu recall, oracle menu F1, conditional selector
-accuracy, final answer metrics, and earliest failure stage. Full-Freebase
-coverage and formal operator coverage are explicitly left unmeasured because
-the converted RoG JSONL contains neither full Freebase nor gold SPARQL.
+Measure candidate-path and evidence recall without running the verifier:
+
+```bash
+python3 -m inverse_verifier retrieve \
+  --limit 100 \
+  --output runs/inverse_verifier/path_retrieval_100
+```
+
+Run retrieval followed by inverse verification. Candidates are checked in
+batches of five; verification stops when the best semantic similarity reaches
+0.85, or after 100 candidates, and otherwise selects the best seen candidate.
+Scores below 0.5 are logged but deliberately have no fallback yet.
+
+```bash
+python3 -m inverse_verifier verify \
+  --model runs/inverse_verifier/type_aware_generator_multi_kg/model \
+  --limit 100 \
+  --output runs/inverse_verifier/type_aware_path_verifier_100
+```
+
+During fine-tuning, every path/question example supplies the ordinary
+path-to-question target. Examples with informative endpoint types also supply a
+second task:
+
+```text
+question + candidate endpoint type -> yes/no type compatibility
+```
+
+Gold endpoint types are positive examples. Synthetic wrong endpoint types are
+negative examples. At verification time, a path may pass only when both the
+original question and the generated question are compatible with its endpoint
+type. These compatibility decisions are separate from semantic question
+similarity and are recorded independently.
+
+The current controlled WebQSP run uses the supplied topic entities and local
+question neighborhoods. It therefore tests path retrieval and verification,
+not standalone entity linking or full-Freebase serving.
+
+## Research Boundary
+
+Before implementation, record:
+
+1. The general failure in existing KGQA methods.
+2. The computational reason for that failure.
+3. The proposed mechanism and why it should address the cause.
+4. The strongest matched baselines.
+5. The smallest experiment that could reject the hypothesis.
+6. The intermediate and final-answer measurements that determine the result.
+
+Previous experimental methods remain recoverable from Git history, but they are
+not architectural dependencies or fallbacks for this experiment.
