@@ -21,6 +21,12 @@ GLOSSARY_MODEL = "gpt-4o-2024-11-20"
 VALIDATION_MODEL = "gpt-4o-2024-11-20"
 GLOSSARY_GROUP_SIZE = 6
 QWEN_GROUP_SIZE = 4
+VAGUE_PREDICATE_PHRASES = (
+    "associated with",
+    "related to",
+    "linked to",
+    "connected to",
+)
 
 GLOSSARY_SCHEMA = {
     "name": "relation_glossary",
@@ -349,7 +355,9 @@ def validation_records(rows: list[dict[str, Any]], glossary: dict[str, dict[str,
         "object, shared variables, and direction. Do not compress away an intermediate variable, "
         "transfer a person's property to an institution or place, or replace a predicate with a "
         "nearby predicate. For every preserved fact, report its zero-based fact_index and quote the "
-        "specific clause that expresses it. Use each index exactly once. The question must ask for "
+        "exact contiguous clause copied verbatim from the final question that expresses it; do not "
+        "write an explanation or mention variables in expressed_as. Use each index exactly once, "
+        "and use a distinct quoted clause for each fact. The question must ask for "
         "the declared return variable and answer type, and [ENTITY] must occur exactly once. Mark "
         "valid only if the draft already meets all rules. Use rewritten with a corrected question "
         "when possible. Reject incoherent or semantically unsupported queries. Generic wording such "
@@ -384,14 +392,26 @@ def validation_rejection(
         return "validator_rejected"
     if prediction.get("question", "").count("[ENTITY]") != 1:
         return "invalid_entity_placeholder"
+    question = prediction["question"].strip()
+    if not question.endswith("?"):
+        return "not_a_question"
+    if any(phrase in question.casefold() for phrase in VAGUE_PREDICATE_PHRASES):
+        return "vague_predicate_wording"
     if not prediction.get("answer_variable_preserved"):
         return "answer_variable_not_preserved"
     expected = list(range(len(query["facts"])))
-    covered = sorted(item.get("fact_index") for item in prediction.get("fact_coverage", []))
+    coverage = prediction.get("fact_coverage", [])
+    covered = sorted(item.get("fact_index") for item in coverage)
     if covered != expected:
         return "incomplete_fact_coverage"
-    if any(not item.get("expressed_as", "").strip() for item in prediction.get("fact_coverage", [])):
+    spans = [item.get("expressed_as", "").strip() for item in coverage]
+    if any(not span for span in spans):
         return "empty_fact_coverage_clause"
+    normalized_spans = [span.casefold() for span in spans]
+    if any(span not in question.casefold() for span in normalized_spans):
+        return "fact_coverage_not_in_question"
+    if len(set(normalized_spans)) != len(normalized_spans):
+        return "duplicate_fact_coverage_clause"
     return None
 
 
@@ -497,7 +517,7 @@ def build_naturalized_dataset(
     print(f"[4/5] Qwen produced {len(qwen)} candidate outputs", flush=True)
     validation_files = run_chat_records_sync(
         validation_records(rows, glossary, qwen, validation_model),
-        internal / "validation_sync_v2",
+        internal / "validation_sync_v3",
         client,
         "strict question validation",
     )

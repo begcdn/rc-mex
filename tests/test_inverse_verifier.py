@@ -366,10 +366,18 @@ def test_strict_validation_requires_every_fact_and_answer_variable() -> None:
 
     complete = dict(incomplete)
     complete["fact_coverage"] = [
-        {"fact_index": 0, "expressed_as": "the author of [ENTITY]"},
-        {"fact_index": 1, "expressed_as": "what country ... a citizen of"},
+        {"fact_index": 0, "expressed_as": "author of [ENTITY]"},
+        {"fact_index": 1, "expressed_as": "What country"},
     ]
     assert validation_rejection(path, complete, glossary) is None
+
+    invented_coverage = dict(complete)
+    invented_coverage["question"] = "What country is [ENTITY] a citizen of?"
+    invented_coverage["fact_coverage"] = [
+        {"fact_index": 0, "expressed_as": "a person educated at [ENTITY]"},
+        {"fact_index": 1, "expressed_as": "What country"},
+    ]
+    assert validation_rejection(path, invented_coverage, glossary) == "fact_coverage_not_in_question"
 
 
 def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
