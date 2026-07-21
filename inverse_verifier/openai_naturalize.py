@@ -552,7 +552,26 @@ def run_batch_records(
     if state_path.exists():
         state = json.loads(state_path.read_text())
         if state.get("fingerprint") != fingerprint:
-            raise RuntimeError(f"existing {label} state does not match current requests")
+            completed_results = [
+                Path(chunk.get("result_file", ""))
+                for chunk in state.get("chunks", [])
+                if chunk.get("status") == "completed"
+            ]
+            can_reuse = (
+                state.get("requests") == len(records)
+                and len(completed_results) == len(state.get("chunks", []))
+                and all(path.is_file() for path in completed_results)
+            )
+            if can_reuse:
+                print(
+                    f"Reusing completed {label} batch despite a request fingerprint change; "
+                    "downstream validation will mark missing relation IDs opaque.",
+                    flush=True,
+                )
+                return completed_results
+            raise RuntimeError(
+                f"existing {label} state does not match current requests and is not complete"
+            )
     else:
         chunks = []
         lines, tokens = [], 0

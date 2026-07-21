@@ -113,8 +113,11 @@ def collect_relation_evidence(
     wanted_kqa = {item["relation_id"] for item in evidence.values() if item["kg"] == "kqa_pro"}
     if wanted_kqa and kqa_kb.exists():
         graph = load_kqa_graph(kqa_kb)
-        for head, edges in graph.adjacency.items():
-            for edge in edges:
+        for head in sorted(graph.adjacency):
+            for edge in sorted(
+                graph.adjacency[head],
+                key=lambda item: (item.relation, item.direction, item.target),
+            ):
                 if edge.direction != "forward" or edge.relation not in wanted_kqa:
                     continue
                 item = evidence[relation_key("kqa_pro", edge.relation)]
