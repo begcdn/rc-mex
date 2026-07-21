@@ -49,7 +49,12 @@ from inverse_verifier.openai_naturalize import (
     run_chat_records_sync,
 )
 from inverse_verifier.query_representation import represent_query
-from inverse_verifier.dataset_builder import compact_query, validate_glossary, validation_rejection
+from inverse_verifier.dataset_builder import (
+    combine_contrastive_results,
+    compact_query,
+    validate_glossary,
+    validation_rejection,
+)
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -342,7 +347,7 @@ def test_glossary_validation_overrides_metadata_and_weak_semantics() -> None:
     assert glossary["webqsp::people.person.profession"]["status"] == "opaque"
 
 
-def test_strict_validation_requires_every_fact_and_answer_variable() -> None:
+def test_contrastive_validation_requires_intended_path_and_answer_type() -> None:
     path = {
         "kg": "kqa_pro",
         "anchor_type": "book",
@@ -356,28 +361,35 @@ def test_strict_validation_requires_every_fact_and_answer_variable() -> None:
         "kqa_pro::author": {"status": "semantic", "description": "book author", "fact_template": "{subject} was authored by {object}"},
         "kqa_pro::citizenship": {"status": "semantic", "description": "person citizenship", "fact_template": "{subject} is a citizen of {object}"},
     }
-    incomplete = {
+    accepted = {
         "status": "valid",
         "question": "What country is the author of [ENTITY] a citizen of?",
-        "answer_variable_preserved": True,
-        "fact_coverage": [{"fact_index": 0, "expressed_as": "the author of [ENTITY]"}],
+        "selected_option": "B",
+        "intended_option": "B",
+        "answer_type_matches": True,
+        "confidence": 0.94,
     }
-    assert validation_rejection(path, incomplete, glossary) == "incomplete_fact_coverage"
+    assert validation_rejection(path, accepted, glossary) is None
 
-    complete = dict(incomplete)
-    complete["fact_coverage"] = [
-        {"fact_index": 0, "expressed_as": "author of [ENTITY]"},
-        {"fact_index": 1, "expressed_as": "What country"},
-    ]
-    assert validation_rejection(path, complete, glossary) is None
+    wrong_path = dict(accepted, selected_option="A")
+    assert validation_rejection(path, wrong_path, glossary) == "wrong_contrastive_path"
 
-    invented_coverage = dict(complete)
-    invented_coverage["question"] = "What country is [ENTITY] a citizen of?"
-    invented_coverage["fact_coverage"] = [
-        {"fact_index": 0, "expressed_as": "a person educated at [ENTITY]"},
-        {"fact_index": 1, "expressed_as": "What country"},
-    ]
-    assert validation_rejection(path, invented_coverage, glossary) == "fact_coverage_not_in_question"
+    wrong_type = dict(accepted, answer_type_matches=False)
+    assert validation_rejection(path, wrong_type, glossary) == "answer_type_mismatch"
+
+
+def test_combined_contrastive_result_accepts_only_intended_high_confidence() -> None:
+    generated = {
+        "good": {"status": "generated", "question": "Who wrote [ENTITY]?"},
+        "wrong": {"status": "generated", "question": "Who wrote [ENTITY]?"},
+    }
+    judgments = {
+        "good": {"selected_option": "C", "answer_type_matches": True, "confidence": 0.91, "reason": "exact"},
+        "wrong": {"selected_option": "A", "answer_type_matches": True, "confidence": 0.99, "reason": "different path"},
+    }
+    combined = combine_contrastive_results(generated, judgments, {"good": "C", "wrong": "B"})
+    assert combined["good"]["status"] == "valid"
+    assert combined["wrong"]["status"] == "reject"
 
 
 def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
@@ -402,8 +414,10 @@ def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
     prediction = {
         "status": "valid",
         "question": "What description is stored for [ENTITY]?",
-        "answer_variable_preserved": True,
-        "fact_coverage": [{"fact_index": 0, "expressed_as": "description stored for"}],
+        "selected_option": "A",
+        "intended_option": "A",
+        "answer_type_matches": True,
+        "confidence": 0.99,
     }
     assert validation_rejection(path, prediction, glossary) == "unusable_relation"
 from inverse_verifier.selector import (

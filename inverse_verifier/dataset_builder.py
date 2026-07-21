@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import urllib.request
 from collections import defaultdict
@@ -21,12 +22,6 @@ GLOSSARY_MODEL = "gpt-4o-2024-11-20"
 VALIDATION_MODEL = "gpt-4o-2024-11-20"
 GLOSSARY_GROUP_SIZE = 6
 QWEN_GROUP_SIZE = 4
-VAGUE_PREDICATE_PHRASES = (
-    "associated with",
-    "related to",
-    "linked to",
-    "connected to",
-)
 
 GLOSSARY_SCHEMA = {
     "name": "relation_glossary",
@@ -61,8 +56,8 @@ GLOSSARY_SCHEMA = {
     },
 }
 
-VALIDATION_SCHEMA = {
-    "name": "question_validation",
+GENERATION_SCHEMA = {
+    "name": "faithful_question_generation",
     "strict": True,
     "schema": {
         "type": "object",
@@ -73,26 +68,39 @@ VALIDATION_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
-                        "status": {"type": "string", "enum": ["valid", "rewritten", "reject"]},
+                        "status": {"type": "string", "enum": ["generated", "reject"]},
                         "question": {"type": "string"},
-                        "fact_coverage": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "fact_index": {"type": "integer"},
-                                    "expressed_as": {"type": "string"},
-                                },
-                                "required": ["fact_index", "expressed_as"],
-                                "additionalProperties": False,
-                            },
-                        },
-                        "answer_variable_preserved": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["id", "status", "question", "reason"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    },
+}
+
+CONTRASTIVE_SCHEMA = {
+    "name": "contrastive_path_selection",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "selected_option": {"type": "string"},
+                        "answer_type_matches": {"type": "boolean"},
+                        "confidence": {"type": "number"},
                         "reason": {"type": "string"},
                     },
                     "required": [
-                        "id", "status", "question", "fact_coverage",
-                        "answer_variable_preserved", "reason",
+                        "id", "selected_option", "answer_type_matches", "confidence", "reason"
                     ],
                     "additionalProperties": False,
                 },
@@ -348,36 +356,126 @@ def naturalize_with_qwen(rows: list[dict[str, Any]], glossary: dict[str, dict[st
     return predictions
 
 
-def validation_records(rows: list[dict[str, Any]], glossary: dict[str, dict[str, Any]], qwen: dict[str, dict[str, Any]], model: str) -> list[dict[str, Any]]:
+def row_candidates(row: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    meta = row["_naturalization"]
+    prefix = f"{meta['split']}:{meta['source_index']}"
+    return [(f"{prefix}:positive", row["positive_path"])] + [
+        (f"{prefix}:negative:{index}", path) for index, path in enumerate(row["negative_paths"])
+    ]
+
+
+def generation_records(
+    rows: list[dict[str, Any]],
+    glossary: dict[str, dict[str, Any]],
+    qwen: dict[str, dict[str, Any]],
+    model: str,
+) -> list[dict[str, Any]]:
     system = (
-        "Act as a strict logical-query compiler, not a fluency reviewer. Validate or rewrite each "
-        "draft against the explicit facts. Preserve every fact's exact predicate meaning, subject, "
-        "object, shared variables, and direction. Do not compress away an intermediate variable, "
-        "transfer a person's property to an institution or place, or replace a predicate with a "
-        "nearby predicate. For every preserved fact, report its zero-based fact_index and quote the "
-        "exact contiguous clause copied verbatim from the final question that expresses it; do not "
-        "write an explanation or mention variables in expressed_as. Use each index exactly once, "
-        "and use a distinct quoted clause for each fact. The question must ask for "
-        "the declared return variable and answer type, and [ENTITY] must occur exactly once. Mark "
-        "valid only if the draft already meets all rules. Use rewritten with a corrected question "
-        "when possible. Reject incoherent or semantically unsupported queries. Generic wording such "
-        "as related to or associated with does not establish a specific predicate."
+        "Generate one natural English question from each explicit logical query. Raw facts and "
+        "variable identity are authoritative. Express every predicate with its correct subject and "
+        "object, preserve shared intermediate variables, and ask for the declared return variable "
+        "and answer type. Never transfer a person's property to an institution or place, omit a "
+        "fact, reverse a relation, or replace a predicate with a nearby meaning. Use [ENTITY] "
+        "exactly once. The draft is optional assistance, not evidence; repair it freely. Reject only "
+        "when the explicit query cannot form one coherent natural question. Avoid vague related, "
+        "associated, linked, or connected wording when a specific predicate is available."
     )
     items = []
     for row in rows:
-        meta = row["_naturalization"]
-        prefix = f"{meta['split']}:{meta['source_index']}"
-        candidates = [(f"{prefix}:positive", row["positive_path"])] + [
-            (f"{prefix}:negative:{index}", path) for index, path in enumerate(row["negative_paths"])
-        ]
-        for identifier, path in candidates:
+        for identifier, path in row_candidates(row):
             query = compact_query(path, glossary)
             if not query["unusable_relations"]:
                 items.append({"id": identifier, "query": query, "draft": qwen.get(identifier)})
     return [
-        _chat_record(f"validate-{start // QWEN_GROUP_SIZE:06d}", model, system, {"items": items[start:start + QWEN_GROUP_SIZE]}, VALIDATION_SCHEMA)
+        _chat_record(
+            f"generate-{start // QWEN_GROUP_SIZE:06d}", model, system,
+            {"items": items[start:start + QWEN_GROUP_SIZE]}, GENERATION_SCHEMA,
+        )
         for start in range(0, len(items), QWEN_GROUP_SIZE)
     ]
+
+
+def contrastive_records(
+    rows: list[dict[str, Any]],
+    glossary: dict[str, dict[str, Any]],
+    generated: dict[str, dict[str, Any]],
+    model: str,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    system = (
+        "Infer which explicit logical query is fully expressed by each natural-language question. "
+        "Compare exact predicate meanings, subject/object roles, shared variables, number of facts, "
+        "and requested answer type. Select NONE if the question omits a fact, reverses a relation, "
+        "collapses an intermediate entity, uses only vague related/associated wording, matches more "
+        "than one option, or matches no option. Option order is random and gives no correctness hint."
+    )
+    items = []
+    intended_options: dict[str, str] = {}
+    for row in rows:
+        usable = []
+        for identifier, path in row_candidates(row):
+            query = compact_query(path, glossary)
+            if not query["unusable_relations"]:
+                usable.append((identifier, path, query))
+        for identifier, _path, _query in usable:
+            generation = generated.get(identifier)
+            if not generation or generation.get("status") != "generated":
+                continue
+            choices = [(other_id, other_query) for other_id, _other_path, other_query in usable]
+            if len(choices) < 2:
+                continue
+            choices.sort(
+                key=lambda choice: hashlib.sha256(
+                    f"{identifier}|{choice[0]}".encode()
+                ).hexdigest()
+            )
+            options = []
+            for index, (choice_id, query) in enumerate(choices):
+                option_id = chr(ord("A") + index)
+                options.append({"option_id": option_id, "query": query})
+                if choice_id == identifier:
+                    intended_options[identifier] = option_id
+            options.append({"option_id": "NONE", "query": None})
+            items.append({
+                "id": identifier,
+                "question": generation["question"],
+                "options": options,
+            })
+    records = [
+        _chat_record(
+            f"contrast-{start // QWEN_GROUP_SIZE:06d}", model, system,
+            {"items": items[start:start + QWEN_GROUP_SIZE]}, CONTRASTIVE_SCHEMA,
+        )
+        for start in range(0, len(items), QWEN_GROUP_SIZE)
+    ]
+    return records, intended_options
+
+
+def combine_contrastive_results(
+    generated: dict[str, dict[str, Any]],
+    judgments: dict[str, dict[str, Any]],
+    intended_options: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    combined = {}
+    for identifier, generation in generated.items():
+        judgment = judgments.get(identifier)
+        accepted = bool(
+            generation.get("status") == "generated"
+            and judgment
+            and judgment.get("selected_option") == intended_options.get(identifier)
+            and judgment.get("answer_type_matches") is True
+            and float(judgment.get("confidence", 0.0)) >= 0.8
+        )
+        combined[identifier] = {
+            "id": identifier,
+            "status": "valid" if accepted else "reject",
+            "question": generation.get("question", ""),
+            "selected_option": (judgment or {}).get("selected_option", ""),
+            "intended_option": intended_options.get(identifier, ""),
+            "answer_type_matches": (judgment or {}).get("answer_type_matches", False),
+            "confidence": float((judgment or {}).get("confidence", 0.0)),
+            "reason": (judgment or {}).get("reason", generation.get("reason", "")),
+        }
+    return combined
 
 
 def validation_rejection(
@@ -389,29 +487,18 @@ def validation_rejection(
     if query["unusable_relations"]:
         return "unusable_relation"
     if not prediction or prediction.get("status") == "reject":
-        return "validator_rejected"
+        return "contrastive_verifier_rejected"
     if prediction.get("question", "").count("[ENTITY]") != 1:
         return "invalid_entity_placeholder"
     question = prediction["question"].strip()
     if not question.endswith("?"):
         return "not_a_question"
-    if any(phrase in question.casefold() for phrase in VAGUE_PREDICATE_PHRASES):
-        return "vague_predicate_wording"
-    if not prediction.get("answer_variable_preserved"):
-        return "answer_variable_not_preserved"
-    expected = list(range(len(query["facts"])))
-    coverage = prediction.get("fact_coverage", [])
-    covered = sorted(item.get("fact_index") for item in coverage)
-    if covered != expected:
-        return "incomplete_fact_coverage"
-    spans = [item.get("expressed_as", "").strip() for item in coverage]
-    if any(not span for span in spans):
-        return "empty_fact_coverage_clause"
-    normalized_spans = [span.casefold() for span in spans]
-    if any(span not in question.casefold() for span in normalized_spans):
-        return "fact_coverage_not_in_question"
-    if len(set(normalized_spans)) != len(normalized_spans):
-        return "duplicate_fact_coverage_clause"
+    if prediction.get("answer_type_matches") is not True:
+        return "answer_type_mismatch"
+    if float(prediction.get("confidence", 0.0)) < 0.8:
+        return "low_contrastive_confidence"
+    if prediction.get("selected_option") != prediction.get("intended_option"):
+        return "wrong_contrastive_path"
     return None
 
 
@@ -515,18 +602,32 @@ def build_naturalized_dataset(
 
     qwen = naturalize_with_qwen(rows, glossary, qwen_model, ollama_host, output)
     print(f"[4/5] Qwen produced {len(qwen)} candidate outputs", flush=True)
-    validation_files = run_chat_records_sync(
-        validation_records(rows, glossary, qwen, validation_model),
-        internal / "validation_sync_v3",
+    generation_files = run_chat_records_sync(
+        generation_records(rows, glossary, qwen, validation_model),
+        internal / "generation_sync_v4",
         client,
-        "strict question validation",
+        "faithful question generation",
     )
-    validated, validation_errors = parse_batch_items(validation_files)
+    generated, generation_errors = parse_batch_items(generation_files)
+    contrastive_requests, intended_options = contrastive_records(
+        rows, glossary, generated, validation_model
+    )
+    contrastive_files = run_chat_records_sync(
+        contrastive_requests,
+        internal / "contrastive_sync_v4",
+        client,
+        "contrastive question verification",
+    )
+    judgments, contrastive_errors = parse_batch_items(contrastive_files)
+    validated = combine_contrastive_results(generated, judgments, intended_options)
+    validation_errors = [*generation_errors, *contrastive_errors]
     manifest = finalize_dataset(rows, validated, glossary, output, {
         "source": str(source), "requested_paths": max_paths, "selected_paths": len(rows),
         "relations": len(evidence), "glossary_entries": len(glossary),
         "glossary_errors": len(glossary_errors), "qwen_model": qwen_model,
         "glossary_model": glossary_model, "validation_model": validation_model,
+        "generation_errors": len(generation_errors),
+        "contrastive_errors": len(contrastive_errors),
         "validation_errors": len(validation_errors),
     })
     print(
