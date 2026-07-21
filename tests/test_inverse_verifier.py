@@ -5,6 +5,7 @@ import urllib.error
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from inverse_verifier.data import (
@@ -44,6 +45,7 @@ from inverse_verifier.openai_naturalize import (
     candidate_items,
     select_negatives,
     validate_question,
+    select_rows,
 )
 
 
@@ -88,6 +90,11 @@ def test_openai_naturalization_selects_diverse_negative_types() -> None:
     }
     selected = select_negatives(row, 2)
     assert [item["negative_type"] for item in selected] == ["reversed", "added_hop"]
+
+
+def test_openai_naturalization_reports_missing_corpus(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="train_faithful.jsonl"):
+        select_rows(tmp_path, 10, 3)
 from inverse_verifier.selector import (
     answer_metrics,
     enumerate_path_families,

@@ -140,6 +140,14 @@ def select_rows(source: Path, max_paths: int, max_negatives: int, seed: int = 17
             rng.shuffle(rows)
 
     total_available = sum(split_sizes.values())
+    if total_available == 0:
+        expected = ", ".join(
+            str(source / filename)
+            for filename in ("train_faithful.jsonl", "dev_faithful.jsonl")
+        )
+        raise FileNotFoundError(
+            f"no faithful corpus rows found; expected JSONL data in: {expected}"
+        )
     target = min(max_paths, total_available)
     quotas = {
         split: min(size, round(target * size / total_available))
