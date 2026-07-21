@@ -655,17 +655,45 @@ def _naturalize_batch(
     model: str,
     host: str,
     start: int,
+    id_offset: int = 0,
 ) -> dict[str, str]:
     for attempt in range(2):
         try:
-            return _ollama_naturalize(batch, model, host)
+            generated = _ollama_naturalize(batch, model, host)
+            return _offset_generated_ids(generated, id_offset)
         except Exception as exc:
-            if attempt == 1:
+            if attempt == 1 and len(batch) == 1:
                 print(
-                    f"Naturalization fallback at row {start} via {host}: {exc}",
+                    f"Naturalization fallback for single row {start} via {host}: {exc}",
                     flush=True,
                 )
-    return {}
+                return {}
+    midpoint = len(batch) // 2
+    print(
+        f"Malformed response for rows {start}-{start + len(batch) - 1} via {host}; "
+        "retrying as smaller requests",
+        flush=True,
+    )
+    left = _naturalize_batch(batch[:midpoint], model, host, start, id_offset)
+    right = _naturalize_batch(
+        batch[midpoint:],
+        model,
+        host,
+        start + midpoint,
+        id_offset + midpoint,
+    )
+    return left | right
+
+
+def _offset_generated_ids(generated: dict[str, str], offset: int) -> dict[str, str]:
+    if offset == 0:
+        return generated
+    shifted = {}
+    for identifier, question in generated.items():
+        row_index, separator, suffix = identifier.partition(":")
+        if separator and row_index.isdigit():
+            shifted[f"{int(row_index) + offset}:{suffix}"] = question
+    return shifted
 
 
 def evaluate_faithful_generation(

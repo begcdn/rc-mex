@@ -531,3 +531,45 @@ def test_naturalization_uses_multiple_hosts_and_preserves_source_order(
     )
     assert resumed["rows"] == 5
     assert len(called_hosts) == 5
+
+
+def test_naturalization_splits_malformed_batches_instead_of_discarding_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    rows = [
+        {
+            "id": f"row-{index}",
+            "question": f"canonical {index}",
+            "positive_path": {
+                "hops": [{"relation": "author", "direction": "forward"}],
+                "answer_type": "person",
+            },
+            "negative_paths": [],
+        }
+        for index in range(4)
+    ]
+    (source / "train_faithful.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    (source / "dev_faithful.jsonl").write_text("", encoding="utf-8")
+
+    def malformed_when_batched(batch, _model, _host):
+        if len(batch) > 1:
+            raise json.JSONDecodeError("truncated", "{}", 1)
+        return {"0:positive": f"natural {batch[0]['id']}"}
+
+    monkeypatch.setattr(
+        "inverse_verifier.synthetic._ollama_naturalize", malformed_when_batched
+    )
+    manifest = naturalize_corpus(source, output, batch_size=4)
+    written = [
+        json.loads(line)
+        for line in (output / "train_faithful.jsonl").open(encoding="utf-8")
+    ]
+
+    assert [row["question"] for row in written] == [f"natural row-{index}" for index in range(4)]
+    assert manifest["naturalized_questions"] == 4
+    assert manifest["canonical_fallbacks"] == 0
