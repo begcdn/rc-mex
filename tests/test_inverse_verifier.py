@@ -39,6 +39,55 @@ from inverse_verifier.synthetic import (
     question_covers_path,
     naturalize_corpus,
 )
+from inverse_verifier.openai_naturalize import (
+    _prediction_rejection,
+    candidate_items,
+    select_negatives,
+    validate_question,
+)
+
+
+def test_openai_naturalization_payload_is_sanitized() -> None:
+    row = {
+        "question": "Which country was Ada born in?",
+        "positive_path": {
+            "anchor": "Ada Lovelace",
+            "anchor_type": "person",
+            "answer_type": "country",
+            "hops": [{
+                "relation": "people.person.place_of_birth",
+                "direction": "forward",
+                "source_type": "person",
+                "target_type": "place",
+            }],
+        },
+        "negative_paths": [],
+        "_naturalization": {"split": "train", "source_index": 0},
+    }
+    payload = candidate_items([row])[0]
+    serialized = json.dumps(payload)
+    assert "Ada Lovelace" not in serialized
+    assert "Which country" not in serialized
+    assert payload["topic"] == "[ENTITY]"
+
+
+def test_openai_naturalization_validation_rejects_procedural_output() -> None:
+    assert validate_question("Which country was [ENTITY] born in?") is None
+    assert validate_question("Follow the first hop from [ENTITY]?") == "procedural_language"
+    assert validate_question("Where was Ada born?") == "entity_placeholder_count"
+    assert _prediction_rejection({"status": "opaque", "question": "", "reason": "mixed"}) == "model_marked_opaque"
+
+
+def test_openai_naturalization_selects_diverse_negative_types() -> None:
+    row = {
+        "negative_paths": [
+            {"negative_type": "reversed"},
+            {"negative_type": "reversed"},
+            {"negative_type": "added_hop"},
+        ]
+    }
+    selected = select_negatives(row, 2)
+    assert [item["negative_type"] for item in selected] == ["reversed", "added_hop"]
 from inverse_verifier.selector import (
     answer_metrics,
     enumerate_path_families,

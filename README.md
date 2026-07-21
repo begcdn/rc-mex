@@ -133,3 +133,32 @@ Before implementation, record:
 
 Previous experimental methods remain recoverable from Git history, but they are
 not architectural dependencies or fallbacks for this experiment.
+
+# OpenAI Batch naturalization
+
+Naturalize a bounded, balanced faithful corpus without exposing canonical questions or entity
+names to the model. Start with a dry run; it creates request files and prints a conservative cost
+estimate without submitting them:
+
+```bash
+python3 -m inverse_verifier naturalize-openai \
+  --data runs/inverse_verifier/faithful_data \
+  --output runs/inverse_verifier/faithful_data_openai_3k \
+  --max-paths 3000 \
+  --max-negatives 3 \
+  --dry-run
+```
+
+Then export the API key in the shell and rerun without `--dry-run`. The command submits resumable
+OpenAI Batch jobs sequentially, waits for completion, validates outputs, and writes accepted train
+and dev JSONL files. It defaults to the fixed `gpt-5-nano-2025-08-07` snapshot and refuses to
+proceed when its estimate exceeds `$8`.
+
+```bash
+export OPENAI_API_KEY='...'
+python3 -m inverse_verifier naturalize-openai \
+  --data runs/inverse_verifier/faithful_data \
+  --output runs/inverse_verifier/faithful_data_openai_3k \
+  --max-paths 3000 \
+  --max-negatives 3
+```

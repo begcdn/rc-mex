@@ -7,6 +7,7 @@ from pathlib import Path
 from .data import prepare_dataset
 from .evaluate import evaluate, evaluate_gold_generation
 from .model import train_model
+from .openai_naturalize import run_openai_naturalization
 from .selector import run_verifier_pipeline
 from .retrieval import SRTK_SCORER, run_retrieval_probe
 from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
@@ -73,6 +74,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to http://127.0.0.1:11434."
         ),
     )
+
+    openai_naturalize = subparsers.add_parser(
+        "naturalize-openai",
+        help="naturalize a bounded faithful corpus with the resumable OpenAI Batch API",
+    )
+    openai_naturalize.add_argument(
+        "--data", type=Path, default=Path("runs/inverse_verifier/faithful_data")
+    )
+    openai_naturalize.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/faithful_data_openai")
+    )
+    openai_naturalize.add_argument("--model", default="gpt-5-nano-2025-08-07")
+    openai_naturalize.add_argument("--max-paths", type=int, default=3_000)
+    openai_naturalize.add_argument("--max-negatives", type=int, default=3)
+    openai_naturalize.add_argument("--max-budget-usd", type=float, default=8.0)
+    openai_naturalize.add_argument("--dry-run", action="store_true")
 
     faithfulness = subparsers.add_parser(
         "faithfulness", help="compare gold and executable-negative generated questions"
@@ -234,6 +251,18 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Prepared natural faithful data in {args.output}")
+    elif args.command == "naturalize-openai":
+        manifest = run_openai_naturalization(
+            args.data,
+            args.output,
+            model=args.model,
+            max_paths=args.max_paths,
+            max_negatives=args.max_negatives,
+            max_budget_usd=args.max_budget_usd,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Prepared OpenAI-naturalized data in {args.output}")
     elif args.command == "faithfulness":
         metrics = evaluate_faithful_generation(
             args.data,
