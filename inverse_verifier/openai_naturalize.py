@@ -15,9 +15,10 @@ from typing import Any
 from .synthetic import relation_words
 
 
-MODEL = "gpt-5-nano-2025-08-07"
-BATCH_INPUT_USD_PER_MILLION = 0.05
-BATCH_OUTPUT_USD_PER_MILLION = 0.40
+MODEL = "gpt-4o-mini-2024-07-18"
+# Conservative published rates. Actual Batch charges may be lower.
+BATCH_INPUT_USD_PER_MILLION = 0.15
+BATCH_OUTPUT_USD_PER_MILLION = 0.60
 MAX_ESTIMATED_TOKENS_PER_BATCH = 1_250_000
 ROWS_PER_REQUEST = 4
 POLL_SECONDS = 60

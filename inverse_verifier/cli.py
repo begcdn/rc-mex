@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_naturalize.add_argument(
         "--output", type=Path, default=Path("runs/inverse_verifier/faithful_data_openai")
     )
-    openai_naturalize.add_argument("--model", default="gpt-5-nano-2025-08-07")
+    openai_naturalize.add_argument("--model", default="gpt-4o-mini-2024-07-18")
     openai_naturalize.add_argument("--max-paths", type=int, default=3_000)
     openai_naturalize.add_argument("--max-negatives", type=int, default=3)
     openai_naturalize.add_argument("--max-budget-usd", type=float, default=8.0)
