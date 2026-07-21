@@ -329,9 +329,6 @@ class OpenAIBatchClient:
     def retrieve_batch(self, batch_id: str) -> dict[str, Any]:
         return self._request("GET", f"/batches/{batch_id}")
 
-    def cancel_batch(self, batch_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/batches/{batch_id}/cancel", b"{}")
-
     def download(self, file_id: str) -> bytes:
         request = urllib.request.Request(
             self.base_url + f"/files/{file_id}/content",
@@ -687,41 +684,3 @@ def run_chat_records_sync(
                 done += 1
                 print(f"{label}: {done}/{len(records)} requests", flush=True)
     return [result_path]
-
-
-def recover_or_cancel_batch_records(
-    directory: Path,
-    client: OpenAIBatchClient,
-    label: str,
-) -> list[Path] | None:
-    """Reuse a completed legacy batch, or cancel it before synchronous replacement."""
-    state_path = directory / "state.json"
-    if not state_path.exists():
-        return None
-    state = json.loads(state_path.read_text())
-    result_paths = []
-    all_completed = True
-    for index, chunk in enumerate(state.get("chunks", [])):
-        batch_id = chunk.get("batch_id")
-        if not batch_id:
-            all_completed = False
-            continue
-        batch = client.retrieve_batch(batch_id)
-        status = batch["status"]
-        if status == "completed":
-            result_path = directory / f"results_{index:03d}.jsonl"
-            if not result_path.exists():
-                result_path.write_bytes(client.download(batch["output_file_id"]))
-            chunk.update({"result_file": str(result_path), "status": "completed"})
-            result_paths.append(result_path)
-        else:
-            all_completed = False
-            if status not in {"failed", "expired", "cancelled", "cancelling"}:
-                client.cancel_batch(batch_id)
-                chunk["status"] = "cancelling"
-                print(f"Cancelled queued {label} batch {batch_id}", flush=True)
-    _write_json(state_path, state)
-    if all_completed and len(result_paths) == len(state.get("chunks", [])):
-        print(f"Reusing completed legacy {label} batch", flush=True)
-        return result_paths
-    return None

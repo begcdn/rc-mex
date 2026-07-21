@@ -10,7 +10,6 @@ from typing import Any
 from .openai_naturalize import (
     OpenAIBatchClient,
     _parse_result_file,
-    recover_or_cancel_batch_records,
     run_chat_records_sync,
     select_rows,
 )
@@ -19,7 +18,7 @@ from .synthetic import load_kqa_graph
 
 
 GLOSSARY_MODEL = "gpt-4o-2024-11-20"
-VALIDATION_MODEL = "gpt-4o-mini-2024-07-18"
+VALIDATION_MODEL = "gpt-4o-2024-11-20"
 GLOSSARY_GROUP_SIZE = 6
 QWEN_GROUP_SIZE = 4
 
@@ -70,9 +69,25 @@ VALIDATION_SCHEMA = {
                         "id": {"type": "string"},
                         "status": {"type": "string", "enum": ["valid", "rewritten", "reject"]},
                         "question": {"type": "string"},
+                        "fact_coverage": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "fact_index": {"type": "integer"},
+                                    "expressed_as": {"type": "string"},
+                                },
+                                "required": ["fact_index", "expressed_as"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "answer_variable_preserved": {"type": "boolean"},
                         "reason": {"type": "string"},
                     },
-                    "required": ["id", "status", "question", "reason"],
+                    "required": [
+                        "id", "status", "question", "fact_coverage",
+                        "answer_variable_preserved", "reason",
+                    ],
                     "additionalProperties": False,
                 },
             }
@@ -329,12 +344,16 @@ def naturalize_with_qwen(rows: list[dict[str, Any]], glossary: dict[str, dict[st
 
 def validation_records(rows: list[dict[str, Any]], glossary: dict[str, dict[str, Any]], qwen: dict[str, dict[str, Any]], model: str) -> list[dict[str, Any]]:
     system = (
-        "Validate and repair natural questions against explicit logical queries. Every raw fact "
-        "must be expressed with correct subject/object roles; distinct variables must remain "
-        "distinct; [ENTITY] must occur exactly once; the question must ask for the return variable "
-        "and type. If the draft is fully faithful use valid unchanged. If repairable, use rewritten "
-        "and provide a faithful replacement. Reject only when relation meaning is opaque or the "
-        "query cannot form one coherent question. Never replace a predicate with vague association."
+        "Act as a strict logical-query compiler, not a fluency reviewer. Validate or rewrite each "
+        "draft against the explicit facts. Preserve every fact's exact predicate meaning, subject, "
+        "object, shared variables, and direction. Do not compress away an intermediate variable, "
+        "transfer a person's property to an institution or place, or replace a predicate with a "
+        "nearby predicate. For every preserved fact, report its zero-based fact_index and quote the "
+        "specific clause that expresses it. Use each index exactly once. The question must ask for "
+        "the declared return variable and answer type, and [ENTITY] must occur exactly once. Mark "
+        "valid only if the draft already meets all rules. Use rewritten with a corrected question "
+        "when possible. Reject incoherent or semantically unsupported queries. Generic wording such "
+        "as related to or associated with does not establish a specific predicate."
     )
     items = []
     for row in rows:
@@ -344,14 +363,45 @@ def validation_records(rows: list[dict[str, Any]], glossary: dict[str, dict[str,
             (f"{prefix}:negative:{index}", path) for index, path in enumerate(row["negative_paths"])
         ]
         for identifier, path in candidates:
-            items.append({"id": identifier, "query": compact_query(path, glossary), "draft": qwen.get(identifier)})
+            query = compact_query(path, glossary)
+            if not query["unusable_relations"]:
+                items.append({"id": identifier, "query": query, "draft": qwen.get(identifier)})
     return [
         _chat_record(f"validate-{start // QWEN_GROUP_SIZE:06d}", model, system, {"items": items[start:start + QWEN_GROUP_SIZE]}, VALIDATION_SCHEMA)
         for start in range(0, len(items), QWEN_GROUP_SIZE)
     ]
 
 
-def finalize_dataset(rows: list[dict[str, Any]], validated: dict[str, dict[str, Any]], output: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+def validation_rejection(
+    path: dict[str, Any],
+    prediction: dict[str, Any] | None,
+    glossary: dict[str, dict[str, Any]],
+) -> str | None:
+    query = compact_query(path, glossary)
+    if query["unusable_relations"]:
+        return "unusable_relation"
+    if not prediction or prediction.get("status") == "reject":
+        return "validator_rejected"
+    if prediction.get("question", "").count("[ENTITY]") != 1:
+        return "invalid_entity_placeholder"
+    if not prediction.get("answer_variable_preserved"):
+        return "answer_variable_not_preserved"
+    expected = list(range(len(query["facts"])))
+    covered = sorted(item.get("fact_index") for item in prediction.get("fact_coverage", []))
+    if covered != expected:
+        return "incomplete_fact_coverage"
+    if any(not item.get("expressed_as", "").strip() for item in prediction.get("fact_coverage", [])):
+        return "empty_fact_coverage_clause"
+    return None
+
+
+def finalize_dataset(
+    rows: list[dict[str, Any]],
+    validated: dict[str, dict[str, Any]],
+    glossary: dict[str, dict[str, Any]],
+    output: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
     accepted: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rejected = []
     for original in rows:
@@ -359,8 +409,9 @@ def finalize_dataset(rows: list[dict[str, Any]], validated: dict[str, dict[str, 
         meta = row.pop("_naturalization")
         prefix = f"{meta['split']}:{meta['source_index']}"
         positive = validated.get(f"{prefix}:positive")
-        if not positive or positive.get("status") == "reject" or positive.get("question", "").count("[ENTITY]") != 1:
-            rejected.append({"id": prefix, "reason": "invalid_positive", "prediction": positive})
+        positive_rejection = validation_rejection(row["positive_path"], positive, glossary)
+        if positive_rejection:
+            rejected.append({"id": prefix, "reason": positive_rejection, "prediction": positive})
             continue
         row["canonical_question"] = row["question"]
         row["question"] = positive["question"].strip()
@@ -369,7 +420,7 @@ def finalize_dataset(rows: list[dict[str, Any]], validated: dict[str, dict[str, 
         for index, negative in enumerate(row["negative_paths"]):
             prediction = validated.get(f"{prefix}:negative:{index}")
             question = (prediction or {}).get("question", "").strip()
-            if not prediction or prediction.get("status") == "reject" or question.count("[ENTITY]") != 1 or question.casefold() in seen:
+            if validation_rejection(negative, prediction, glossary) or question.casefold() in seen:
                 continue
             item = dict(negative)
             item["canonical_question"] = item["question"]
@@ -444,18 +495,14 @@ def build_naturalized_dataset(
 
     qwen = naturalize_with_qwen(rows, glossary, qwen_model, ollama_host, output)
     print(f"[4/5] Qwen produced {len(qwen)} candidate outputs", flush=True)
-    validation_files = recover_or_cancel_batch_records(
-        internal / "validation_batch", client, "question validation"
+    validation_files = run_chat_records_sync(
+        validation_records(rows, glossary, qwen, validation_model),
+        internal / "validation_sync_v2",
+        client,
+        "strict question validation",
     )
-    if validation_files is None:
-        validation_files = run_chat_records_sync(
-            validation_records(rows, glossary, qwen, validation_model),
-            internal / "validation_sync",
-            client,
-            "question validation",
-        )
     validated, validation_errors = parse_batch_items(validation_files)
-    manifest = finalize_dataset(rows, validated, output, {
+    manifest = finalize_dataset(rows, validated, glossary, output, {
         "source": str(source), "requested_paths": max_paths, "selected_paths": len(rows),
         "relations": len(evidence), "glossary_entries": len(glossary),
         "glossary_errors": len(glossary_errors), "qwen_model": qwen_model,

@@ -49,7 +49,7 @@ from inverse_verifier.openai_naturalize import (
     run_chat_records_sync,
 )
 from inverse_verifier.query_representation import represent_query
-from inverse_verifier.dataset_builder import compact_query, validate_glossary
+from inverse_verifier.dataset_builder import compact_query, validate_glossary, validation_rejection
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -340,6 +340,64 @@ def test_glossary_validation_overrides_metadata_and_weak_semantics() -> None:
     glossary = validate_glossary(evidence, generated)
     assert glossary["webqsp::base.kwebbase.kwtopic.has_sentences"]["status"] == "metadata"
     assert glossary["webqsp::people.person.profession"]["status"] == "opaque"
+
+
+def test_strict_validation_requires_every_fact_and_answer_variable() -> None:
+    path = {
+        "kg": "kqa_pro",
+        "anchor_type": "book",
+        "answer_type": "country",
+        "hops": [
+            {"relation": "author", "direction": "forward", "source_type": "book", "target_type": "human"},
+            {"relation": "citizenship", "direction": "forward", "source_type": "human", "target_type": "country"},
+        ],
+    }
+    glossary = {
+        "kqa_pro::author": {"status": "semantic", "description": "book author", "fact_template": "{subject} was authored by {object}"},
+        "kqa_pro::citizenship": {"status": "semantic", "description": "person citizenship", "fact_template": "{subject} is a citizen of {object}"},
+    }
+    incomplete = {
+        "status": "valid",
+        "question": "What country is the author of [ENTITY] a citizen of?",
+        "answer_variable_preserved": True,
+        "fact_coverage": [{"fact_index": 0, "expressed_as": "the author of [ENTITY]"}],
+    }
+    assert validation_rejection(path, incomplete, glossary) == "incomplete_fact_coverage"
+
+    complete = dict(incomplete)
+    complete["fact_coverage"] = [
+        {"fact_index": 0, "expressed_as": "the author of [ENTITY]"},
+        {"fact_index": 1, "expressed_as": "what country ... a citizen of"},
+    ]
+    assert validation_rejection(path, complete, glossary) is None
+
+
+def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
+    path = {
+        "kg": "webqsp",
+        "anchor_type": "person",
+        "answer_type": "entity",
+        "hops": [{
+            "relation": "base.kwebbase.kwtopic.has_sentences",
+            "direction": "forward",
+            "source_type": "person",
+            "target_type": "entity",
+        }],
+    }
+    glossary = {
+        "webqsp::base.kwebbase.kwtopic.has_sentences": {
+            "status": "metadata",
+            "description": "stored sentence",
+            "fact_template": "{subject} has sentence {object}",
+        }
+    }
+    prediction = {
+        "status": "valid",
+        "question": "What description is stored for [ENTITY]?",
+        "answer_variable_preserved": True,
+        "fact_coverage": [{"fact_index": 0, "expressed_as": "description stored for"}],
+    }
+    assert validation_rejection(path, prediction, glossary) == "unusable_relation"
 from inverse_verifier.selector import (
     answer_metrics,
     enumerate_path_families,
