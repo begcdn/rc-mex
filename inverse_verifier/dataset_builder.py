@@ -607,6 +607,7 @@ def build_naturalized_dataset(
         internal / "generation_sync_v4",
         client,
         "faithful question generation",
+        workers=2,
     )
     generated, generation_errors = parse_batch_items(generation_files)
     contrastive_requests, intended_options = contrastive_records(
@@ -617,6 +618,7 @@ def build_naturalized_dataset(
         internal / "contrastive_sync_v4",
         client,
         "contrastive question verification",
+        workers=2,
     )
     judgments, contrastive_errors = parse_batch_items(contrastive_files)
     validated = combine_contrastive_results(generated, judgments, intended_options)

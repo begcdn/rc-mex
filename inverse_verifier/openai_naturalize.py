@@ -625,7 +625,7 @@ def run_chat_records_sync(
     client: OpenAIBatchClient,
     label: str,
     workers: int = 6,
-    retries: int = 6,
+    retries: int = 12,
 ) -> list[Path]:
     """Run Chat Completions concurrently and persist every completed response."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -670,7 +670,8 @@ def run_chat_records_sync(
                     raise RuntimeError(
                         f"synchronous {label} request {record['custom_id']} failed"
                     ) from exc
-                time.sleep(min(2 ** attempt, 30))
+                delay = 30 if "API error 429" in str(exc) else min(2 ** attempt, 30)
+                time.sleep(delay)
         raise AssertionError("unreachable")
 
     done = len(completed)
