@@ -46,6 +46,7 @@ from inverse_verifier.openai_naturalize import (
     select_negatives,
     validate_question,
     select_rows,
+    run_chat_records_sync,
 )
 from inverse_verifier.query_representation import represent_query
 from inverse_verifier.dataset_builder import compact_query, validate_glossary
@@ -97,6 +98,37 @@ def test_openai_naturalization_selects_diverse_negative_types() -> None:
 def test_openai_naturalization_reports_missing_corpus(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="train_faithful.jsonl"):
         select_rows(tmp_path, 10, 3)
+
+
+def test_synchronous_chat_records_resume_without_repeating_calls(tmp_path: Path) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _request(self, method, endpoint, data):
+            self.calls += 1
+            request = json.loads(data)
+            identifier = json.loads(request["messages"][-1]["content"])["id"]
+            content = json.dumps({"items": [{"id": identifier, "status": "valid"}]})
+            return {"id": f"response-{identifier}", "choices": [{"message": {"content": content}}]}
+
+    records = [
+        {
+            "custom_id": f"request-{index}",
+            "url": "/v1/chat/completions",
+            "body": {
+                "messages": [{"role": "user", "content": json.dumps({"id": f"item-{index}"})}]
+            },
+        }
+        for index in range(3)
+    ]
+    client = FakeClient()
+    files = run_chat_records_sync(records, tmp_path, client, "test", workers=2)
+    assert client.calls == 3
+    assert len(files[0].read_text().splitlines()) == 3
+
+    run_chat_records_sync(records, tmp_path, client, "test", workers=2)
+    assert client.calls == 3
 
 
 def test_explicit_query_representation_orients_forward_fact() -> None:

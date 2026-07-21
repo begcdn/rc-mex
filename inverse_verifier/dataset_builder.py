@@ -10,7 +10,8 @@ from typing import Any
 from .openai_naturalize import (
     OpenAIBatchClient,
     _parse_result_file,
-    run_batch_records,
+    recover_or_cancel_batch_records,
+    run_chat_records_sync,
     select_rows,
 )
 from .query_representation import classify_metadata_relation, represent_query
@@ -421,24 +422,38 @@ def build_naturalized_dataset(
         flush=True,
     )
     (internal / "relation_evidence.json").write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
-    glossary_files = run_batch_records(
-        glossary_records(evidence, glossary_model),
-        internal / "glossary_batch",
-        client,
-        "relation glossary",
-        max_estimated_tokens=75_000,
-    )
-    raw_glossary, glossary_errors = parse_batch_items(glossary_files)
-    glossary = validate_glossary(evidence, raw_glossary)
+    glossary_path = internal / "relation_glossary.json"
+    if glossary_path.exists():
+        glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+        glossary_errors = []
+        print("[3/5] Reusing completed relation glossary", flush=True)
+    else:
+        glossary_files = run_chat_records_sync(
+            glossary_records(evidence, glossary_model),
+            internal / "glossary_sync",
+            client,
+            "relation glossary",
+        )
+        raw_glossary, glossary_errors = parse_batch_items(glossary_files)
+        glossary = validate_glossary(evidence, raw_glossary)
     statuses = defaultdict(int)
     for item in glossary.values():
         statuses[item["status"]] += 1
     print(f"[3/5] Relation glossary: {dict(statuses)}", flush=True)
-    (internal / "relation_glossary.json").write_text(json.dumps(glossary, indent=2, ensure_ascii=False), encoding="utf-8")
+    glossary_path.write_text(json.dumps(glossary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     qwen = naturalize_with_qwen(rows, glossary, qwen_model, ollama_host, output)
     print(f"[4/5] Qwen produced {len(qwen)} candidate outputs", flush=True)
-    validation_files = run_batch_records(validation_records(rows, glossary, qwen, validation_model), internal / "validation_batch", client, "question validation")
+    validation_files = recover_or_cancel_batch_records(
+        internal / "validation_batch", client, "question validation"
+    )
+    if validation_files is None:
+        validation_files = run_chat_records_sync(
+            validation_records(rows, glossary, qwen, validation_model),
+            internal / "validation_sync",
+            client,
+            "question validation",
+        )
     validated, validation_errors = parse_batch_items(validation_files)
     manifest = finalize_dataset(rows, validated, output, {
         "source": str(source), "requested_paths": max_paths, "selected_paths": len(rows),

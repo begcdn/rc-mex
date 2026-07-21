@@ -10,6 +10,7 @@ import urllib.request
 import uuid
 import hashlib
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -328,6 +329,9 @@ class OpenAIBatchClient:
     def retrieve_batch(self, batch_id: str) -> dict[str, Any]:
         return self._request("GET", f"/batches/{batch_id}")
 
+    def cancel_batch(self, batch_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/batches/{batch_id}/cancel", b"{}")
+
     def download(self, file_id: str) -> bytes:
         request = urllib.request.Request(
             self.base_url + f"/files/{file_id}/content",
@@ -616,3 +620,108 @@ def run_batch_records(
                 raise RuntimeError(f"OpenAI {label} batch ended with {batch['status']}")
             time.sleep(POLL_SECONDS)
     return [Path(chunk["result_file"]) for chunk in state["chunks"]]
+
+
+def run_chat_records_sync(
+    records: list[dict[str, Any]],
+    directory: Path,
+    client: OpenAIBatchClient,
+    label: str,
+    workers: int = 6,
+    retries: int = 6,
+) -> list[Path]:
+    """Run Chat Completions concurrently and persist every completed response."""
+    directory.mkdir(parents=True, exist_ok=True)
+    result_path = directory / "results.jsonl"
+    state_path = directory / "state.json"
+    serialized = [json.dumps(record, ensure_ascii=False) for record in records]
+    fingerprint = hashlib.sha256("\n".join(serialized).encode()).hexdigest()
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if state.get("fingerprint") != fingerprint:
+            raise RuntimeError(f"existing synchronous {label} state does not match current requests")
+    else:
+        state = {"label": label, "fingerprint": fingerprint, "requests": len(records)}
+        _write_json(state_path, state)
+
+    completed = set()
+    if result_path.exists():
+        with result_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    completed.add(json.loads(line)["custom_id"])
+    pending = [record for record in records if record["custom_id"] not in completed]
+    if not pending:
+        print(f"Reusing {len(completed)} completed synchronous {label} requests", flush=True)
+        return [result_path]
+
+    def execute(record: dict[str, Any]) -> dict[str, Any]:
+        endpoint = record["url"]
+        if endpoint.startswith("/v1/"):
+            endpoint = endpoint[3:]
+        for attempt in range(retries + 1):
+            try:
+                body = client._request("POST", endpoint, json.dumps(record["body"]).encode())
+                return {
+                    "id": f"sync-{uuid.uuid4().hex}",
+                    "custom_id": record["custom_id"],
+                    "response": {"status_code": 200, "request_id": body.get("id"), "body": body},
+                    "error": None,
+                }
+            except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+                if attempt == retries:
+                    raise RuntimeError(
+                        f"synchronous {label} request {record['custom_id']} failed"
+                    ) from exc
+                time.sleep(min(2 ** attempt, 30))
+        raise AssertionError("unreachable")
+
+    done = len(completed)
+    with result_path.open("a", encoding="utf-8") as handle:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {executor.submit(execute, record): record for record in pending}
+            for future in as_completed(futures):
+                result = future.result()
+                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                handle.flush()
+                done += 1
+                print(f"{label}: {done}/{len(records)} requests", flush=True)
+    return [result_path]
+
+
+def recover_or_cancel_batch_records(
+    directory: Path,
+    client: OpenAIBatchClient,
+    label: str,
+) -> list[Path] | None:
+    """Reuse a completed legacy batch, or cancel it before synchronous replacement."""
+    state_path = directory / "state.json"
+    if not state_path.exists():
+        return None
+    state = json.loads(state_path.read_text())
+    result_paths = []
+    all_completed = True
+    for index, chunk in enumerate(state.get("chunks", [])):
+        batch_id = chunk.get("batch_id")
+        if not batch_id:
+            all_completed = False
+            continue
+        batch = client.retrieve_batch(batch_id)
+        status = batch["status"]
+        if status == "completed":
+            result_path = directory / f"results_{index:03d}.jsonl"
+            if not result_path.exists():
+                result_path.write_bytes(client.download(batch["output_file_id"]))
+            chunk.update({"result_file": str(result_path), "status": "completed"})
+            result_paths.append(result_path)
+        else:
+            all_completed = False
+            if status not in {"failed", "expired", "cancelled", "cancelling"}:
+                client.cancel_batch(batch_id)
+                chunk["status"] = "cancelling"
+                print(f"Cancelled queued {label} batch {batch_id}", flush=True)
+    _write_json(state_path, state)
+    if all_completed and len(result_paths) == len(state.get("chunks", [])):
+        print(f"Reusing completed legacy {label} batch", flush=True)
+        return result_paths
+    return None
