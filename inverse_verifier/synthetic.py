@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -661,6 +662,10 @@ def _naturalize_batch(
         try:
             generated = _ollama_naturalize(batch, model, host)
             return _offset_generated_ids(generated, id_offset)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError(
+                f"Ollama request failed at row {start} via {host}: {exc}"
+            ) from exc
         except Exception as exc:
             if attempt == 1 and len(batch) == 1:
                 print(

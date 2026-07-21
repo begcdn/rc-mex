@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -573,3 +574,34 @@ def test_naturalization_splits_malformed_batches_instead_of_discarding_rows(
     assert [row["question"] for row in written] == [f"natural row-{index}" for index in range(4)]
     assert manifest["naturalized_questions"] == 4
     assert manifest["canonical_fallbacks"] == 0
+
+
+def test_naturalization_does_not_turn_http_failure_into_training_data(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    row = {
+        "question": "canonical",
+        "positive_path": {
+            "hops": [{"relation": "author", "direction": "forward"}],
+            "answer_type": "person",
+        },
+        "negative_paths": [],
+    }
+    (source / "train_faithful.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (source / "dev_faithful.jsonl").write_text("", encoding="utf-8")
+
+    def unavailable(*_args):
+        raise urllib.error.HTTPError("http://gpu0/api/chat", 404, "missing", {}, None)
+
+    monkeypatch.setattr("inverse_verifier.synthetic._ollama_naturalize", unavailable)
+    try:
+        naturalize_corpus(source, output)
+    except RuntimeError as exc:
+        assert "Ollama request failed" in str(exc)
+    else:
+        raise AssertionError("HTTP failure should stop naturalization")
+
+    assert (output / "train_faithful.jsonl").read_text(encoding="utf-8") == ""
