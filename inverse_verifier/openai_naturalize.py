@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -532,3 +533,67 @@ def _prediction_rejection(prediction: dict[str, str] | None) -> str | None:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def run_batch_records(
+    records: list[dict[str, Any]],
+    directory: Path,
+    client: OpenAIBatchClient,
+    label: str,
+    max_estimated_tokens: int = MAX_ESTIMATED_TOKENS_PER_BATCH,
+) -> list[Path]:
+    """Run arbitrary Chat Completions Batch records with resumable local state."""
+    directory.mkdir(parents=True, exist_ok=True)
+    serialized = [json.dumps(record, ensure_ascii=False) for record in records]
+    fingerprint = hashlib.sha256(
+        (str(max_estimated_tokens) + "\n" + "\n".join(serialized)).encode()
+    ).hexdigest()
+    state_path = directory / "state.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+        if state.get("fingerprint") != fingerprint:
+            raise RuntimeError(f"existing {label} state does not match current requests")
+    else:
+        chunks = []
+        lines, tokens = [], 0
+        for line in serialized:
+            line_tokens = estimate_tokens(line)
+            if lines and tokens + line_tokens > max_estimated_tokens:
+                chunks.append(_write_chunk(directory, len(chunks), lines, tokens))
+                lines, tokens = [], 0
+            lines.append(line)
+            tokens += line_tokens
+        if lines:
+            chunks.append(_write_chunk(directory, len(chunks), lines, tokens))
+        state = {"label": label, "fingerprint": fingerprint, "requests": len(records), "chunks": chunks}
+        _write_json(state_path, state)
+
+    for index, chunk in enumerate(state["chunks"], 1):
+        if chunk.get("status") == "completed":
+            continue
+        if not chunk.get("batch_id"):
+            print(f"Submitting {label} batch {index}/{len(state['chunks'])}", flush=True)
+            file_id = client.upload(Path(chunk["request_file"]))
+            batch = client.create_batch(file_id)
+            chunk.update({"input_file_id": file_id, "batch_id": batch["id"], "status": batch["status"]})
+            _write_json(state_path, state)
+        while True:
+            batch = client.retrieve_batch(chunk["batch_id"])
+            chunk["status"] = batch["status"]
+            _write_json(state_path, state)
+            counts = batch.get("request_counts") or {}
+            print(
+                f"{label} batch {index}/{len(state['chunks'])}: {batch['status']} "
+                f"({counts.get('completed', 0)}/{counts.get('total', '?')})",
+                flush=True,
+            )
+            if batch["status"] == "completed":
+                result_path = directory / f"results_{index - 1:03d}.jsonl"
+                result_path.write_bytes(client.download(batch["output_file_id"]))
+                chunk.update({"result_file": str(result_path), "status": "completed"})
+                _write_json(state_path, state)
+                break
+            if batch["status"] in {"failed", "expired", "cancelled"}:
+                raise RuntimeError(f"OpenAI {label} batch ended with {batch['status']}")
+            time.sleep(POLL_SECONDS)
+    return [Path(chunk["result_file"]) for chunk in state["chunks"]]

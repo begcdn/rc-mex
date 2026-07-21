@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .data import prepare_dataset
+from .dataset_builder import build_naturalized_dataset
 from .evaluate import evaluate, evaluate_gold_generation
 from .model import train_model
 from .openai_naturalize import run_openai_naturalization
@@ -90,6 +91,23 @@ def build_parser() -> argparse.ArgumentParser:
     openai_naturalize.add_argument("--max-negatives", type=int, default=3)
     openai_naturalize.add_argument("--max-budget-usd", type=float, default=8.0)
     openai_naturalize.add_argument("--dry-run", action="store_true")
+
+    build_dataset = subparsers.add_parser(
+        "build-naturalized-dataset",
+        help="build a validated natural corpus using grounded relation semantics",
+    )
+    build_dataset.add_argument(
+        "--data", type=Path, default=Path("runs/inverse_verifier/faithful_data_30k_probe")
+    )
+    build_dataset.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/naturalized_dataset")
+    )
+    build_dataset.add_argument("--kqa-kb", type=Path, default=Path("data/kqa_pro/kb.json"))
+    build_dataset.add_argument("--webqsp-graphs", type=Path, default=Path("data/webqsp/train.jsonl"))
+    build_dataset.add_argument("--max-paths", type=int, default=3_000)
+    build_dataset.add_argument("--max-negatives", type=int, default=3)
+    build_dataset.add_argument("--qwen-model", default="qwen3:8b")
+    build_dataset.add_argument("--ollama-host", default="http://127.0.0.1:11434")
 
     faithfulness = subparsers.add_parser(
         "faithfulness", help="compare gold and executable-negative generated questions"
@@ -263,6 +281,19 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Prepared OpenAI-naturalized data in {args.output}")
+    elif args.command == "build-naturalized-dataset":
+        manifest = build_naturalized_dataset(
+            args.data,
+            args.output,
+            args.kqa_kb,
+            args.webqsp_graphs,
+            max_paths=args.max_paths,
+            max_negatives=args.max_negatives,
+            qwen_model=args.qwen_model,
+            ollama_host=args.ollama_host,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Prepared validated natural dataset in {args.output}")
     elif args.command == "faithfulness":
         metrics = evaluate_faithful_generation(
             args.data,

@@ -162,3 +162,28 @@ python3 -m inverse_verifier naturalize-openai \
   --max-paths 3000 \
   --max-negatives 3
 ```
+
+## Validated Dataset Builder
+
+The current production path compiles traversal directions into explicit raw triples, grounds each
+unique relation with labeled facts from the local KQA Pro and WebQSP graphs, builds a reusable
+relation glossary with GPT-4o, naturalizes compact queries with local Qwen, and validates or repairs
+every question with GPT-4o mini. Metadata and low-confidence relation meanings are rejected rather
+than guessed. All stages resume from the same output directory.
+
+Run a small dataset build before the full corpus:
+
+```bash
+export OPENAI_API_KEY='...'
+python3 -m inverse_verifier build-naturalized-dataset \
+  --output runs/inverse_verifier/naturalized_dataset_40 \
+  --max-paths 40
+```
+
+After inspecting that output, build the 3,000-path corpus with a new output directory:
+
+```bash
+python3 -m inverse_verifier build-naturalized-dataset \
+  --output runs/inverse_verifier/naturalized_dataset_3k \
+  --max-paths 3000
+```

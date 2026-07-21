@@ -47,6 +47,8 @@ from inverse_verifier.openai_naturalize import (
     validate_question,
     select_rows,
 )
+from inverse_verifier.query_representation import represent_query
+from inverse_verifier.dataset_builder import compact_query, validate_glossary
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -95,6 +97,217 @@ def test_openai_naturalization_selects_diverse_negative_types() -> None:
 def test_openai_naturalization_reports_missing_corpus(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="train_faithful.jsonl"):
         select_rows(tmp_path, 10, 3)
+
+
+def test_explicit_query_representation_orients_forward_fact() -> None:
+    query = represent_query(
+        PathSpec(
+            "Ada Lovelace",
+            "person",
+            (Hop("people.person.place_of_birth", "forward", "person", "city"),),
+            "city",
+            "webqsp",
+        )
+    )
+    assert query["variables"] == [
+        {"id": "v0", "role": "anchor", "binding": "[ENTITY]", "type": "person"},
+        {"id": "v1", "role": "answer", "type": "city"},
+    ]
+    triple = query["triples"][0]
+    assert (triple["subject"], triple["predicate"], triple["object"]) == (
+        "v0",
+        "people.person.place_of_birth",
+        "v1",
+    )
+    assert triple["kg"] == "webqsp"
+    assert (triple["subject_type"], triple["object_type"]) == ("person", "city")
+    assert (triple["traversal"]["source_type"], triple["traversal"]["target_type"]) == (
+        "person",
+        "city",
+    )
+    assert triple["relation_schema"]["components"] == {
+        "domain": "people",
+        "type": "person",
+        "property": "place_of_birth",
+    }
+    assert triple["relation_schema"]["semantic_interpretation"] == (
+        "not_inferred_from_identifier_tokens"
+    )
+    assert query["answer_variable"] == "v1"
+
+
+def test_explicit_query_representation_orients_backward_fact() -> None:
+    query = represent_query(
+        PathSpec(
+            "Whitney Houston",
+            "musical artist",
+            (Hop("music.album.artist", "backward", "musical artist", "album"),),
+            "album",
+            "webqsp",
+        )
+    )
+    triple = query["triples"][0]
+    assert (triple["subject"], triple["predicate"], triple["object"]) == (
+        "v1",
+        "music.album.artist",
+        "v0",
+    )
+    assert triple["traversal"] == {
+        "hop_index": 0,
+        "from": "v0",
+        "to": "v1",
+        "direction": "backward",
+        "source_type": "musical artist",
+        "target_type": "album",
+    }
+    assert (triple["subject_type"], triple["object_type"]) == ("album", "musical artist")
+    assert "raw fact (v_j, relation, v_i)" in query["logical_form"]
+
+
+def test_explicit_query_exposes_birthplace_residence_occupation_branch() -> None:
+    path = PathSpec(
+        "Wendee Lee",
+        "human",
+        (
+            Hop("place of birth", "forward", "human", "city"),
+            Hop("residence", "backward", "city", "human"),
+            Hop("occupation", "forward", "human", "occupation"),
+        ),
+        "occupation",
+        "kqa_pro",
+    )
+    query = represent_query(path)
+    assert [
+        (triple["subject"], triple["predicate"], triple["object"])
+        for triple in query["triples"]
+    ] == [
+        ("v0", "place of birth", "v1"),
+        ("v2", "residence", "v1"),
+        ("v2", "occupation", "v3"),
+    ]
+    assert query["schema_origin"] == "kqa_pro"
+    assert query["answer_variable"] == "v3"
+    assert query["variables"][-1] == {"id": "v3", "role": "answer", "type": "occupation"}
+    assert "Do not generate the final natural-language question" in query["logical_form"]
+
+
+def test_explicit_query_preserves_raw_freebase_cvt_triples() -> None:
+    path = PathSpec(
+        "Actor A",
+        "person",
+        (
+            Hop("people.place_lived.person", "backward", "person", "entity"),
+            Hop("people.place_lived.location", "forward", "entity", "location"),
+        ),
+        "location",
+        "webqsp",
+    )
+    query = represent_query(path)
+    assert [
+        (triple["subject"], triple["predicate"], triple["object"])
+        for triple in query["triples"]
+    ] == [
+        ("v1", "people.place_lived.person", "v0"),
+        ("v1", "people.place_lived.location", "v2"),
+    ]
+    assert len(query["semantic_macros"]) == 1
+    macro = query["semantic_macros"][0]
+    assert macro["kind"] == "possible_freebase_cvt"
+    assert macro["middle_variable"] == "v1"
+    assert macro["triple_indices"] == [0, 1]
+    assert macro["needs_semantic_description"] is True
+    assert "identifier tokens do not establish" in macro["reason"]
+
+
+def test_explicit_query_preserves_and_flags_metadata_relation() -> None:
+    path = PathSpec(
+        "Book A",
+        "book",
+        (Hop("common.topic.notable_types", "forward", "book", "type"),),
+        "type",
+        "webqsp",
+    )
+    query = represent_query(path)
+    triple = query["triples"][0]
+    assert triple["predicate"] == "common.topic.notable_types"
+    assert triple["metadata"] == {
+        "is_metadata": True,
+        "matched_patterns": ["common.topic.notable_types"],
+        "action": "preserve_and_flag",
+    }
+    assert "metadata=true" in query["logical_form"]
+
+
+def test_explicit_query_flags_kwebbase_internal_relation() -> None:
+    path = PathSpec(
+        "Commander A",
+        "military commander",
+        (Hop("base.kwebbase.kwtopic.has_sentences", "forward", "military commander", "entity"),),
+        "entity",
+        "webqsp",
+    )
+    triple = represent_query(path)["triples"][0]
+    assert triple["metadata"]["is_metadata"] is True
+    assert triple["needs_semantic_description"] is True
+
+
+def test_compact_query_preserves_branch_and_relation_meaning() -> None:
+    path = {
+        "kg": "kqa_pro",
+        "anchor_type": "human",
+        "answer_type": "occupation",
+        "hops": [
+            {"relation": "place of birth", "direction": "forward", "source_type": "human", "target_type": "city"},
+            {"relation": "residence", "direction": "backward", "source_type": "city", "target_type": "human"},
+            {"relation": "occupation", "direction": "forward", "source_type": "human", "target_type": "occupation"},
+        ],
+    }
+    glossary = {
+        f"kqa_pro::{relation}": {
+            "status": "semantic",
+            "description": relation,
+            "fact_template": "{subject} " + relation + " {object}",
+        }
+        for relation in ("place of birth", "residence", "occupation")
+    }
+    query = compact_query(path, glossary)
+    assert [(fact["subject"], fact["object"]) for fact in query["facts"]] == [
+        ("v0", "v1"),
+        ("v2", "v1"),
+        ("v2", "v3"),
+    ]
+    assert query["return"] == {"variable": "v3", "type": "occupation"}
+    assert query["unusable_relations"] == []
+
+
+def test_glossary_validation_overrides_metadata_and_weak_semantics() -> None:
+    evidence = {
+        "webqsp::base.kwebbase.kwtopic.has_sentences": {
+            "metadata_hint": {"is_metadata": True, "matched_patterns": ["base.kwebbase"]}
+        },
+        "webqsp::people.person.profession": {
+            "metadata_hint": {"is_metadata": False, "matched_patterns": []}
+        },
+    }
+    generated = {
+        "webqsp::base.kwebbase.kwtopic.has_sentences": {
+            "id": "webqsp::base.kwebbase.kwtopic.has_sentences",
+            "status": "semantic",
+            "fact_template": "{subject} has {object}",
+            "confidence": 0.99,
+            "reason": "guessed",
+        },
+        "webqsp::people.person.profession": {
+            "id": "webqsp::people.person.profession",
+            "status": "semantic",
+            "fact_template": "person profession",
+            "confidence": 0.4,
+            "reason": "weak",
+        },
+    }
+    glossary = validate_glossary(evidence, generated)
+    assert glossary["webqsp::base.kwebbase.kwtopic.has_sentences"]["status"] == "metadata"
+    assert glossary["webqsp::people.person.profession"]["status"] == "opaque"
 from inverse_verifier.selector import (
     answer_metrics,
     enumerate_path_families,

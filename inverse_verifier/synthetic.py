@@ -15,6 +15,7 @@ from .data import Hop, PathSpec, path_to_dict, relation_sequence, relation_words
 
 
 METADATA_RELATION_PARTS = (
+    "base.kwebbase",
     "common.topic.notable_types",
     "common.topic.notable_for",
     "common.topic.subject_of",
