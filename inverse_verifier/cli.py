@@ -65,7 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", type=Path, default=Path("runs/inverse_verifier/faithful_data_natural")
     )
     naturalize.add_argument("--model", default="qwen3:8b")
-    naturalize.add_argument("--ollama-host", default="http://127.0.0.1:11434")
+    naturalize.add_argument(
+        "--ollama-host",
+        action="append",
+        help=(
+            "Ollama endpoint; repeat once per GPU-backed server. "
+            "Defaults to http://127.0.0.1:11434."
+        ),
+    )
 
     faithfulness = subparsers.add_parser(
         "faithfulness", help="compare gold and executable-negative generated questions"
@@ -223,7 +230,7 @@ def main() -> None:
             args.data,
             args.output,
             model=args.model,
-            host=args.ollama_host,
+            host=args.ollama_host or ["http://127.0.0.1:11434"],
         )
         print(json.dumps(manifest, indent=2))
         print(f"Prepared natural faithful data in {args.output}")

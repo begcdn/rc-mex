@@ -5,6 +5,7 @@ import random
 import re
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -561,9 +562,14 @@ def naturalize_corpus(
     source: Path,
     output: Path,
     model: str = "qwen3:8b",
-    host: str = "http://127.0.0.1:11434",
+    host: str | list[str] = "http://127.0.0.1:11434",
     batch_size: int = 4,
 ) -> dict[str, Any]:
+    hosts = [host] if isinstance(host, str) else host
+    hosts = [item.rstrip("/") for item in hosts if item]
+    if not hosts:
+        raise ValueError("at least one Ollama host is required")
+
     output.mkdir(parents=True, exist_ok=True)
     totals = {"rows": 0, "naturalized_questions": 0, "canonical_fallbacks": 0}
     for filename in ("train_faithful.jsonl", "dev_faithful.jsonl"):
@@ -587,42 +593,79 @@ def naturalize_corpus(
             totals["canonical_fallbacks"] += sum(
                 1 + len(row["negative_paths"]) for row in completed_rows
             ) - completed_naturalized
-        with destination.open("a", encoding="utf-8") as handle:
-            for start in range(len(completed_rows), len(rows), batch_size):
-                batch = rows[start : start + batch_size]
-                generated: dict[str, str] = {}
-                for attempt in range(2):
-                    try:
-                        generated = _ollama_naturalize(batch, model, host)
-                        break
-                    except Exception as exc:
-                        if attempt == 1:
-                            print(f"Naturalization fallback at row {start}: {exc}", flush=True)
-                for row_index, row in enumerate(batch):
-                    row["canonical_question"] = row["question"]
-                    positive_id = f"{row_index}:positive"
-                    if positive_id in generated:
-                        row["question"] = generated[positive_id]
-                        totals["naturalized_questions"] += 1
-                    else:
-                        totals["canonical_fallbacks"] += 1
-                    for negative_index, negative in enumerate(row["negative_paths"]):
-                        negative["canonical_question"] = negative["question"]
-                        negative_id = f"{row_index}:negative:{negative_index}"
-                        if negative_id in generated:
-                            negative["question"] = generated[negative_id]
+        pending = list(range(len(completed_rows), len(rows), batch_size))
+        with destination.open("a", encoding="utf-8") as handle, ThreadPoolExecutor(
+            max_workers=len(hosts)
+        ) as executor:
+            for wave_start in range(0, len(pending), len(hosts)):
+                wave = pending[wave_start : wave_start + len(hosts)]
+                jobs = []
+                for worker_index, start in enumerate(wave):
+                    batch = rows[start : start + batch_size]
+                    jobs.append(
+                        (
+                            start,
+                            batch,
+                            hosts[worker_index],
+                            executor.submit(
+                                _naturalize_batch,
+                                batch,
+                                model,
+                                hosts[worker_index],
+                                start,
+                            ),
+                        )
+                    )
+
+                for start, batch, worker_host, future in jobs:
+                    generated = future.result()
+                    for row_index, row in enumerate(batch):
+                        row["canonical_question"] = row["question"]
+                        positive_id = f"{row_index}:positive"
+                        if positive_id in generated:
+                            row["question"] = generated[positive_id]
                             totals["naturalized_questions"] += 1
                         else:
                             totals["canonical_fallbacks"] += 1
-                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    totals["rows"] += 1
-                print(
-                    f"{filename}: {min(start + len(batch), len(rows))}/{len(rows)} rows",
-                    flush=True,
-                )
-    totals.update({"model": model, "source": str(source)})
+                        for negative_index, negative in enumerate(row["negative_paths"]):
+                            negative["canonical_question"] = negative["question"]
+                            negative_id = f"{row_index}:negative:{negative_index}"
+                            if negative_id in generated:
+                                negative["question"] = generated[negative_id]
+                                totals["naturalized_questions"] += 1
+                            else:
+                                totals["canonical_fallbacks"] += 1
+                        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        totals["rows"] += 1
+                    handle.flush()
+                    print(
+                        f"{filename}: {min(start + len(batch), len(rows))}/{len(rows)} rows "
+                        f"via {worker_host}",
+                        flush=True,
+                    )
+    totals.update(
+        {"model": model, "source": str(source), "ollama_hosts": hosts, "workers": len(hosts)}
+    )
     (output / "manifest.json").write_text(json.dumps(totals, indent=2), encoding="utf-8")
     return totals
+
+
+def _naturalize_batch(
+    batch: list[dict[str, Any]],
+    model: str,
+    host: str,
+    start: int,
+) -> dict[str, str]:
+    for attempt in range(2):
+        try:
+            return _ollama_naturalize(batch, model, host)
+        except Exception as exc:
+            if attempt == 1:
+                print(
+                    f"Naturalization fallback at row {start} via {host}: {exc}",
+                    flush=True,
+                )
+    return {}
 
 
 def evaluate_faithful_generation(

@@ -36,6 +36,7 @@ from inverse_verifier.synthetic import (
     canonical_question,
     example_from_path,
     question_covers_path,
+    naturalize_corpus,
 )
 from inverse_verifier.selector import (
     answer_metrics,
@@ -462,3 +463,71 @@ def test_faithful_dataset_generates_negative_intent_and_contrasts_with_gold() ->
     assert item["generation_target"] == row["negative_paths"][0]["question"]
     assert item["contrast_target"] == row["question"]
     assert "place of birth" in item["negative_source"]
+
+
+def test_naturalization_uses_multiple_hosts_and_preserves_source_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    rows = []
+    for index in range(5):
+        rows.append(
+            {
+                "id": f"row-{index}",
+                "question": f"canonical {index}",
+                "positive_path": {
+                    "hops": [
+                        {
+                            "relation": "author",
+                            "direction": "forward",
+                            "source_type": "book",
+                            "target_type": "person",
+                        }
+                    ],
+                    "answer_type": "person",
+                },
+                "negative_paths": [],
+            }
+        )
+    for filename in ("train_faithful.jsonl", "dev_faithful.jsonl"):
+        selected = rows if filename.startswith("train") else []
+        (source / filename).write_text(
+            "".join(json.dumps(row) + "\n" for row in selected), encoding="utf-8"
+        )
+
+    called_hosts = []
+
+    def fake_naturalize(batch, _model, host):
+        called_hosts.append(host)
+        return {
+            f"{index}:positive": f"natural {row['id']}"
+            for index, row in enumerate(batch)
+        }
+
+    monkeypatch.setattr("inverse_verifier.synthetic._ollama_naturalize", fake_naturalize)
+    manifest = naturalize_corpus(
+        source,
+        output,
+        host=["http://gpu0:11434", "http://gpu1:11434"],
+        batch_size=1,
+    )
+
+    written = [
+        json.loads(line)
+        for line in (output / "train_faithful.jsonl").open(encoding="utf-8")
+    ]
+    assert [row["id"] for row in written] == [f"row-{index}" for index in range(5)]
+    assert [row["question"] for row in written] == [f"natural row-{index}" for index in range(5)]
+    assert set(called_hosts) == {"http://gpu0:11434", "http://gpu1:11434"}
+    assert manifest["workers"] == 2
+
+    resumed = naturalize_corpus(
+        source,
+        output,
+        host=["http://gpu0:11434", "http://gpu1:11434"],
+        batch_size=1,
+    )
+    assert resumed["rows"] == 5
+    assert len(called_hosts) == 5

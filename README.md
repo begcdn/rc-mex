@@ -66,6 +66,19 @@ python3 -m inverse_verifier faithfulness \
   --output runs/inverse_verifier/faithful_inverse_eval
 ```
 
+Naturalization can use one independent Ollama server per GPU. Repeat
+`--ollama-host` for every endpoint; batches run concurrently while output rows
+remain in source order and the run remains resumable.
+
+```bash
+python3 -m inverse_verifier naturalize \
+  --data runs/inverse_verifier/faithful_data \
+  --output runs/inverse_verifier/faithful_data_natural \
+  --model qwen3:8b \
+  --ollama-host http://127.0.0.1:11434 \
+  --ollama-host http://127.0.0.1:11435
+```
+
 For a quick local check, add `--limit 128` to training and
 `--limit-per-split 32` to evaluation. Full outputs are limited to
 `metrics.json`, `predictions.jsonl`, and `report.md`.
