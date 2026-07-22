@@ -119,5 +119,28 @@ validated v8 corpus. One `relative` pair was rejected because the grounded
 relation is symmetric. All 266 source pairs were independently reviewed against
 their explicit queries; one over-narrow religion paraphrase was corrected. The
 final corpus has no train/development relation overlap and no detected structural
-or semantic audit failures. Its frozen evaluation is still pending, so it must
-not yet be described as an improvement.
+or semantic audit failures.
+
+### Frozen executable-direction result
+
+The 24 development relations are disjoint from the paired-direction training
+relations. Each is evaluated in both directions, producing 48 decisions. The
+original v8 model and the executable-direction model use the same generated-
+question similarity evaluator:
+
+| Model | Executable direction accuracy | Positive similarity | Negative similarity | Margin |
+|---|---:|---:|---:|---:|
+| Original v8 | 0.729 | 0.849 | 0.766 | 0.083 |
+| Executable-direction v1 | **0.854** | **0.905** | 0.785 | **0.120** |
+
+The intervention therefore recovers six additional held-out direction decisions
+and increases the separation margin by about 45%. This supports the narrow claim
+that paired executable supervision improves direction semantics. It does not
+solve full candidate ranking: KQA Pro gold-over-all remains `0.139`, WebQSP
+gold-over-all remains `0.293`, and strict unseen-composition gold-over-all is
+only `0.034`.
+
+The older KQA `wrong_direction` corruption is not used as the primary direction
+measure. It flips an arrow without swapping endpoint types, so many negatives
+are incoherent queries rather than executable reverse relations. Its low score
+must not be conflated with performance on real bidirectional KG queries.
