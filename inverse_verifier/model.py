@@ -737,7 +737,16 @@ def train_model(
         dev_rows = dev_rows[: max(16, limit // 10)]
     if not train_rows or not dev_rows:
         raise ValueError("training and development splits must both be non-empty")
-    relation_glossary = load_relation_glossary(relation_glossary_path)
+    embedded_glossary_path = Path(base_model) / "relation_glossary.json"
+    effective_glossary_path = relation_glossary_path
+    if effective_glossary_path is None and embedded_glossary_path.exists():
+        effective_glossary_path = embedded_glossary_path
+    if objective == "faithful_inverse" and effective_glossary_path is None:
+        raise ValueError(
+            "faithful_inverse requires --relation-glossary, unless the base checkpoint "
+            "already embeds relation_glossary.json"
+        )
+    relation_glossary = load_relation_glossary(effective_glossary_path)
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True)
     generator = load_generator_backbone(base_model)
@@ -980,8 +989,10 @@ def train_model(
         "relation_glossary_entries": len(relation_glossary),
         "history": history,
     }
-    if relation_glossary_path:
-        shutil.copyfile(relation_glossary_path, output / "model" / "relation_glossary.json")
+    if effective_glossary_path:
+        destination_glossary = output / "model" / "relation_glossary.json"
+        if Path(effective_glossary_path).resolve() != destination_glossary.resolve():
+            shutil.copyfile(effective_glossary_path, destination_glossary)
     (output / "training.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
     return run
 
