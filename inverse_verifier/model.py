@@ -1074,6 +1074,45 @@ def generate_joint_questions(
     return generations
 
 
+@torch.no_grad()
+def score_question_likelihood(
+    model: Any,
+    tokenizer: Any,
+    questions: list[str],
+    paths: list[dict[str, Any]],
+    device: torch.device,
+    batch_size: int = 16,
+    max_source_length: int = 256,
+    max_target_length: int = 96,
+) -> list[float]:
+    """Return length-normalized log-likelihood of each question given its path."""
+    scores: list[float] = []
+    model.eval()
+    backbone = model.generator if isinstance(model, JointInverseRanker) else model
+    for start in range(0, len(paths), batch_size):
+        batch_paths = paths[start : start + batch_size]
+        batch_questions = questions[start : start + batch_size]
+        encoded = tokenizer(
+            [render_path(path, mask_anchor=True) for path in batch_paths],
+            padding=True,
+            truncation=True,
+            max_length=max_source_length,
+            return_tensors="pt",
+        ).to(device)
+        target = tokenizer(
+            text_target=batch_questions,
+            padding=True,
+            truncation=True,
+            max_length=max_target_length,
+            return_tensors="pt",
+        )
+        labels = target["input_ids"].to(device)
+        labels[labels == tokenizer.pad_token_id] = -100
+        output = backbone(**encoded, labels=labels)
+        scores.extend((-normalized_sequence_nll(output.logits, labels)).cpu().tolist())
+    return scores
+
+
 def load_joint_ranker(
     model_path: str,
     device_name: str = "auto",

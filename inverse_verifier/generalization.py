@@ -9,7 +9,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from .data import delexicalize_question, read_jsonl, write_jsonl
-from .model import generate_joint_questions, load_seq2seq
+from .model import generate_joint_questions, load_seq2seq, score_question_likelihood
 
 
 def relation_keys(row: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
@@ -96,6 +96,9 @@ def evaluate_slice(
         delexicalize_question(rows[row_index]["question"], path["anchor"])
         for path, (row_index, _, _) in zip(paths, locations, strict=True)
     ]
+    likelihood_scores = score_question_likelihood(
+        model, tokenizer, references, paths, model_device, batch_size=batch_size
+    )
     intents = [
         delexicalize_question(question, path["anchor"])
         for question, path in zip(generated, paths, strict=True)
@@ -109,8 +112,8 @@ def evaluate_slice(
     similarities = np.sum(reference_embeddings * intent_embeddings, axis=1).tolist()
 
     candidates_by_row: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for path, question, intent, similarity, (row_index, category, is_positive) in zip(
-        paths, generated, intents, similarities, locations, strict=True
+    for path, question, intent, similarity, likelihood, (row_index, category, is_positive) in zip(
+        paths, generated, intents, similarities, likelihood_scores, locations, strict=True
     ):
         candidates_by_row[row_index].append(
             {
@@ -119,24 +122,32 @@ def evaluate_slice(
                 "generated_question": question,
                 "generated_intent": intent,
                 "semantic_similarity": float(similarity),
+                "conditional_likelihood_score": float(likelihood),
                 "path": path,
             }
         )
 
     predictions = []
     category_results: dict[str, list[bool]] = defaultdict(list)
+    likelihood_category_results: dict[str, list[bool]] = defaultdict(list)
     positive_scores: list[float] = []
     negative_scores: list[float] = []
     margins: list[float] = []
+    likelihood_margins: list[float] = []
+    likelihood_beats_all: list[bool] = []
     for row_index, row in enumerate(rows):
         candidates = candidates_by_row[row_index]
         positive_score = candidates[0]["semantic_similarity"]
+        positive_likelihood = candidates[0]["conditional_likelihood_score"]
         negatives = candidates[1:]
         positive_scores.append(positive_score)
         negative_scores.extend(item["semantic_similarity"] for item in negatives)
         for item in negatives:
             category_results[item["category"]].append(
                 positive_score > item["semantic_similarity"]
+            )
+            likelihood_category_results[item["category"]].append(
+                positive_likelihood > item["conditional_likelihood_score"]
             )
         beats_all = all(positive_score > item["semantic_similarity"] for item in negatives)
         margin = (
@@ -145,6 +156,18 @@ def evaluate_slice(
             else 0.0
         )
         margins.append(margin)
+        likelihood_beats_all.append(
+            all(
+                positive_likelihood > item["conditional_likelihood_score"]
+                for item in negatives
+            )
+        )
+        likelihood_margins.append(
+            positive_likelihood
+            - max(item["conditional_likelihood_score"] for item in negatives)
+            if negatives
+            else 0.0
+        )
         predictions.append(
             {
                 "example_id": row["example_id"],
@@ -153,6 +176,8 @@ def evaluate_slice(
                 "relation_sequence": list(relation_keys(row)),
                 "positive_beats_all_negatives": beats_all,
                 "positive_margin_over_best_negative": margin,
+                "likelihood_positive_beats_all_negatives": likelihood_beats_all[-1],
+                "likelihood_margin_over_best_negative": likelihood_margins[-1],
                 "candidates": candidates,
             }
         )
@@ -174,12 +199,32 @@ def evaluate_slice(
         "mean_positive_similarity": float(np.mean(positive_scores)) if positive_scores else 0.0,
         "mean_negative_similarity": float(np.mean(negative_scores)) if negative_scores else 0.0,
         "mean_margin": float(np.mean(margins)) if margins else 0.0,
+        "likelihood_positive_beats_all_negatives": (
+            sum(likelihood_beats_all) / len(likelihood_beats_all)
+            if likelihood_beats_all
+            else 0.0
+        ),
+        "likelihood_pairwise_accuracy": (
+            sum(sum(values) for values in likelihood_category_results.values()) / pair_count
+            if pair_count
+            else 0.0
+        ),
+        "mean_likelihood_margin": (
+            float(np.mean(likelihood_margins)) if likelihood_margins else 0.0
+        ),
         "by_negative_type": {
             category: {
                 "pairs": len(values),
                 "pairwise_accuracy": sum(values) / len(values),
             }
             for category, values in sorted(category_results.items())
+        },
+        "likelihood_by_negative_type": {
+            category: {
+                "pairs": len(values),
+                "pairwise_accuracy": sum(values) / len(values),
+            }
+            for category, values in sorted(likelihood_category_results.items())
         },
     }
     return metrics, predictions
@@ -227,14 +272,16 @@ def evaluate_faithful_generalization(
         "",
         "Strict relation and composition slices are derived from the actual training corpus, not old split names.",
         "",
-        "| Slice | Examples | Gold beats all | Pair accuracy | Gold similarity | Margin |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Slice | Examples | Semantic gold-all | Semantic pair | Likelihood gold-all | Likelihood pair | Likelihood margin |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, values in metrics["slices"].items():
         lines.append(
             f"| {name} | {values['examples']} | {values['positive_beats_all_negatives']:.3f} | "
-            f"{values['pairwise_accuracy']:.3f} | {values['mean_positive_similarity']:.3f} | "
-            f"{values['mean_margin']:.3f} |"
+            f"{values['pairwise_accuracy']:.3f} | "
+            f"{values['likelihood_positive_beats_all_negatives']:.3f} | "
+            f"{values['likelihood_pairwise_accuracy']:.3f} | "
+            f"{values['mean_likelihood_margin']:.3f} |"
         )
     (output / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return metrics
