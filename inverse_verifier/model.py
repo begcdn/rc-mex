@@ -4,6 +4,7 @@ import json
 import gc
 import math
 import random
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,13 @@ from torch.utils.data import DataLoader, Dataset
 from safetensors import safe_open
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from .data import ENTITY_PLACEHOLDER, delexicalize_question, read_jsonl, render_path
+from .data import (
+    ENTITY_PLACEHOLDER,
+    delexicalize_question,
+    load_relation_glossary,
+    read_jsonl,
+    render_path,
+)
 
 
 UNINFORMATIVE_ANSWER_TYPES = {
@@ -54,6 +61,10 @@ def load_generator_backbone(model_path: str) -> Any:
                 saved_output = weights.get_tensor("lm_head.weight")
                 model.get_output_embeddings().weight = nn.Parameter(saved_output)
                 model.config.tie_word_embeddings = False
+    embedded_glossary = path / "relation_glossary.json"
+    model._relation_glossary = (
+        load_relation_glossary(embedded_glossary) if embedded_glossary.exists() else {}
+    )
     return model
 
 
@@ -147,10 +158,16 @@ class JointPathDataset(Dataset):
 class FaithfulInverseDataset(Dataset):
     """Generation targets for every path plus gold-vs-negative likelihood pairs."""
 
-    def __init__(self, rows: list[dict[str, Any]], seed: int = 17):
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        seed: int = 17,
+        relation_glossary: dict[str, dict[str, Any]] | None = None,
+    ):
         self.rows = rows
         self.seed = seed
         self.epoch = 0
+        self.relation_glossary = relation_glossary
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -172,10 +189,16 @@ class FaithfulInverseDataset(Dataset):
                 negative = row["positive_path"]
                 target = paired["question"]
             return {
-                "generation_source": render_path(positive, mask_anchor=True),
+                "generation_source": render_path(
+                    positive, mask_anchor=True, relation_glossary=self.relation_glossary
+                ),
                 "generation_target": target,
-                "positive_source": render_path(positive, mask_anchor=True),
-                "negative_source": render_path(negative, mask_anchor=True),
+                "positive_source": render_path(
+                    positive, mask_anchor=True, relation_glossary=self.relation_glossary
+                ),
+                "negative_source": render_path(
+                    negative, mask_anchor=True, relation_glossary=self.relation_glossary
+                ),
                 "contrast_target": target,
                 "negative_type": "executable_opposite_direction",
             }
@@ -194,10 +217,20 @@ class FaithfulInverseDataset(Dataset):
             natural_negative["question"] if generate_negative else row["question"]
         )
         return {
-            "generation_source": render_path(generation_path, mask_anchor=True),
+            "generation_source": render_path(
+                generation_path,
+                mask_anchor=True,
+                relation_glossary=self.relation_glossary,
+            ),
             "generation_target": generation_target,
-            "positive_source": render_path(positive, mask_anchor=True),
-            "negative_source": render_path(contrast_negative, mask_anchor=True),
+            "positive_source": render_path(
+                positive, mask_anchor=True, relation_glossary=self.relation_glossary
+            ),
+            "negative_source": render_path(
+                contrast_negative,
+                mask_anchor=True,
+                relation_glossary=self.relation_glossary,
+            ),
             "contrast_target": row["question"],
             "negative_type": contrast_negative["negative_type"],
         }
@@ -685,13 +718,14 @@ def train_model(
     rank_weight: float = 1.0,
     margin: float = 0.2,
     temperature: float = 0.2,
-    max_source_length: int = 256,
+    max_source_length: int = 512,
     max_target_length: int = 96,
     seed: int = 17,
     device_name: str = "auto",
     limit: int | None = None,
     regime: str = "kqa_only",
     objective: str = "inverse",
+    relation_glossary_path: Path | None = None,
 ) -> dict[str, Any]:
     torch.manual_seed(seed)
     random.seed(seed)
@@ -703,6 +737,7 @@ def train_model(
         dev_rows = dev_rows[: max(16, limit // 10)]
     if not train_rows or not dev_rows:
         raise ValueError("training and development splits must both be non-empty")
+    relation_glossary = load_relation_glossary(relation_glossary_path)
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True)
     generator = load_generator_backbone(base_model)
@@ -729,8 +764,8 @@ def train_model(
         dev_dataset = TypeAwareGeneratorDataset(dev_rows, seed + 1)
         collator = Seq2SeqTaskCollator(tokenizer, max_source_length, max_target_length)
     elif objective == "faithful_inverse":
-        train_dataset = FaithfulInverseDataset(train_rows, seed)
-        dev_dataset = FaithfulInverseDataset(dev_rows, seed + 1)
+        train_dataset = FaithfulInverseDataset(train_rows, seed, relation_glossary)
+        dev_dataset = FaithfulInverseDataset(dev_rows, seed + 1, relation_glossary)
         collator = FaithfulInverseCollator(tokenizer, max_source_length, max_target_length)
     else:
         raise ValueError(f"unknown objective: {objective}")
@@ -941,8 +976,12 @@ def train_model(
         "best_dev_selection_loss": best_dev_loss,
         "regime": regime,
         "objective": objective,
+        "input_contract": "grounded_relation_semantics_v1" if relation_glossary else "legacy",
+        "relation_glossary_entries": len(relation_glossary),
         "history": history,
     }
+    if relation_glossary_path:
+        shutil.copyfile(relation_glossary_path, output / "model" / "relation_glossary.json")
     (output / "training.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
     return run
 
@@ -1054,17 +1093,24 @@ def generate_joint_questions(
     device: torch.device,
     batch_size: int = 8,
     max_new_tokens: int = 64,
+    relation_glossary: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     generations: list[str] = []
     model.eval()
     backbone = model.generator if isinstance(model, JointInverseRanker) else model
+    glossary = relation_glossary
+    if glossary is None:
+        glossary = getattr(backbone, "_relation_glossary", None)
     for start in range(0, len(paths), batch_size):
         batch_paths = paths[start : start + batch_size]
         encoded = tokenizer(
-            [render_path(path, mask_anchor=True) for path in batch_paths],
+            [
+                render_path(path, mask_anchor=True, relation_glossary=glossary)
+                for path in batch_paths
+            ],
             padding=True,
             truncation=True,
-            max_length=256,
+            max_length=512,
             return_tensors="pt",
         ).to(device)
         output_ids = backbone.generate(**encoded, max_new_tokens=max_new_tokens, num_beams=1)
@@ -1082,18 +1128,25 @@ def score_question_likelihood(
     paths: list[dict[str, Any]],
     device: torch.device,
     batch_size: int = 16,
-    max_source_length: int = 256,
+    max_source_length: int = 512,
     max_target_length: int = 96,
+    relation_glossary: dict[str, dict[str, Any]] | None = None,
 ) -> list[float]:
     """Return length-normalized log-likelihood of each question given its path."""
     scores: list[float] = []
     model.eval()
     backbone = model.generator if isinstance(model, JointInverseRanker) else model
+    glossary = relation_glossary
+    if glossary is None:
+        glossary = getattr(backbone, "_relation_glossary", None)
     for start in range(0, len(paths), batch_size):
         batch_paths = paths[start : start + batch_size]
         batch_questions = questions[start : start + batch_size]
         encoded = tokenizer(
-            [render_path(path, mask_anchor=True) for path in batch_paths],
+            [
+                render_path(path, mask_anchor=True, relation_glossary=glossary)
+                for path in batch_paths
+            ],
             padding=True,
             truncation=True,
             max_length=max_source_length,

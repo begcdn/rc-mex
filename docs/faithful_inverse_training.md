@@ -144,3 +144,33 @@ The older KQA `wrong_direction` corruption is not used as the primary direction
 measure. It flips an arrow without swapping endpoint types, so many negatives
 are incoherent queries rather than executable reverse relations. Its low score
 must not be conflated with performance on real bidirectional KG queries.
+
+## Grounded generator input contract
+
+A generator-only audit found that executable-direction supervision improved
+relative discrimination but did not make the generated questions reliable:
+only 97 of 174 judgeable held-out generations were fully faithful. The main
+errors were reversed direction, unsupported facts, wrong answer roles, and
+wrong relation meanings.
+
+The cause was an input/target mismatch. Naturalized targets were created from a
+grounded relation glossary, but the generator input discarded that glossary.
+For Freebase predicates with three or more segments, it retained only the final
+segment. In the retained glossary, 472 relations participate in 147 resulting
+label collisions; for example, 22 distinct predicates render as `team`.
+
+The grounded input contract now gives the generator, for every hop:
+
+- the complete relation ID;
+- a natural-language relation meaning;
+- canonical subject and object roles;
+- a fact template instantiated with `START`, intermediate nodes, and `ANSWER`;
+- source, destination, and requested answer types.
+
+Traversal direction changes the variable binding in the instantiated fact. For
+example, a backward authorship hop is rendered as `ANSWER (written work) was
+written by START (author)`. The same renderer is used for training and
+inference. The glossary is copied into the trained checkpoint, so inference on
+a known KG does not require an LLM call. A new KG requires one offline glossary
+derived from its schema documentation or grounded examples; an opaque relation
+ID alone is not enough to recover semantics.

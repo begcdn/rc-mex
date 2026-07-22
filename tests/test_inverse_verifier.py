@@ -1066,6 +1066,72 @@ def test_render_path_makes_subject_object_direction_explicit() -> None:
     assert "fact roles=ANSWER:subject,START:object" in backward
 
 
+def test_grounded_render_path_binds_fact_roles_in_both_directions() -> None:
+    glossary = {
+        "test::author": {
+            "status": "semantic",
+            "description": "Connects a written work to its author.",
+            "subject_role": "written work",
+            "object_role": "author",
+            "fact_template": "{subject} was written by {object}.",
+        }
+    }
+    forward_path = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "kg": "test",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    backward_path = json.loads(json.dumps(forward_path))
+    backward_path["anchor_type"] = "person"
+    backward_path["answer_type"] = "book"
+    backward_path["hops"][0].update(
+        direction="backward", source_type="person", target_type="book"
+    )
+
+    forward = render_path(
+        forward_path, mask_anchor=True, relation_glossary=glossary
+    )
+    backward = render_path(
+        backward_path, mask_anchor=True, relation_glossary=glossary
+    )
+
+    assert "START (type: book; role: written work) was written by ANSWER" in forward
+    assert "ANSWER (type: book; role: written work) was written by START" in backward
+    assert "Requested answer: ANSWER (type: person)" in forward
+    assert "Requested answer: ANSWER (type: book)" in backward
+
+
+def test_grounded_render_path_fallback_preserves_full_relation_identity() -> None:
+    path = {
+        "anchor": "Work",
+        "anchor_type": "book",
+        "answer_type": "topic",
+        "kg": "webqsp",
+        "hops": [
+            {
+                "relation": "book.book_subject.works",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "topic",
+            }
+        ],
+    }
+
+    rendered = render_path(path, relation_glossary={})
+
+    assert "book / book subject / works" in rendered
+    assert "Relation ID: book.book_subject.works" in rendered
+
+
 def test_direction_repair_excludes_symmetric_relations() -> None:
     from inverse_verifier.training_data import direction_counterfactuals
 

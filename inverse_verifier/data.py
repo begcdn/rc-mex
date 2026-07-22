@@ -100,11 +100,85 @@ def relation_words(relation: str) -> str:
     return normalize_space(" ".join(pieces).replace("_", " ").replace("/", " "))
 
 
+def full_relation_words(relation: str) -> str:
+    """Render every schema segment instead of discarding relation identity."""
+    relation = relation.removeprefix("ns:")
+    return normalize_space(
+        " / ".join(relation.split(".")).replace("_", " ").replace("/", " / ")
+    )
+
+
+def load_relation_glossary(path: Path | str | None) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    glossary_path = Path(path)
+    if not glossary_path.exists():
+        raise FileNotFoundError(f"relation glossary not found: {glossary_path}")
+    data = json.loads(glossary_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("relation glossary must be a JSON object keyed by KG::relation")
+    return data
+
+
+def _grounded_hop_lines(
+    path: dict[str, Any],
+    hop: dict[str, Any],
+    index: int,
+    source: str,
+    destination: str,
+    glossary: dict[str, dict[str, Any]],
+) -> list[str]:
+    relation = hop["relation"]
+    kg = hop.get("kg") or path.get("kg", "unknown")
+    entry = glossary.get(f"{kg}::{relation}", {})
+    semantic = entry.get("status") == "semantic"
+    description = normalize_space(str(entry.get("description", ""))) if semantic else ""
+    subject_role = normalize_space(str(entry.get("subject_role", "entity"))) or "entity"
+    object_role = normalize_space(str(entry.get("object_role", "entity"))) or "entity"
+    template = str(entry.get("fact_template", "")) if semantic else ""
+
+    if hop["direction"] == "forward":
+        fact_subject, fact_object = source, destination
+        subject_type, object_type = hop["source_type"], hop["target_type"]
+    else:
+        fact_subject, fact_object = destination, source
+        subject_type, object_type = hop["target_type"], hop["source_type"]
+
+    subject = f"{fact_subject} (type: {subject_type}; role: {subject_role})"
+    obj = f"{fact_object} (type: {object_type}; role: {object_role})"
+    if "{subject}" in template and "{object}" in template:
+        try:
+            bound_fact = normalize_space(template.format(subject=subject, object=obj))
+        except (KeyError, ValueError):
+            bound_fact = ""
+    else:
+        bound_fact = ""
+    if not bound_fact:
+        bound_fact = f"{subject} --[{full_relation_words(relation)}]--> {obj}."
+
+    lines = [
+        f"Hop {index}: traversal {source} -> {destination}.",
+        f"  Relation ID: {relation}",
+    ]
+    if description:
+        lines.append(f"  Relation meaning: {description}")
+    else:
+        lines.append(f"  Relation meaning: {full_relation_words(relation)}")
+    lines.extend(
+        [
+            f"  Canonical roles: subject={subject_role}; object={object_role}.",
+            f"  Bound fact: {bound_fact}",
+        ]
+    )
+    return lines
+
+
 def render_path(
     path: dict[str, Any] | PathSpec,
     style: str = "natural",
     include_instruction: bool = True,
     mask_anchor: bool = False,
+    relation_glossary: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     if isinstance(path, PathSpec):
         path = path_to_dict(path)
@@ -115,13 +189,20 @@ def render_path(
         lines.append("Write a question for this KG path.")
     lines.append(f'Start entity: "{anchor}" (type: {anchor_type})')
     for index, hop in enumerate(path["hops"], 1):
+        source = "START" if index == 1 else f"NODE_{index - 1}"
+        destination = "ANSWER" if index == len(path["hops"]) else f"NODE_{index}"
+        if relation_glossary is not None:
+            lines.extend(
+                _grounded_hop_lines(
+                    path, hop, index, source, destination, relation_glossary
+                )
+            )
+            continue
         relation = hop["relation"]
         if style == "schema":
             relation = relation_words(relation).replace(" ", "_")
         else:
             relation = relation_words(relation)
-        source = "START" if index == 1 else f"NODE_{index - 1}"
-        destination = "ANSWER" if index == len(path["hops"]) else f"NODE_{index}"
         if hop["direction"] == "forward":
             fact_head, fact_tail = source, destination
         else:
@@ -131,6 +212,8 @@ def render_path(
             f"fact roles={fact_head}:subject,{fact_tail}:object; "
             f"types={source}:{hop['source_type']},{destination}:{hop['target_type']}."
         )
+    if relation_glossary is not None:
+        lines.append(f"Requested answer: ANSWER (type: {path.get('answer_type') or 'entity'}).")
     if include_instruction:
         lines.append("Question:")
     return "\n".join(lines)

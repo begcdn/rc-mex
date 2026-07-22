@@ -184,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=2e-4)
     train.add_argument("--rank-weight", type=float, default=1.0)
     train.add_argument(
+        "--relation-glossary",
+        type=Path,
+        help=(
+            "grounded KG relation glossary used to render canonical facts; "
+            "it is embedded in the trained checkpoint"
+        ),
+    )
+    train.add_argument(
         "--regime",
         choices=("kqa_only", "multi_kg", "faithful_synthetic"),
         default="kqa_only",
@@ -398,6 +406,7 @@ def main() -> None:
             limit=args.limit,
             regime=args.regime,
             objective=args.objective,
+            relation_glossary_path=args.relation_glossary,
         )
         if args.objective == "type_aware_generator":
             print(
