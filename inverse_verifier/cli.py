@@ -13,6 +13,7 @@ from .openai_naturalize import run_openai_naturalization
 from .selector import run_verifier_pipeline
 from .retrieval import SRTK_SCORER, run_retrieval_probe
 from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
+from .training_data import repair_faithful_corpus
 
 
 DEFAULT_DATA_DIR = Path("runs/inverse_verifier/data")
@@ -144,6 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generalize.add_argument("--batch-size", type=int, default=32)
     generalize.add_argument("--device", default="auto")
+
+    repair_data = subparsers.add_parser(
+        "repair-training-data",
+        help="add direction contrasts and remove malformed generated questions",
+    )
+    repair_data.add_argument("--data", type=Path, required=True)
+    repair_data.add_argument("--glossary", type=Path, required=True)
+    repair_data.add_argument("--output", type=Path, required=True)
 
     train = subparsers.add_parser("train", help="fine-tune the inverse generator")
     train.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
@@ -336,6 +345,10 @@ def main() -> None:
         )
         print(json.dumps(metrics["training_relative_coverage"], indent=2))
         print(f"Wrote faithful generalization evaluation to {args.output}")
+    elif args.command == "repair-training-data":
+        manifest = repair_faithful_corpus(args.data, args.output, args.glossary)
+        print(json.dumps(manifest["counts"], indent=2))
+        print(f"Wrote repaired faithful corpus to {args.output}")
     elif args.command == "train":
         names = {
             "kqa_only": ("train.jsonl", "dev.jsonl"),

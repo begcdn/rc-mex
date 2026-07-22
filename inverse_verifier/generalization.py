@@ -22,8 +22,18 @@ def derive_generalization_slices(
     train_rows: list[dict[str, Any]],
     evaluation_rows: dict[str, list[dict[str, Any]]],
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    train_relations = {key for row in train_rows for key in relation_keys(row)}
-    train_compositions = {relation_keys(row) for row in train_rows}
+    training_paths = []
+    for row in train_rows:
+        training_paths.append({"positive_path": row["positive_path"]})
+        training_paths.extend(
+            {"positive_path": path}
+            for path in [
+                *row.get("negative_paths", []),
+                *row.get("contrast_only_negative_paths", []),
+            ]
+        )
+    train_relations = {key for row in training_paths for key in relation_keys(row)}
+    train_compositions = {relation_keys(row) for row in training_paths}
 
     unique_rows: dict[str, dict[str, Any]] = {}
     for rows in evaluation_rows.values():
@@ -46,6 +56,7 @@ def derive_generalization_slices(
     }
     coverage = {
         "train_examples": len(train_rows),
+        "train_paths_seen_by_loss": len(training_paths),
         "train_relation_direction_keys": len(train_relations),
         "train_compositions": len(train_compositions),
         "unique_evaluation_examples": len(unique_rows),

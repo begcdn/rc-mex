@@ -112,7 +112,7 @@ def render_path(
     anchor_type = path.get("anchor_type") or "entity"
     lines = []
     if include_instruction:
-        lines.append("Generate the natural-language question answered by this knowledge-graph path.")
+        lines.append("Write a question for this KG path.")
     lines.append(f'Start entity: "{anchor}" (type: {anchor_type})')
     for index, hop in enumerate(path["hops"], 1):
         relation = hop["relation"]
@@ -126,11 +126,10 @@ def render_path(
             fact_head, fact_tail = source, destination
         else:
             fact_head, fact_tail = destination, source
-        lines.append(f"Hop {index} traversal: {source} -> {destination}.")
-        lines.append(f'KG fact: {fact_head} --["{relation}"]--> {fact_tail}.')
         lines.append(
-            f"Traversal node types: {source} is {hop['source_type']}; "
-            f"{destination} is {hop['target_type']}."
+            f'Hop {index}: traverse {source} -> {destination}; relation="{relation}"; '
+            f"fact roles={fact_head}:subject,{fact_tail}:object; "
+            f"types={source}:{hop['source_type']},{destination}:{hop['target_type']}."
         )
     if include_instruction:
         lines.append("Question:")

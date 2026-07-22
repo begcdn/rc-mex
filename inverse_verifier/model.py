@@ -162,17 +162,26 @@ class FaithfulInverseDataset(Dataset):
         row = self.rows[index]
         rng = random.Random(self.seed + self.epoch * len(self.rows) + index)
         positive = row["positive_path"]
-        negative = row["negative_paths"][rng.randrange(len(row["negative_paths"]))]
+        natural_negative = row["negative_paths"][rng.randrange(len(row["negative_paths"]))]
+        direction_negatives = row.get("contrast_only_negative_paths", [])
+        if direction_negatives and self.epoch % 2 == 0:
+            contrast_negative = direction_negatives[
+                rng.randrange(len(direction_negatives))
+            ]
+        else:
+            contrast_negative = natural_negative
         generate_negative = (self.epoch + index) % 2 == 1
-        generation_path = negative if generate_negative else positive
-        generation_target = negative["question"] if generate_negative else row["question"]
+        generation_path = natural_negative if generate_negative else positive
+        generation_target = (
+            natural_negative["question"] if generate_negative else row["question"]
+        )
         return {
             "generation_source": render_path(generation_path, mask_anchor=True),
             "generation_target": generation_target,
             "positive_source": render_path(positive, mask_anchor=True),
-            "negative_source": render_path(negative, mask_anchor=True),
+            "negative_source": render_path(contrast_negative, mask_anchor=True),
             "contrast_target": row["question"],
-            "negative_type": negative["negative_type"],
+            "negative_type": contrast_negative["negative_type"],
         }
 
 

@@ -473,7 +473,7 @@ def test_extracts_chain_without_answer_or_intermediate_names(tmp_path: Path) -> 
     assert "Book A" in rendered
     assert "Country Z" not in rendered
     assert "NODE_1" in rendered and "ANSWER" in rendered
-    assert 'NODE_1 --["place of birth"]--> ANSWER' in rendered
+    assert 'relation="place of birth"; fact roles=NODE_1:subject,ANSWER:object' in rendered
     assert not render_path(rows[0][2], include_instruction=False).endswith("Question:")
 
 
@@ -573,7 +573,7 @@ def test_direct_prompt_sees_question_and_same_oriented_path() -> None:
     )
     prompt = direct_prompt("Who wrote Book A?", json.loads(json.dumps(path, default=lambda x: x.__dict__)))
     assert "Who wrote Book A?" in prompt
-    assert 'START --["author"]--> ANSWER' in prompt
+    assert 'relation="author"; fact roles=START:subject,ANSWER:object' in prompt
 
 
 def test_joint_prompt_masks_linked_entity_but_keeps_relation_intent() -> None:
@@ -1039,3 +1039,140 @@ def test_generalization_slices_are_relative_to_actual_training_data() -> None:
         "new-composition"
     ]
     assert coverage["slice_examples"]["strict_unseen_relation"] == 2
+
+
+def test_render_path_makes_subject_object_direction_explicit() -> None:
+    base = {
+        "anchor": "Work",
+        "anchor_type": "book",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+        "answer_type": "person",
+        "kg": "test",
+    }
+    forward = render_path(base, mask_anchor=True)
+    backward_path = json.loads(json.dumps(base))
+    backward_path["hops"][0]["direction"] = "backward"
+    backward = render_path(backward_path, mask_anchor=True)
+
+    assert "fact roles=START:subject,ANSWER:object" in forward
+    assert "fact roles=ANSWER:subject,START:object" in backward
+
+
+def test_direction_repair_excludes_symmetric_relations() -> None:
+    from inverse_verifier.training_data import direction_counterfactuals
+
+    path = {
+        "kg": "kqa_pro",
+        "anchor": "A",
+        "anchor_type": "person",
+        "answer_type": "person",
+        "hops": [
+            {
+                "relation": "spouse",
+                "direction": "forward",
+                "source_type": "person",
+                "target_type": "person",
+            },
+            {
+                "relation": "place of birth",
+                "direction": "forward",
+                "source_type": "person",
+                "target_type": "city",
+            },
+        ],
+    }
+    counterfactuals = direction_counterfactuals(path, {})
+
+    assert len(counterfactuals) == 1
+    assert counterfactuals[0]["flipped_hop_index"] == 1
+    assert counterfactuals[0]["hops"][0]["direction"] == "forward"
+    assert counterfactuals[0]["hops"][1]["direction"] == "backward"
+
+
+def test_repetition_filter_rejects_only_pathological_repetition() -> None:
+    from inverse_verifier.training_data import repetitive_question_reason
+
+    legitimate = (
+        "Who is the parent of the person who is a sibling of a sibling of [ENTITY]?"
+    )
+    malformed = (
+        "What is the type of dish that is a dish that is a dish that is a dish "
+        "that is a dish that is a dish?"
+    )
+
+    assert repetitive_question_reason(legitimate) is None
+    assert repetitive_question_reason(malformed) is not None
+
+
+def test_faithful_dataset_uses_direction_contrasts_only_for_ranking() -> None:
+    row = {
+        "question": "Who wrote [ENTITY]?",
+        "positive_path": {
+            "anchor": "Work",
+            "anchor_type": "book",
+            "answer_type": "person",
+            "kg": "test",
+            "hops": [
+                {
+                    "relation": "author",
+                    "direction": "forward",
+                    "source_type": "book",
+                    "target_type": "person",
+                }
+            ],
+        },
+        "negative_paths": [
+            {
+                "anchor": "Work",
+                "anchor_type": "book",
+                "answer_type": "publisher",
+                "kg": "test",
+                "negative_type": "sibling_relation",
+                "question": "Who published [ENTITY]?",
+                "hops": [
+                    {
+                        "relation": "publisher",
+                        "direction": "forward",
+                        "source_type": "book",
+                        "target_type": "publisher",
+                    }
+                ],
+            }
+        ],
+        "contrast_only_negative_paths": [
+            {
+                "anchor": "Work",
+                "anchor_type": "book",
+                "answer_type": "person",
+                "kg": "test",
+                "negative_type": "wrong_direction",
+                "contrast_only": True,
+                "hops": [
+                    {
+                        "relation": "author",
+                        "direction": "backward",
+                        "source_type": "book",
+                        "target_type": "person",
+                    }
+                ],
+            }
+        ],
+    }
+    dataset = FaithfulInverseDataset([row])
+    dataset.set_epoch(0)
+    even = dataset[0]
+    dataset.set_epoch(1)
+    odd = dataset[0]
+
+    assert even["negative_type"] == "wrong_direction"
+    assert "ANSWER:subject,START:object" in even["negative_source"]
+    assert even["generation_target"] == row["question"]
+    assert odd["negative_type"] == "sibling_relation"
+    assert odd["generation_target"] == "Who published [ENTITY]?"

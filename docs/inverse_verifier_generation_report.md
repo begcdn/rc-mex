@@ -218,6 +218,33 @@ training split do not justify distributed-training complexity; exposing a second
 the existing code use it. A second device should instead be reserved for a later controlled ablation
 or larger-backbone experiment.
 
+### Independent evaluation and direction repair
+
+The first model trained on the validated corpus reached 1.000 development pair accuracy, but a
+training-relative held-out evaluation exposed a specific failure that the random development split
+hid. Gold-path question similarity remained high (0.932 on KQA Pro and 0.808 on executable WebQSP),
+yet wrong-direction discrimination was only 0.126 on KQA Pro. In 147 of 206 KQA direction pairs,
+the model generated exactly the same question for the forward and backward paths. The original
+training corpus contained only 19 wrong-direction negatives versus 1,729 sibling-relation, 1,339
+added-hop, and 1,001 missing-hop negatives.
+
+`runs/inverse_verifier/naturalized_dataset_3000_direction_v3` repairs the supervision rather than
+adding epochs to the same data:
+
+- retain all 1,979 independently validated natural-question rows;
+- add 3,211 contrast-only wrong-direction paths by flipping one asymmetric traversal at a time;
+- never use these counterfactuals as natural-question generation targets;
+- exclude symmetric predicates such as spouse, sibling, partner, and border sharing;
+- make subject/object roles explicit in the compact path input;
+- alternate direction contrasts with ordinary hard negatives across training epochs;
+- preserve and flag 465 rows with generic type evidence rather than silently discarding them.
+
+The repaired corpus has 1,781 train and 198 development rows, 4,552 naturalized negatives, no
+train/development ID, question, or anchored-path overlap, and no structural direction-counterfactual
+audit errors. A local 64-row training smoke test completed successfully. The next full run must use
+the same frozen generalization evaluation; success requires a large increase in wrong-direction
+accuracy without degrading missing-hop or wrong-relation discrimination.
+
 ## Reproduction
 
 ```bash
