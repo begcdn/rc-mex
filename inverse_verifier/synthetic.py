@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import random
 import re
@@ -722,7 +723,8 @@ def evaluate_faithful_generation(
     from .data import delexicalize_question
     from .model import generate_joint_questions, load_seq2seq
 
-    rows = [json.loads(line) for line in data.open(encoding="utf-8")][:limit]
+    source_rows = [json.loads(line) for line in data.open(encoding="utf-8")][:limit]
+    rows = _expand_bidirectional_evaluation_rows(source_rows)
     generator, tokenizer, model_device = load_seq2seq(model_path, device)
     encoder = SentenceTransformer(semantic_model, local_files_only=True)
     predictions = []
@@ -834,3 +836,27 @@ def evaluate_faithful_generation(
     ]
     (output / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return metrics
+
+
+def _expand_bidirectional_evaluation_rows(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expanded = []
+    for row in rows:
+        expanded.append(row)
+        if not row.get("bidirectional_pair"):
+            continue
+        backward = copy.deepcopy(row["negative_paths"][0])
+        forward_negative = copy.deepcopy(row["positive_path"])
+        forward_negative["negative_type"] = "executable_opposite_direction"
+        expanded.append(
+            {
+                **copy.deepcopy(row),
+                "example_id": f"{row['example_id']}:backward",
+                "question": backward["question"],
+                "positive_path": backward,
+                "negative_paths": [forward_negative],
+                "evaluation_direction": "backward",
+            }
+        )
+    return expanded

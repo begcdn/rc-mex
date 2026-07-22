@@ -32,6 +32,7 @@ from inverse_verifier.model import (
     type_compatibility_prompt,
 )
 from inverse_verifier.synthetic import (
+    _expand_bidirectional_evaluation_rows,
     ConcretePath,
     Edge,
     ExecutableGraph,
@@ -1269,3 +1270,29 @@ def test_direction_pair_validation_rejects_vague_or_identical_questions() -> Non
     identical = json.loads(json.dumps(row))
     identical["negative_paths"][0]["question"] = identical["question"]
     assert _natural_pair_rejection(identical) == "directions_have_identical_question"
+
+
+def test_faithfulness_evaluates_both_executable_directions() -> None:
+    row = {
+        "example_id": "pair-1",
+        "question": "Who wrote [ENTITY]?",
+        "positive_path": {"anchor": "Book", "hops": [{"direction": "forward"}]},
+        "negative_paths": [
+            {
+                "anchor": "Person",
+                "hops": [{"direction": "backward"}],
+                "question": "Which book did [ENTITY] write?",
+                "negative_type": "executable_opposite_direction",
+            }
+        ],
+        "bidirectional_pair": True,
+    }
+
+    forward, backward = _expand_bidirectional_evaluation_rows([row])
+
+    assert forward is row
+    assert backward["example_id"] == "pair-1:backward"
+    assert backward["question"] == "Which book did [ENTITY] write?"
+    assert backward["positive_path"]["hops"][0]["direction"] == "backward"
+    assert backward["negative_paths"][0]["hops"][0]["direction"] == "forward"
+    assert backward["negative_paths"][0]["negative_type"] == "executable_opposite_direction"
