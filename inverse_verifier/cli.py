@@ -13,7 +13,11 @@ from .openai_naturalize import run_openai_naturalization
 from .selector import run_verifier_pipeline
 from .retrieval import SRTK_SCORER, run_retrieval_probe
 from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
-from .training_data import repair_faithful_corpus
+from .training_data import (
+    merge_executable_direction_pairs,
+    prepare_executable_direction_pairs,
+    repair_faithful_corpus,
+)
 
 
 DEFAULT_DATA_DIR = Path("runs/inverse_verifier/data")
@@ -153,6 +157,23 @@ def build_parser() -> argparse.ArgumentParser:
     repair_data.add_argument("--data", type=Path, required=True)
     repair_data.add_argument("--glossary", type=Path, required=True)
     repair_data.add_argument("--output", type=Path, required=True)
+
+    prepare_direction = subparsers.add_parser(
+        "prepare-direction-pairs",
+        help="select paired executable forward/backward one-hop training paths",
+    )
+    prepare_direction.add_argument("--data", type=Path, required=True)
+    prepare_direction.add_argument("--base", type=Path, required=True)
+    prepare_direction.add_argument("--glossary", type=Path, required=True)
+    prepare_direction.add_argument("--output", type=Path, required=True)
+
+    merge_direction = subparsers.add_parser(
+        "merge-direction-pairs",
+        help="validate and merge naturalized executable direction pairs",
+    )
+    merge_direction.add_argument("--base", type=Path, required=True)
+    merge_direction.add_argument("--pairs", type=Path, required=True)
+    merge_direction.add_argument("--output", type=Path, required=True)
 
     train = subparsers.add_parser("train", help="fine-tune the inverse generator")
     train.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
@@ -349,6 +370,14 @@ def main() -> None:
         manifest = repair_faithful_corpus(args.data, args.output, args.glossary)
         print(json.dumps(manifest["counts"], indent=2))
         print(f"Wrote repaired faithful corpus to {args.output}")
+    elif args.command == "prepare-direction-pairs":
+        manifest = prepare_executable_direction_pairs(
+            args.data, args.base, args.glossary, args.output
+        )
+        print(json.dumps(manifest, indent=2))
+    elif args.command == "merge-direction-pairs":
+        manifest = merge_executable_direction_pairs(args.base, args.pairs, args.output)
+        print(json.dumps(manifest, indent=2))
     elif args.command == "train":
         names = {
             "kqa_only": ("train.jsonl", "dev.jsonl"),

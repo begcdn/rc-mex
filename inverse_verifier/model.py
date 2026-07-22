@@ -161,6 +161,24 @@ class FaithfulInverseDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, str]:
         row = self.rows[index]
         rng = random.Random(self.seed + self.epoch * len(self.rows) + index)
+        if row.get("bidirectional_pair"):
+            paired = row["negative_paths"][0]
+            if self.epoch % 2 == 0:
+                positive = row["positive_path"]
+                negative = paired
+                target = row["question"]
+            else:
+                positive = paired
+                negative = row["positive_path"]
+                target = paired["question"]
+            return {
+                "generation_source": render_path(positive, mask_anchor=True),
+                "generation_target": target,
+                "positive_source": render_path(positive, mask_anchor=True),
+                "negative_source": render_path(negative, mask_anchor=True),
+                "contrast_target": target,
+                "negative_type": "executable_opposite_direction",
+            }
         positive = row["positive_path"]
         natural_negative = row["negative_paths"][rng.randrange(len(row["negative_paths"]))]
         direction_negatives = row.get("contrast_only_negative_paths", [])

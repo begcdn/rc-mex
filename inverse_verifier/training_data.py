@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ SYMMETRIC_RELATION_PARTS = (
     "spouse",
     "twinned administrative body",
 )
+SYMMETRIC_RELATIONS = {"relative"}
 GENERIC_TYPES = {"", "entity", "thing", "unknown"}
 
 
@@ -34,7 +36,9 @@ def is_symmetric_hop(
     glossary: dict[str, dict[str, Any]],
 ) -> bool:
     relation = normalized_words(hop["relation"])
-    if any(part in relation for part in SYMMETRIC_RELATION_PARTS):
+    if relation in SYMMETRIC_RELATIONS or any(
+        part in relation for part in SYMMETRIC_RELATION_PARTS
+    ):
         return True
     entry = glossary.get(f"{kg}::{hop['relation']}", {})
     subject_role = normalized_words(entry.get("subject_role", ""))
@@ -163,6 +167,166 @@ def repair_faithful_corpus(
         },
         "counts": dict(totals),
         "source_manifest": source_manifest,
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _pair_candidate_score(row: dict[str, Any], preferred_ids: set[str]) -> tuple[int, str]:
+    path = row["positive_path"]
+    values = [path.get("anchor_type", ""), path.get("answer_type", "")]
+    informative = sum(normalized_words(value) not in GENERIC_TYPES for value in values)
+    clean_types = sum("/" not in value and len(value) <= 50 for value in values)
+    preferred = 1 if row["example_id"] in preferred_ids else 0
+    return preferred * 10 + informative * 2 + clean_types, row["example_id"]
+
+
+def prepare_executable_direction_pairs(
+    source: Path,
+    base: Path,
+    glossary_path: Path,
+    output: Path,
+) -> dict[str, Any]:
+    from .dataset_builder import compact_query, render_compact_query
+
+    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+    preferred_ids = {
+        row["example_id"]
+        for split in ("train", "dev")
+        for row in read_jsonl(base / f"{split}_faithful.jsonl")
+    }
+    grouped: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {}
+    for split in ("train", "dev"):
+        for row in read_jsonl(source / f"{split}_faithful.jsonl"):
+            path = row["positive_path"]
+            if len(path["hops"]) != 1:
+                continue
+            hop = path["hops"][0]
+            key = (path.get("kg", row.get("kg", "unknown")), hop["relation"])
+            entry = glossary.get(f"{key[0]}::{key[1]}", {})
+            if entry.get("status") != "semantic" or is_symmetric_hop(key[0], hop, glossary):
+                continue
+            grouped.setdefault(key, {"forward": [], "backward": []})[hop["direction"]].append(row)
+
+    prepared = {"train": [], "dev": []}
+    for (kg, relation), directions in sorted(grouped.items()):
+        if not directions["forward"] or not directions["backward"]:
+            continue
+        forward = max(directions["forward"], key=lambda row: _pair_candidate_score(row, preferred_ids))
+        backward = max(directions["backward"], key=lambda row: _pair_candidate_score(row, preferred_ids))
+        digest = hashlib.sha256(f"{kg}::{relation}".encode()).hexdigest()
+        split = "dev" if int(digest[:8], 16) % 10 == 0 else "train"
+        forward_path = copy.deepcopy(forward["positive_path"])
+        backward_path = copy.deepcopy(backward["positive_path"])
+        forward_path["explicit_query"] = render_compact_query(
+            compact_query(forward_path, glossary)
+        )
+        backward_path["explicit_query"] = render_compact_query(
+            compact_query(backward_path, glossary)
+        )
+        backward_path.update(
+            {
+                "negative_type": "executable_opposite_direction",
+                "question": backward["question"],
+                "answer_entity": backward.get("positive_answer_entity", ""),
+            }
+        )
+        prepared[split].append(
+            {
+                "example_id": f"direction-pair:{kg}:{digest[:16]}",
+                "question": forward["question"],
+                "positive_path": forward_path,
+                "positive_answer_entity": forward.get("positive_answer_entity", ""),
+                "alternate_positive_paths": [],
+                "negative_paths": [backward_path],
+                "split": f"{split}_faithful",
+                "kg": kg,
+                "relation_sequence": [f"{relation}::forward"],
+                "source_kind": "paired_executable_direction",
+                "bidirectional_pair": True,
+                "paired_source_ids": [forward["example_id"], backward["example_id"]],
+            }
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    for split in ("train", "dev"):
+        write_jsonl(output / f"{split}_faithful.jsonl", prepared[split])
+    manifest = {
+        "version": "executable-direction-pairs-v1",
+        "source": str(source),
+        "base": str(base),
+        "glossary": str(glossary_path),
+        "train_pairs": len(prepared["train"]),
+        "dev_pairs": len(prepared["dev"]),
+        "total_pairs": sum(map(len, prepared.values())),
+        "selection": (
+            "one executable forward and backward one-hop path per semantic asymmetric relation"
+        ),
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def _natural_pair_rejection(row: dict[str, Any]) -> str | None:
+    positive = row.get("question", "").strip()
+    positive_path = row.get("positive_path", {})
+    negative_path = row.get("negative_paths", [{}])[0]
+    negative = negative_path.get("question", "").strip()
+    positive_hops = positive_path.get("hops", [])
+    if positive_hops and normalized_words(positive_hops[0]["relation"]) in SYMMETRIC_RELATIONS:
+        return "symmetric_relation_pair"
+    for question, path in ((positive, positive_path), (negative, negative_path)):
+        if question.count("[ENTITY]") != 1 or not question.endswith("?"):
+            return "invalid_question_form"
+        lowered = question.casefold()
+        if re.search(
+            r"\b(?:forward|backward|graph|hop)\b|reverse direction|through the relation",
+            lowered,
+        ):
+            return "exposes_graph_notation"
+        explicit = path.get("explicit_query", "").casefold()
+        for vague in ("associated with", "related to", "connected to"):
+            if vague in lowered and vague not in explicit:
+                return "weakens_specific_relation"
+    if positive.casefold() == negative.casefold():
+        return "directions_have_identical_question"
+    if positive == row.get("canonical_question"):
+        return "positive_naturalization_fallback"
+    if negative == row["negative_paths"][0].get("canonical_question"):
+        return "negative_naturalization_fallback"
+    return None
+
+
+def merge_executable_direction_pairs(
+    base: Path,
+    naturalized_pairs: Path,
+    output: Path,
+) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    counts = Counter()
+    rejected = []
+    for split in ("train", "dev"):
+        base_rows = read_jsonl(base / f"{split}_faithful.jsonl")
+        accepted_pairs = []
+        for row in read_jsonl(naturalized_pairs / f"{split}_faithful.jsonl"):
+            reason = _natural_pair_rejection(row)
+            if reason:
+                rejected.append({"example_id": row["example_id"], "split": split, "reason": reason})
+                counts[f"rejected_{reason}"] += 1
+            else:
+                accepted_pairs.append(row)
+        write_jsonl(output / f"{split}_faithful.jsonl", [*base_rows, *accepted_pairs])
+        counts[f"base_{split}"] = len(base_rows)
+        counts[f"direction_pairs_{split}"] = len(accepted_pairs)
+        counts[f"final_{split}"] = len(base_rows) + len(accepted_pairs)
+    write_jsonl(output / "rejected_direction_pairs.jsonl", rejected)
+    manifest = {
+        "version": "faithful-plus-executable-direction-v1",
+        "base": str(base),
+        "naturalized_pairs": str(naturalized_pairs),
+        "counts": dict(counts),
+        "direction_pairs_are_executable": True,
+        "counterfactual_direction_flips_used": False,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest

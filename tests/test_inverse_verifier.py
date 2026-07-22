@@ -1095,6 +1095,10 @@ def test_direction_repair_excludes_symmetric_relations() -> None:
     assert counterfactuals[0]["hops"][0]["direction"] == "forward"
     assert counterfactuals[0]["hops"][1]["direction"] == "backward"
 
+    relative = json.loads(json.dumps(path))
+    relative["hops"] = [relative["hops"][0] | {"relation": "relative"}]
+    assert direction_counterfactuals(relative, {}) == []
+
 
 def test_repetition_filter_rejects_only_pathological_repetition() -> None:
     from inverse_verifier.training_data import repetitive_question_reason
@@ -1176,3 +1180,92 @@ def test_faithful_dataset_uses_direction_contrasts_only_for_ranking() -> None:
     assert even["generation_target"] == row["question"]
     assert odd["negative_type"] == "sibling_relation"
     assert odd["generation_target"] == "Who published [ENTITY]?"
+
+
+def test_bidirectional_pair_trains_both_executable_directions() -> None:
+    forward = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "kg": "test",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    backward = {
+        "anchor": "Person",
+        "anchor_type": "person",
+        "answer_type": "book",
+        "kg": "test",
+        "negative_type": "executable_opposite_direction",
+        "question": "Which book did [ENTITY] write?",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "backward",
+                "source_type": "person",
+                "target_type": "book",
+            }
+        ],
+    }
+    dataset = FaithfulInverseDataset(
+        [
+            {
+                "question": "Who wrote [ENTITY]?",
+                "positive_path": forward,
+                "negative_paths": [backward],
+                "bidirectional_pair": True,
+            }
+        ]
+    )
+
+    dataset.set_epoch(0)
+    forward_item = dataset[0]
+    dataset.set_epoch(1)
+    backward_item = dataset[0]
+
+    assert forward_item["generation_target"] == "Who wrote [ENTITY]?"
+    assert "START:subject,ANSWER:object" in forward_item["positive_source"]
+    assert "ANSWER:subject,START:object" in forward_item["negative_source"]
+    assert backward_item["generation_target"] == "Which book did [ENTITY] write?"
+    assert "ANSWER:subject,START:object" in backward_item["positive_source"]
+    assert "START:subject,ANSWER:object" in backward_item["negative_source"]
+
+
+def test_direction_pair_validation_rejects_vague_or_identical_questions() -> None:
+    from inverse_verifier.training_data import _natural_pair_rejection
+
+    row = {
+        "question": "Who wrote [ENTITY]?",
+        "canonical_question": "canonical forward",
+        "negative_paths": [
+            {
+                "question": "Which work was written by [ENTITY]?",
+                "canonical_question": "canonical backward",
+            }
+        ],
+    }
+    assert _natural_pair_rejection(row) is None
+
+    vague = json.loads(json.dumps(row))
+    vague["question"] = "Who is associated with [ENTITY]?"
+    assert _natural_pair_rejection(vague) == "weakens_specific_relation"
+
+    genuinely_associative = json.loads(json.dumps(vague))
+    genuinely_associative["positive_path"] = {
+        "explicit_query": "F0: v0 is associated with the sport v1."
+    }
+    assert _natural_pair_rejection(genuinely_associative) is None
+
+    geographic = json.loads(json.dumps(row))
+    geographic["question"] = "Which geographic region contains [ENTITY]?"
+    assert _natural_pair_rejection(geographic) is None
+
+    identical = json.loads(json.dumps(row))
+    identical["negative_paths"][0]["question"] = identical["question"]
+    assert _natural_pair_rejection(identical) == "directions_have_identical_question"

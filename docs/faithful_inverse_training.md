@@ -90,3 +90,34 @@ sample changed:
 
 This verifies objective direction only. It is not evidence of benchmark
 improvement and must not be reported as a final result.
+
+## Direction-supervision correction
+
+The first direction-balanced follow-up used mechanically reversed paths only as
+contrastive negatives. Frozen evaluation showed that this was the wrong training
+intervention. On KQA Pro, wrong-direction pair accuracy fell to `0.073`, while
+wrong-relation (`0.871`) and wrong-answer-type (`0.987`) accuracy remained high.
+The model learned that a reversed rendering should score poorly, but generation
+was never trained to express what the reverse executable query actually means.
+
+The replacement corpus uses only relations for which the source graphs contain
+real one-hop examples in both directions. Each pair contains:
+
+- one executable forward path and its natural question;
+- one executable backward path for the same relation and its natural question;
+- explicit grounded subject/object facts and return variables;
+- a relation-disjoint train/development split.
+
+Training alternates the positive direction by epoch. In even epochs the forward
+path is generated and ranked above the backward path for the forward question;
+in odd epochs the backward path is generated and ranked above the forward path
+for the backward question. Thus both directions receive generation supervision,
+and neither is treated as an impossible counterfactual.
+
+The retained direction corpus adds 241 training and 24 development pairs to the
+validated v8 corpus. One `relative` pair was rejected because the grounded
+relation is symmetric. All 266 source pairs were independently reviewed against
+their explicit queries; one over-narrow religion paraphrase was corrected. The
+final corpus has no train/development relation overlap and no detected structural
+or semantic audit failures. Its frozen evaluation is still pending, so it must
+not yet be described as an improvement.

@@ -457,7 +457,7 @@ def synthesize_corpus(
 
 
 def _candidate_payload(identifier: str, question: str, path: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "id": identifier,
         "canonical_question": question,
         "answer_type": path.get("answer_type", "entity"),
@@ -471,6 +471,9 @@ def _candidate_payload(identifier: str, question: str, path: dict[str, Any]) -> 
             for hop in path["hops"]
         ],
     }
+    if path.get("explicit_query"):
+        payload["explicit_query"] = path["explicit_query"]
+    return payload
 
 
 def naturalization_prompt(rows: list[dict[str, Any]]) -> str:
@@ -495,7 +498,9 @@ def naturalization_prompt(rows: list[dict[str, Any]]) -> str:
         "entity is the relation subject. Every hop must affect the meaning. Never silently omit "
         "an added, reversed, or intermediate hop. Do not mention graph traversal, hop numbers, "
         "forward/backward, IDs, or the answer. Keep [ENTITY] exactly as written. Distinct paths "
-        "must receive semantically distinct questions.\n"
+        "must receive semantically distinct questions. When explicit_query is present, its "
+        "subject/object facts and return variable are authoritative. Never replace a specific "
+        "fact with vague associated, related, connected, or 'through the relation' wording.\n"
         "Return only JSON with this shape: "
         '{"items":[{"id":"...","question":"...","covered_hops":'
         '[{"relation":"...","direction":"forward"}]}]}. '
