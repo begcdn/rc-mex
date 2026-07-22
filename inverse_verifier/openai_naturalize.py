@@ -293,18 +293,25 @@ class OpenAIBatchClient:
         self.base_url = base_url.rstrip("/")
 
     def _request(self, method: str, path: str, data: bytes | None = None, content_type: str = "application/json") -> Any:
-        request = urllib.request.Request(
-            self.base_url + path,
-            data=data,
-            method=method,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": content_type},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI API error {exc.code}: {detail}") from exc
+        for attempt in range(7):
+            request = urllib.request.Request(
+                self.base_url + path,
+                data=data,
+                method=method,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": content_type},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    payload = response.read()
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == 6:
+                    raise RuntimeError(f"OpenAI API error {exc.code}: {detail}") from exc
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 6:
+                    raise
+            time.sleep(min(2 ** attempt, 30))
         return json.loads(payload) if payload else None
 
     def upload(self, path: Path) -> str:
@@ -330,12 +337,22 @@ class OpenAIBatchClient:
         return self._request("GET", f"/batches/{batch_id}")
 
     def download(self, file_id: str) -> bytes:
-        request = urllib.request.Request(
-            self.base_url + f"/files/{file_id}/content",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-        )
-        with urllib.request.urlopen(request, timeout=300) as response:
-            return response.read()
+        for attempt in range(7):
+            request = urllib.request.Request(
+                self.base_url + f"/files/{file_id}/content",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == 6:
+                    raise
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 6:
+                    raise
+            time.sleep(min(2 ** attempt, 30))
+        raise AssertionError("unreachable")
 
 
 def run_openai_naturalization(
@@ -391,7 +408,8 @@ def run_openai_naturalization(
         raise RuntimeError("OPENAI_API_KEY is not set")
     client = OpenAIBatchClient(api_key)
     for index, chunk in enumerate(state["chunks"], 1):
-        if chunk.get("status") == "completed":
+        result_file = Path(chunk.get("result_file", ""))
+        if chunk.get("status") == "completed" and result_file.is_file():
             continue
         if not chunk.get("batch_id"):
             print(f"Submitting batch {index}/{len(state['chunks'])}", flush=True)
@@ -616,7 +634,20 @@ def run_batch_records(
             if batch["status"] in {"failed", "expired", "cancelled"}:
                 raise RuntimeError(f"OpenAI {label} batch ended with {batch['status']}")
             time.sleep(POLL_SECONDS)
-    return [Path(chunk["result_file"]) for chunk in state["chunks"]]
+    result_files = []
+    for index, chunk in enumerate(state["chunks"]):
+        result_path = Path(chunk.get("result_file") or directory / f"results_{index:03d}.jsonl")
+        if not result_path.is_file():
+            batch = client.retrieve_batch(chunk["batch_id"])
+            if batch["status"] != "completed" or not batch.get("output_file_id"):
+                raise RuntimeError(
+                    f"OpenAI {label} batch {index + 1} has no downloadable completed output"
+                )
+            result_path.write_bytes(client.download(batch["output_file_id"]))
+        chunk.update({"result_file": str(result_path), "status": "completed"})
+        result_files.append(result_path)
+    _write_json(state_path, state)
+    return result_files
 
 
 def run_chat_records_sync(

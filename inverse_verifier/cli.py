@@ -7,6 +7,7 @@ from pathlib import Path
 from .data import prepare_dataset
 from .dataset_builder import build_naturalized_dataset
 from .evaluate import evaluate, evaluate_gold_generation
+from .generalization import evaluate_faithful_generalization
 from .model import train_model
 from .openai_naturalize import run_openai_naturalization
 from .selector import run_verifier_pipeline
@@ -106,8 +107,6 @@ def build_parser() -> argparse.ArgumentParser:
     build_dataset.add_argument("--webqsp-graphs", type=Path, default=Path("data/webqsp/train.jsonl"))
     build_dataset.add_argument("--max-paths", type=int, default=3_000)
     build_dataset.add_argument("--max-negatives", type=int, default=3)
-    build_dataset.add_argument("--qwen-model", default="qwen3:8b")
-    build_dataset.add_argument("--ollama-host", default="http://127.0.0.1:11434")
 
     faithfulness = subparsers.add_parser(
         "faithfulness", help="compare gold and executable-negative generated questions"
@@ -125,6 +124,26 @@ def build_parser() -> argparse.ArgumentParser:
     faithfulness.add_argument("--limit", type=int, default=500)
     faithfulness.add_argument("--batch-size", type=int, default=16)
     faithfulness.add_argument("--device", default="auto")
+
+    generalize = subparsers.add_parser(
+        "generalize", help="evaluate faithful generation on training-relative held-out slices"
+    )
+    generalize.add_argument(
+        "--train-data",
+        type=Path,
+        default=Path("runs/inverse_verifier/naturalized_dataset_3000_v8/train_faithful.jsonl"),
+    )
+    generalize.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
+    generalize.add_argument("--model", required=True)
+    generalize.add_argument("--semantic-model", default="BAAI/bge-small-en-v1.5")
+    generalize.add_argument(
+        "--splits", default="test_kqa_val,test_executable_webqsp"
+    )
+    generalize.add_argument(
+        "--output", type=Path, default=Path("runs/inverse_verifier/generalization_eval")
+    )
+    generalize.add_argument("--batch-size", type=int, default=32)
+    generalize.add_argument("--device", default="auto")
 
     train = subparsers.add_parser("train", help="fine-tune the inverse generator")
     train.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR)
@@ -289,8 +308,6 @@ def main() -> None:
             args.webqsp_graphs,
             max_paths=args.max_paths,
             max_negatives=args.max_negatives,
-            qwen_model=args.qwen_model,
-            ollama_host=args.ollama_host,
         )
         print(json.dumps(manifest, indent=2))
         print(f"Prepared validated natural dataset in {args.output}")
@@ -306,6 +323,19 @@ def main() -> None:
         )
         print(json.dumps(metrics, indent=2))
         print(f"Wrote faithfulness evaluation to {args.output}")
+    elif args.command == "generalize":
+        metrics = evaluate_faithful_generalization(
+            args.train_data,
+            args.data,
+            args.model,
+            args.semantic_model,
+            args.output,
+            [name.strip() for name in args.splits.split(",") if name.strip()],
+            batch_size=args.batch_size,
+            device=args.device,
+        )
+        print(json.dumps(metrics["training_relative_coverage"], indent=2))
+        print(f"Wrote faithful generalization evaluation to {args.output}")
     elif args.command == "train":
         names = {
             "kqa_only": ("train.jsonl", "dev.jsonl"),

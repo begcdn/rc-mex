@@ -167,9 +167,10 @@ python3 -m inverse_verifier naturalize-openai \
 
 The current production path compiles traversal directions into explicit raw triples, grounds each
 unique relation with labeled facts from the local KQA Pro and WebQSP graphs, builds a reusable
-relation glossary with GPT-4o, naturalizes compact queries with local Qwen, and validates or repairs
-every question with GPT-4o mini. Metadata and low-confidence relation meanings are rejected rather
-than guessed. All stages resume from the same output directory.
+relation glossary with GPT-4o, generates questions from compact logical queries with GPT-4o, and
+independently verifies exact path meaning with GPT-4o mini. Metadata and low-confidence relation
+meanings are rejected rather than guessed. Full builds use the OpenAI Batch API internally; small
+pilots run synchronously. All stages resume from the same output directory.
 
 Run a small dataset build before the full corpus:
 
@@ -184,6 +185,11 @@ After inspecting that output, build the 3,000-path corpus with a new output dire
 
 ```bash
 python3 -m inverse_verifier build-naturalized-dataset \
-  --output runs/inverse_verifier/naturalized_dataset_3k \
+  --output runs/inverse_verifier/naturalized_dataset_3000_v8 \
   --max-paths 3000
 ```
+
+The July 2026 build accepted 1,979 validated rows. GPT-4o mini verified the first four final
+batches. When the API account reached its billing limit, a calibrated local Qwen 3 8B verifier
+completed the fifth batch; its model and pilot agreement are recorded in the manifest. See
+`docs/inverse_verifier_generation_report.md` for the corpus audit and remaining limitations.

@@ -38,10 +38,12 @@ Hard negatives are executable paths from the same graph. They include added
 hops, missing hops, sibling relations, and executable direction alternatives.
 Every negative receives its own question rather than sharing the gold target.
 
-The optional `naturalize` stage uses a local Ollama model to rewrite controlled
-questions into natural English. It asks the teacher to account for the exact
-ordered relation/direction sequence and keeps the controlled target as an audit
-field. Canonical questions are retained when validation fails.
+The retained dataset builder no longer uses the earlier local-Ollama rewrite. It compiles each
+path into explicit logical facts, asks GPT-4o to verbalize the full query, and asks GPT-4o mini to
+select the exact represented path from randomized executable alternatives. Questions are accepted
+only when the intended path, endpoint type, complete fact set, and natural-language checks agree.
+Canonical questions remain audit fields; failed naturalizations are rejected rather than used as
+fallback training targets.
 
 ## Objective
 

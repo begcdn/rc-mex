@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import urllib.request
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -11,6 +11,7 @@ from typing import Any
 from .openai_naturalize import (
     OpenAIBatchClient,
     _parse_result_file,
+    run_batch_records,
     run_chat_records_sync,
     select_rows,
 )
@@ -20,8 +21,10 @@ from .synthetic import load_kqa_graph
 
 GLOSSARY_MODEL = "gpt-4o-2024-11-20"
 VALIDATION_MODEL = "gpt-4o-2024-11-20"
+VERIFIER_MODEL = "gpt-4o-mini-2024-07-18"
 GLOSSARY_GROUP_SIZE = 6
 QWEN_GROUP_SIZE = 4
+VAGUE_QUESTION_PHRASES = ("associated with", "related to", "linked to", "connected to")
 
 GLOSSARY_SCHEMA = {
     "name": "relation_glossary",
@@ -68,7 +71,7 @@ GENERATION_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
-                        "status": {"type": "string", "enum": ["generated", "reject"]},
+                        "status": {"type": "string", "enum": ["generated"]},
                         "question": {"type": "string"},
                         "reason": {"type": "string"},
                     },
@@ -96,11 +99,15 @@ CONTRASTIVE_SCHEMA = {
                         "id": {"type": "string"},
                         "selected_option": {"type": "string"},
                         "answer_type_matches": {"type": "boolean"},
+                        "all_facts_expressed": {"type": "boolean"},
+                        "uses_only_supported_facts": {"type": "boolean"},
+                        "is_natural_language_question": {"type": "boolean"},
                         "confidence": {"type": "number"},
                         "reason": {"type": "string"},
                     },
                     "required": [
-                        "id", "selected_option", "answer_type_matches", "confidence", "reason"
+                        "id", "selected_option", "answer_type_matches", "all_facts_expressed",
+                        "uses_only_supported_facts", "is_natural_language_question", "confidence", "reason"
                     ],
                     "additionalProperties": False,
                 },
@@ -183,6 +190,7 @@ def _chat_record(custom_id: str, model: str, system: str, payload: Any, schema: 
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             "response_format": {"type": "json_schema", "json_schema": schema},
+            "temperature": 0,
             "max_completion_tokens": 2400,
         },
     }
@@ -277,83 +285,23 @@ def compact_query(path: dict[str, Any], glossary: dict[str, dict[str, Any]]) -> 
     }
 
 
-def qwen_naturalize(items: list[dict[str, Any]], model: str, host: str) -> dict[str, dict[str, Any]]:
-    prompt = (
-        "/no_think\nWrite one natural English question for every explicit logical query. "
-        "Raw facts and variable identity are authoritative. [ENTITY] must appear exactly once. "
-        "Every fact must contribute and different variable IDs are different entities. Ask for "
-        "the return variable and exact answer type. Do not mention graphs, variables, facts, "
-        "forward/backward, associated, related, or linked. If unusable_relations is nonempty, "
-        "return status opaque. Return JSON only: "
-        '{"items":[{"id":"...","status":"valid|opaque","question":"...","reason":"..."}]}.\n'
-        + json.dumps({"queries": items}, ensure_ascii=False)
-    )
-    request = urllib.request.Request(
-        host.rstrip("/") + "/api/chat",
-        data=json.dumps({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "think": False,
-            "format": "json",
-            "options": {"temperature": 0.0, "num_predict": 2200},
-        }).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=600) as response:
-        content = json.load(response)["message"]["content"]
-    return {item["id"]: item for item in json.loads(content)["items"]}
-
-
-def qwen_naturalize_resilient(
-    items: list[dict[str, Any]], model: str, host: str
-) -> dict[str, dict[str, Any]]:
-    try:
-        return qwen_naturalize(items, model, host)
-    except Exception as exc:
-        if len(items) == 1:
-            item = items[0]
-            return {
-                item["id"]: {
-                    "id": item["id"],
-                    "status": "opaque",
-                    "question": "",
-                    "reason": f"Qwen request failed: {type(exc).__name__}",
-                }
-            }
-        midpoint = len(items) // 2
-        return qwen_naturalize_resilient(items[:midpoint], model, host) | qwen_naturalize_resilient(
-            items[midpoint:], model, host
-        )
-
-
-def naturalize_with_qwen(rows: list[dict[str, Any]], glossary: dict[str, dict[str, Any]], model: str, host: str, output: Path) -> dict[str, dict[str, Any]]:
-    destination = output / ".dataset_builder" / "qwen_predictions.jsonl"
-    predictions = {}
-    if destination.exists():
-        predictions = {row["id"]: row for row in (json.loads(line) for line in destination.open())}
-    with destination.open("a", encoding="utf-8") as handle:
-        for start in range(0, len(rows), QWEN_GROUP_SIZE):
-            pending = []
-            for row in rows[start:start + QWEN_GROUP_SIZE]:
-                meta = row["_naturalization"]
-                prefix = f"{meta['split']}:{meta['source_index']}"
-                candidates = [(f"{prefix}:positive", row["positive_path"])] + [
-                    (f"{prefix}:negative:{index}", path) for index, path in enumerate(row["negative_paths"])
-                ]
-                for identifier, path in candidates:
-                    if identifier not in predictions:
-                        pending.append({"id": identifier, "query": compact_query(path, glossary)})
-            if not pending:
-                continue
-            generated = qwen_naturalize_resilient(pending, model, host)
-            for item in pending:
-                prediction = generated.get(item["id"], {"id": item["id"], "status": "opaque", "question": "", "reason": "missing Qwen output"})
-                predictions[item["id"]] = prediction
-                handle.write(json.dumps(prediction, ensure_ascii=False) + "\n")
-            handle.flush()
-            print(f"Qwen naturalization: {min(start + QWEN_GROUP_SIZE, len(rows))}/{len(rows)} rows", flush=True)
-    return predictions
+def render_compact_query(query: dict[str, Any]) -> str:
+    lines = [
+        f"Anchor: v0 = [ENTITY] (type: {query['anchor']['type']})",
+        "Required facts:",
+    ]
+    for index, fact in enumerate(query["facts"]):
+        subject = f"{fact['subject']} (type: {fact['subject_type']})"
+        object_ = f"{fact['object']} (type: {fact['object_type']})"
+        template = fact.get("fact_template", "")
+        try:
+            statement = template.format(subject=subject, object=object_)
+        except (KeyError, ValueError):
+            statement = f"{subject} -- {fact['meaning']} --> {object_}"
+        lines.append(f"F{index}: {statement}")
+    returned = query["return"]
+    lines.append(f"Return: {returned['variable']} (type: {returned['type']})")
+    return "\n".join(lines)
 
 
 def row_candidates(row: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -367,7 +315,6 @@ def row_candidates(row: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 def generation_records(
     rows: list[dict[str, Any]],
     glossary: dict[str, dict[str, Any]],
-    qwen: dict[str, dict[str, Any]],
     model: str,
 ) -> list[dict[str, Any]]:
     system = (
@@ -376,16 +323,20 @@ def generation_records(
         "object, preserve shared intermediate variables, and ask for the declared return variable "
         "and answer type. Never transfer a person's property to an institution or place, omit a "
         "fact, reverse a relation, or replace a predicate with a nearby meaning. Use [ENTITY] "
-        "exactly once. The draft is optional assistance, not evidence; repair it freely. Reject only "
-        "when the explicit query cannot form one coherent natural question. Avoid vague related, "
-        "associated, linked, or connected wording when a specific predicate is available."
+        "exactly once. Generate from the logical query itself; there is no draft to preserve. Every "
+        "input query is an executable connected graph and must receive a question; do not judge factual "
+        "plausibility and do not refuse complex or unusual paths. Avoid vague related, "
+        "associated, linked, or connected wording when a specific predicate is available. Output "
+        "ordinary natural language only: never mention variable IDs such as v0/v1, raw schemas, "
+        "parentheses, type annotations, facts, or graph terminology. Type words may be used "
+        "naturally as nouns, for example 'film' or 'country'."
     )
     items = []
     for row in rows:
         for identifier, path in row_candidates(row):
             query = compact_query(path, glossary)
             if not query["unusable_relations"]:
-                items.append({"id": identifier, "query": query, "draft": qwen.get(identifier)})
+                items.append({"id": identifier, "query": render_compact_query(query)})
     return [
         _chat_record(
             f"generate-{start // QWEN_GROUP_SIZE:06d}", model, system,
@@ -406,7 +357,12 @@ def contrastive_records(
         "Compare exact predicate meanings, subject/object roles, shared variables, number of facts, "
         "and requested answer type. Select NONE if the question omits a fact, reverses a relation, "
         "collapses an intermediate entity, uses only vague related/associated wording, matches more "
-        "than one option, or matches no option. Option order is random and gives no correctness hint."
+        "than one option, or matches no option. Set all_facts_expressed true only when every F-numbered "
+        "fact in the selected option is stated by the question. Set uses_only_supported_facts true only "
+        "when the question invents no relation absent from that option. Option order is random and gives "
+        "no correctness hint. Set is_natural_language_question true only if the question exposes no "
+        "variable IDs, type annotations, schemas, F-numbered facts, or graph terminology. Do not select the closest option "
+        "when NONE is more accurate."
     )
     items = []
     intended_options: dict[str, str] = {}
@@ -431,7 +387,7 @@ def contrastive_records(
             options = []
             for index, (choice_id, query) in enumerate(choices):
                 option_id = chr(ord("A") + index)
-                options.append({"option_id": option_id, "query": query})
+                options.append({"option_id": option_id, "query": render_compact_query(query)})
                 if choice_id == identifier:
                     intended_options[identifier] = option_id
             options.append({"option_id": "NONE", "query": None})
@@ -463,6 +419,9 @@ def combine_contrastive_results(
             and judgment
             and judgment.get("selected_option") == intended_options.get(identifier)
             and judgment.get("answer_type_matches") is True
+            and judgment.get("all_facts_expressed") is True
+            and judgment.get("uses_only_supported_facts") is True
+            and judgment.get("is_natural_language_question") is True
             and float(judgment.get("confidence", 0.0)) >= 0.8
         )
         combined[identifier] = {
@@ -472,6 +431,9 @@ def combine_contrastive_results(
             "selected_option": (judgment or {}).get("selected_option", ""),
             "intended_option": intended_options.get(identifier, ""),
             "answer_type_matches": (judgment or {}).get("answer_type_matches", False),
+            "all_facts_expressed": (judgment or {}).get("all_facts_expressed", False),
+            "uses_only_supported_facts": (judgment or {}).get("uses_only_supported_facts", False),
+            "is_natural_language_question": (judgment or {}).get("is_natural_language_question", False),
             "confidence": float((judgment or {}).get("confidence", 0.0)),
             "reason": (judgment or {}).get("reason", generation.get("reason", "")),
         }
@@ -493,8 +455,23 @@ def validation_rejection(
     question = prediction["question"].strip()
     if not question.endswith("?"):
         return "not_a_question"
+    if (
+        re.search(r"\bv\d+\b", question, flags=re.IGNORECASE)
+        or "type:" in question.casefold()
+        or "(" in question
+        or ")" in question
+    ):
+        return "internal_notation_in_question"
+    if any(phrase in question.casefold() for phrase in VAGUE_QUESTION_PHRASES):
+        return "vague_question_wording"
     if prediction.get("answer_type_matches") is not True:
         return "answer_type_mismatch"
+    if prediction.get("all_facts_expressed") is not True:
+        return "missing_path_fact"
+    if prediction.get("uses_only_supported_facts") is not True:
+        return "unsupported_question_relation"
+    if prediction.get("is_natural_language_question") is not True:
+        return "non_natural_question"
     if float(prediction.get("confidence", 0.0)) < 0.8:
         return "low_contrastive_confidence"
     if prediction.get("selected_option") != prediction.get("intended_option"):
@@ -558,10 +535,9 @@ def build_naturalized_dataset(
     webqsp_graphs: Path,
     max_paths: int = 3_000,
     max_negatives: int = 3,
-    qwen_model: str = "qwen3:8b",
-    ollama_host: str = "http://127.0.0.1:11434",
     glossary_model: str = GLOSSARY_MODEL,
-    validation_model: str = VALIDATION_MODEL,
+    generation_model: str = VALIDATION_MODEL,
+    verifier_model: str = VERIFIER_MODEL,
 ) -> dict[str, Any]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -570,6 +546,7 @@ def build_naturalized_dataset(
     internal = output / ".dataset_builder"
     internal.mkdir(exist_ok=True)
     rows = select_rows(source, max_paths, max_negatives)
+    use_batch = len(rows) > 100
     client = OpenAIBatchClient(api_key)
     print(f"[1/5] Selected {len(rows)} paths from {source}", flush=True)
 
@@ -586,11 +563,17 @@ def build_naturalized_dataset(
         glossary_errors = []
         print("[3/5] Reusing completed relation glossary", flush=True)
     else:
-        glossary_files = run_chat_records_sync(
-            glossary_records(evidence, glossary_model),
-            internal / "glossary_sync",
-            client,
-            "relation glossary",
+        glossary_requests = glossary_records(evidence, glossary_model)
+        glossary_files = (
+            run_batch_records(
+                glossary_requests, internal / "glossary_batch_v8", client, "relation glossary",
+                max_estimated_tokens=60_000,
+            )
+            if use_batch
+            else run_chat_records_sync(
+                glossary_requests, internal / "glossary_sync_v8", client, "relation glossary",
+                workers=2,
+            )
         )
         raw_glossary, glossary_errors = parse_batch_items(glossary_files)
         glossary = validate_glossary(evidence, raw_glossary)
@@ -600,37 +583,53 @@ def build_naturalized_dataset(
     print(f"[3/5] Relation glossary: {dict(statuses)}", flush=True)
     glossary_path.write_text(json.dumps(glossary, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    qwen = naturalize_with_qwen(rows, glossary, qwen_model, ollama_host, output)
-    print(f"[4/5] Qwen produced {len(qwen)} candidate outputs", flush=True)
-    generation_files = run_chat_records_sync(
-        generation_records(rows, glossary, qwen, validation_model),
-        internal / "generation_sync_v4",
-        client,
-        "faithful question generation",
-        workers=2,
+    print("[4/5] Generating and independently verifying natural questions", flush=True)
+    generation_requests = generation_records(rows, glossary, generation_model)
+    generation_files = (
+        run_batch_records(
+            generation_requests, internal / "generation_batch_v8", client,
+            "faithful question generation", max_estimated_tokens=60_000,
+        )
+        if use_batch
+        else run_chat_records_sync(
+            generation_requests, internal / "generation_sync_v8", client,
+            "faithful question generation", workers=2,
+        )
     )
     generated, generation_errors = parse_batch_items(generation_files)
     contrastive_requests, intended_options = contrastive_records(
-        rows, glossary, generated, validation_model
+        rows, glossary, generated, verifier_model
     )
-    contrastive_files = run_chat_records_sync(
-        contrastive_requests,
-        internal / "contrastive_sync_v4",
-        client,
-        "contrastive question verification",
-        workers=2,
+    contrastive_files = (
+        run_batch_records(
+            contrastive_requests, internal / "contrastive_batch_v8", client,
+            "contrastive question verification",
+        )
+        if use_batch
+        else run_chat_records_sync(
+            contrastive_requests, internal / "contrastive_sync_v8", client,
+            "contrastive question verification", workers=2,
+        )
     )
     judgments, contrastive_errors = parse_batch_items(contrastive_files)
     validated = combine_contrastive_results(generated, judgments, intended_options)
     validation_errors = [*generation_errors, *contrastive_errors]
+    fallback_path = internal / "contrastive_batch_v8" / "fallback_manifest.json"
+    verifier_fallback = (
+        json.loads(fallback_path.read_text(encoding="utf-8"))
+        if fallback_path.is_file()
+        else None
+    )
     manifest = finalize_dataset(rows, validated, glossary, output, {
         "source": str(source), "requested_paths": max_paths, "selected_paths": len(rows),
         "relations": len(evidence), "glossary_entries": len(glossary),
-        "glossary_errors": len(glossary_errors), "qwen_model": qwen_model,
-        "glossary_model": glossary_model, "validation_model": validation_model,
+        "glossary_errors": len(glossary_errors),
+        "glossary_model": glossary_model, "generation_model": generation_model,
+        "verifier_model": verifier_model, "expensive_stages_via_batch": use_batch,
         "generation_errors": len(generation_errors),
         "contrastive_errors": len(contrastive_errors),
         "validation_errors": len(validation_errors),
+        "verifier_fallback": verifier_fallback,
     })
     print(
         f"[5/5] Final dataset: {manifest['accepted_train']} train, "

@@ -367,6 +367,9 @@ def test_contrastive_validation_requires_intended_path_and_answer_type() -> None
         "selected_option": "B",
         "intended_option": "B",
         "answer_type_matches": True,
+        "all_facts_expressed": True,
+        "uses_only_supported_facts": True,
+        "is_natural_language_question": True,
         "confidence": 0.94,
     }
     assert validation_rejection(path, accepted, glossary) is None
@@ -377,6 +380,12 @@ def test_contrastive_validation_requires_intended_path_and_answer_type() -> None
     wrong_type = dict(accepted, answer_type_matches=False)
     assert validation_rejection(path, wrong_type, glossary) == "answer_type_mismatch"
 
+    leaked_variable = dict(accepted, question="What country is v1, the author of [ENTITY], a citizen of?")
+    assert validation_rejection(path, leaked_variable, glossary) == "internal_notation_in_question"
+
+    vague = dict(accepted, question="What country is associated with the author of [ENTITY]?")
+    assert validation_rejection(path, vague, glossary) == "vague_question_wording"
+
 
 def test_combined_contrastive_result_accepts_only_intended_high_confidence() -> None:
     generated = {
@@ -384,8 +393,8 @@ def test_combined_contrastive_result_accepts_only_intended_high_confidence() -> 
         "wrong": {"status": "generated", "question": "Who wrote [ENTITY]?"},
     }
     judgments = {
-        "good": {"selected_option": "C", "answer_type_matches": True, "confidence": 0.91, "reason": "exact"},
-        "wrong": {"selected_option": "A", "answer_type_matches": True, "confidence": 0.99, "reason": "different path"},
+        "good": {"selected_option": "C", "answer_type_matches": True, "all_facts_expressed": True, "uses_only_supported_facts": True, "is_natural_language_question": True, "confidence": 0.91, "reason": "exact"},
+        "wrong": {"selected_option": "A", "answer_type_matches": True, "all_facts_expressed": True, "uses_only_supported_facts": True, "is_natural_language_question": True, "confidence": 0.99, "reason": "different path"},
     }
     combined = combine_contrastive_results(generated, judgments, {"good": "C", "wrong": "B"})
     assert combined["good"]["status"] == "valid"
@@ -417,6 +426,9 @@ def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
         "selected_option": "A",
         "intended_option": "A",
         "answer_type_matches": True,
+        "all_facts_expressed": True,
+        "uses_only_supported_facts": True,
+        "is_natural_language_question": True,
         "confidence": 0.99,
     }
     assert validation_rejection(path, prediction, glossary) == "unusable_relation"
@@ -986,3 +998,44 @@ def test_naturalization_does_not_turn_http_failure_into_training_data(
         raise AssertionError("HTTP failure should stop naturalization")
 
     assert (output / "train_faithful.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_generalization_slices_are_relative_to_actual_training_data() -> None:
+    from inverse_verifier.generalization import derive_generalization_slices
+
+    def row(example_id: str, kg: str, relations: list[tuple[str, str]]) -> dict:
+        return {
+            "example_id": example_id,
+            "positive_path": {
+                "kg": kg,
+                "hops": [
+                    {"relation": relation, "direction": direction}
+                    for relation, direction in relations
+                ],
+            },
+        }
+
+    train = [
+        row("train-a", "kg", [("a", "forward")]),
+        row("train-b", "kg", [("b", "forward")]),
+        row("train-ab", "kg", [("a", "forward"), ("b", "forward")]),
+    ]
+    evaluation = {
+        "heldout": [
+            row("seen", "kg", [("a", "forward")]),
+            row("new-relation", "kg", [("c", "forward")]),
+            row("new-composition", "kg", [("b", "forward"), ("a", "forward")]),
+            row("same-name-other-kg", "other", [("a", "forward")]),
+        ]
+    }
+
+    slices, coverage = derive_generalization_slices(train, evaluation)
+
+    assert {item["example_id"] for item in slices["strict_unseen_relation"]} == {
+        "new-relation",
+        "same-name-other-kg",
+    }
+    assert [item["example_id"] for item in slices["strict_unseen_composition"]] == [
+        "new-composition"
+    ]
+    assert coverage["slice_examples"]["strict_unseen_relation"] == 2

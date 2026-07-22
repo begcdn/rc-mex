@@ -104,6 +104,120 @@ paths average 0.826. The corresponding rates above 0.8 are 78.6% and 68.5%.
 7. **No calibrated acceptance threshold.** Values such as 0.8 or 0.85 are
    operational starting points, not learned probabilities.
 
+## Validated synthetic corpus (July 2026)
+
+The later corpus builder addresses the original generator's hop-omission failure before retraining:
+
+1. Compile each executable path into explicit variables and complete logical facts.
+2. Ground raw relation IDs with observed KG type pairs and example facts.
+3. Use GPT-4o to write a natural question that expresses every fact and the return variable.
+4. Randomize the intended query among executable hard-negative queries.
+5. Use GPT-4o mini to select the exact represented query and verify endpoint type and fact coverage.
+6. Deterministically reject internal notation, raw schemas, parentheses, vague relation wording,
+   unusable relations, and rows without a validated hard negative.
+
+The completed portion of `runs/inverse_verifier/naturalized_dataset_3000_v8` contains:
+
+| Property | Value |
+|---|---:|
+| Selected source paths | 3,000 |
+| Accepted rows | 1,979 |
+| Train / dev | 1,781 / 198 |
+| KQA Pro / WebQSP | 1,115 / 864 |
+| One / two / three hop | 765 / 643 / 571 |
+| Positive and negative questions | 6,531 |
+| Unique positive relation sequences | 1,458 |
+| Formatting-policy violations | 0 |
+
+The API billing limit prevented verifier batch 5/5 from being submitted. A local Qwen 3 8B
+verifier completed its 76 requests after calibration on the same 40-row pilot: Qwen and GPT-4o
+each accepted 24 rows with 23 in common, and a compressed-prompt check reproduced all seven prior
+candidate decisions. The weaker Llama 3.2 3B alternative was rejected after only 58% path-selection
+agreement on its first 12 pilot items. The final manifest records this mixed verifier provenance.
+
+The principal remaining data weakness is WebQSP's generic typing: 324 accepted rows have generic
+`entity` answer types and 451 contain at least one generically typed path node. KQA Pro contributes
+none of these cases. Such rows can produce semantically faithful but awkward questions because the
+source graph does not identify a specific endpoint role. They remain marked in the path structures
+and should be measured as a separate slice during training evaluation rather than silently removed.
+
+### Exact data-generation procedure
+
+The retained training corpus is
+`runs/inverse_verifier/naturalized_dataset_3000_v8`. It was produced as follows.
+
+1. **Select executable source paths.** Sample 3,000 one-, two-, and three-hop paths from the
+   prepared KQA Pro and WebQSP pool. Preserve relation order, traversal direction, node types,
+   endpoint answer type, KG source, and topic-entity masking.
+2. **Compile each path into a query.** Convert the path into an explicit variable chain so the
+   intended return variable and every hop are mechanically visible. Candidate questions are not
+   generated directly from opaque relation identifiers.
+3. **Ground relation semantics.** For 1,515 unique relations, collect observed source/target type
+   pairs and KG facts. GPT-4o (`gpt-4o-2024-11-20`) uses this evidence to classify each relation as
+   semantic, metadata, or opaque and to produce a readable glossary entry. All 1,515 entries were
+   completed without API errors.
+4. **Generate questions contrastively.** Construct the gold query and executable hard-negative
+   queries that differ in relation, direction, composition, or return role. GPT-4o writes natural
+   questions for these explicit queries. The prompt requires every represented fact, correct
+   direction, and the correct answer variable while forbidding raw schema notation.
+5. **Verify exact query identity.** Randomize the candidate-query order, then ask a separate
+   verifier to identify exactly which query each generated question expresses. Verification also
+   checks endpoint answer type, complete fact coverage, naturalness, and absence of unsupported
+   facts. GPT-4o-mini (`gpt-4o-mini-2024-07-18`) handled the main verification batches.
+6. **Complete the interrupted verifier batch.** The OpenAI billing limit prevented the last 76
+   requests from being submitted. Qwen 3 8B completed only that final chunk after a 40-row
+   calibration: GPT-4o and Qwen each accepted 24 rows, with 23 accepted by both. A compressed-prompt
+   test reproduced all seven previously available decisions. Llama 3.2 3B was rejected after only
+   58% agreement on its first 12 pilot items. This fallback is recorded in `manifest.json`.
+7. **Apply deterministic quality gates.** Reject malformed questions, internal variables, raw KG
+   syntax, parenthesized implementation text, vague relation wording, unusable/opaque relations,
+   answer-role mismatches, omitted facts, unsupported facts, and rows lacking at least one validated
+   hard negative. Rejection is explicit; no failed row silently enters training.
+8. **Create the final split.** Write 1,781 accepted rows to `train_faithful.jsonl` and 198 to
+   `dev_faithful.jsonl`. The other 1,021 selected paths remain rejected. All 3,000 selected paths are
+   therefore accounted for.
+
+The final corpus contains 10,998 contrastive-eligible generated candidate questions, all of which
+received a verifier decision. Another 84 generated candidates were ineligible because their source
+row did not contain at least two usable query alternatives; they were not treated as verified
+training material. Every accepted row has at least one validated negative. The corpus has 6,215
+unique question strings, 1,458 unique positive relation sequences, and no detected formatting-policy
+violations.
+
+### Training recommendation and interpretation
+
+The first training run should use the `faithful_inverse` objective from a clean
+`google/flan-t5-small` checkpoint. This objective combines path-to-question likelihood with a
+contrastive sequence-likelihood loss that prefers the gold question/path pairing over validated hard
+negatives. Starting from the older inverse-verifier checkpoint would confound the value of the new
+corpus with inherited hop-omission and degenerate-generation behavior.
+
+This dataset is suitable for the first complete training experiment, but it is not yet publication
+evidence by itself. Evaluation must retain relation-disjoint, composition-disjoint, held-out-question,
+and generic-WebQSP-type slices. The mixed verifier provenance and the 451 generically typed WebQSP
+rows must be reported rather than hidden.
+
+Recommended first training command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m inverse_verifier train \
+  --data runs/inverse_verifier/naturalized_dataset_3000_v8 \
+  --base-model google/flan-t5-small \
+  --regime faithful_synthetic \
+  --objective faithful_inverse \
+  --output runs/inverse_verifier/faithful_inverse_3000_v8 \
+  --epochs 4 \
+  --batch-size 32 \
+  --learning-rate 2e-4 \
+  --rank-weight 1.0 \
+  --device cuda
+```
+
+The current trainer is intentionally single-device. On an L20, FLAN-T5-small and this 1,781-row
+training split do not justify distributed-training complexity; exposing a second GPU would not make
+the existing code use it. A second device should instead be reserved for a later controlled ablation
+or larger-backbone experiment.
+
 ## Reproduction
 
 ```bash
