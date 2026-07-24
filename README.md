@@ -268,3 +268,37 @@ python3 -m inverse_verifier prepare-comparator \
   --generator runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
   --output runs/inverse_verifier/comparator_kqa_heldout_qwen25_v1
 ```
+
+### Semantic-Equivalence Benchmark
+
+Path correctness and question equivalence are different labels. A wrong path
+can produce a question that is textually equivalent to the original when the
+generator collapses or repairs its meaning. Build a separate judge-labeled
+benchmark from the held-out generated questions:
+
+```bash
+export OPENAI_API_KEY='...'
+python3 -m inverse_verifier build-semantic-benchmark \
+  --data runs/inverse_verifier/comparator_kqa_heldout_qwen25_v1 \
+  --output runs/inverse_verifier/comparator_kqa_semantic_v1 \
+  --model gpt-4o-2024-11-20
+```
+
+The judge sees only the original question and candidate questions. It never
+sees paths, path labels, negative categories, or endpoint correctness.
+Multiple candidates may be equivalent. Candidate sets with no equivalent
+generated question are saved separately and excluded from comparator ranking.
+These are silver semantic labels and should be manually audited before being
+reported as benchmark results.
+
+Evaluate the question-only comparator on the semantic labels:
+
+```bash
+python3 -m inverse_verifier evaluate-comparator \
+  --data runs/inverse_verifier/comparator_kqa_semantic_v1 \
+  --model runs/inverse_verifier/deberta_comparator_question_generated_v1/model \
+  --semantic-model BAAI/bge-small-en-v1.5 \
+  --output runs/inverse_verifier/comparator_kqa_semantic_generated_v1_eval \
+  --split test_kqa_val \
+  --device cuda
+```

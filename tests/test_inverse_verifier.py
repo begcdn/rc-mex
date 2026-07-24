@@ -68,6 +68,11 @@ from inverse_verifier.comparator import (
     materialize_comparator_data,
 )
 from inverse_verifier.selector import run_verifier_pipeline
+from inverse_verifier.semantic_benchmark import (
+    apply_semantic_labels,
+    parse_semantic_results,
+    semantic_judge_record,
+)
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -1661,3 +1666,129 @@ def test_comparator_materializes_existing_heldout_predictions(
     assert row["original_question"] == "Who wrote Book?"
     assert row["candidates"][0]["negative_type"] == "positive"
     assert "author" in row["candidates"][0]["path_text"]
+
+
+def test_semantic_judge_sees_questions_but_not_path_labels() -> None:
+    row = {
+        "example_id": "example-1",
+        "original_question": "Who is the father of Ada's mother?",
+        "candidates": [
+            {
+                "generated_question": "Who is Ada's maternal grandfather?",
+                "is_positive": False,
+                "negative_type": "wrong_direction",
+                "path_text": "SECRET PATH",
+            }
+        ],
+    }
+    record = semantic_judge_record(row, "judge")
+    prompt = record["body"]["messages"][1]["content"]
+
+    assert "Who is Ada's maternal grandfather?" in prompt
+    assert "SECRET PATH" not in prompt
+    assert "wrong_direction" not in prompt
+    assert '"is_positive"' not in prompt
+
+
+def test_semantic_labels_allow_equivalent_wrong_paths_and_multiple_positives() -> None:
+    rows = [
+        {
+            "example_id": "example-1",
+            "original_question": "Who is Ada's maternal grandfather?",
+            "candidates": [
+                {"generated_question": "Who is the father of Ada's mother?", "is_positive": True},
+                {"generated_question": "Who is Ada's mother's father?", "is_positive": False},
+                {"generated_question": "Who is Ada's father?", "is_positive": False},
+            ],
+        }
+    ]
+    judgments = {
+        "example-1": {
+            "items": [
+                {"id": "candidate-0", "equivalent": True, "issue": "equivalent"},
+                {"id": "candidate-1", "equivalent": True, "issue": "equivalent"},
+                {"id": "candidate-2", "equivalent": False, "issue": "missing_constraint"},
+            ]
+        }
+    }
+    scored, unscorable, summary = apply_semantic_labels(rows, judgments)
+
+    assert not unscorable
+    assert [candidate["is_positive"] for candidate in scored[0]["candidates"]] == [
+        True,
+        True,
+        False,
+    ]
+    assert scored[0]["candidates"][1]["path_is_positive"] is False
+    assert summary["path_negative_accepted_as_equivalent"] == 1
+
+
+def test_semantic_benchmark_separates_rows_with_no_equivalent_candidate() -> None:
+    rows = [
+        {
+            "example_id": "example-1",
+            "original_question": "Who wrote Book?",
+            "candidates": [
+                {"generated_question": "Who published Book?", "is_positive": True}
+            ],
+        }
+    ]
+    judgments = {
+        "example-1": {
+            "items": [
+                {
+                    "id": "candidate-0",
+                    "equivalent": False,
+                    "issue": "wrong_relation",
+                }
+            ]
+        }
+    }
+    scored, unscorable, summary = apply_semantic_labels(rows, judgments)
+
+    assert not scored
+    assert len(unscorable) == 1
+    assert summary["no_equivalent_candidate_sets"] == 1
+    assert summary["path_positive_rejected_as_not_equivalent"] == 1
+
+
+def test_semantic_result_parser_keeps_candidate_ids_scoped_by_question(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "results.jsonl"
+    rows = []
+    for question_id, equivalent in (("q1", True), ("q2", False)):
+        rows.append(
+            {
+                "custom_id": question_id,
+                "response": {
+                    "body": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "items": [
+                                                {
+                                                    "id": "candidate-0",
+                                                    "equivalent": equivalent,
+                                                }
+                                            ]
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    judgments, errors = parse_semantic_results([path])
+
+    assert not errors
+    assert judgments["q1"]["items"][0]["equivalent"] is True
+    assert judgments["q2"]["items"][0]["equivalent"] is False
