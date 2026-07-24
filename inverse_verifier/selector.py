@@ -9,6 +9,11 @@ from typing import Any
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from .comparator import (
+    comparator_path_text,
+    load_comparator,
+    score_comparator_rows,
+)
 from .data import (
     Hop,
     PathSpec,
@@ -135,11 +140,26 @@ def run_verifier_pipeline(
     output: Path,
     limit: int,
     device: str = "auto",
+    comparison_mode: str = "cosine",
+    comparator_model: str | None = None,
 ) -> dict[str, Any]:
+    if comparison_mode not in {"cosine", "cross_encoder"}:
+        raise ValueError(f"unknown comparison mode: {comparison_mode}")
+    if comparison_mode == "cross_encoder" and not comparator_model:
+        raise ValueError("cross_encoder comparison requires comparator_model")
     started = time.time()
     metadata = supported_questions(questions_path)
-    encoder = SentenceTransformer(SEMANTIC_MODEL, local_files_only=True)
+    encoder = (
+        SentenceTransformer(SEMANTIC_MODEL, local_files_only=True)
+        if comparison_mode == "cosine"
+        else None
+    )
     generator, tokenizer, model_device = load_seq2seq(model_path, device)
+    cross_encoder = cross_tokenizer = cross_device = cross_mode = None
+    if comparison_mode == "cross_encoder":
+        cross_encoder, cross_tokenizer, cross_device, cross_mode = load_comparator(
+            comparator_model or "", device
+        )
     retriever = SRTKPathRetriever(retriever_model, device)
     results = []
     with graphs_path.open(encoding="utf-8") as handle:
@@ -178,15 +198,21 @@ def run_verifier_pipeline(
                     delexicalize_question(text, family["path"]["anchor"])
                     for text, family in zip(generated, batch, strict=True)
                 ]
-                reference_embeddings = encoder.encode(
-                    reference_intents, batch_size=VERIFY_BATCH_SIZE, normalize_embeddings=True
-                )
-                generated_embeddings = encoder.encode(
-                    generated_intents, batch_size=VERIFY_BATCH_SIZE, normalize_embeddings=True
-                )
-                similarities = np.sum(
-                    reference_embeddings * generated_embeddings, axis=1
-                ).tolist()
+                similarities = [float("nan")] * len(batch)
+                if encoder is not None:
+                    reference_embeddings = encoder.encode(
+                        reference_intents,
+                        batch_size=VERIFY_BATCH_SIZE,
+                        normalize_embeddings=True,
+                    )
+                    generated_embeddings = encoder.encode(
+                        generated_intents,
+                        batch_size=VERIFY_BATCH_SIZE,
+                        normalize_embeddings=True,
+                    )
+                    similarities = np.sum(
+                        reference_embeddings * generated_embeddings, axis=1
+                    ).tolist()
                 for family, generated_question, similarity in zip(
                     batch, generated, similarities, strict=True
                 ):
@@ -195,9 +221,18 @@ def run_verifier_pipeline(
                             **family,
                             "generated_question": generated_question,
                             "semantic_similarity": float(similarity),
+                            "path_text": comparator_path_text(
+                                family["path"],
+                                ", ".join(family.get("answers", [])[:10]),
+                                getattr(generator, "_relation_glossary", None),
+                            ),
                         }
                     )
-                if max(item["semantic_similarity"] for item in verified) >= ACCEPT_THRESHOLD:
+                if (
+                    comparison_mode == "cosine"
+                    and max(item["semantic_similarity"] for item in verified)
+                    >= ACCEPT_THRESHOLD
+                ):
                     stopped_on_threshold = True
                     break
 
@@ -205,7 +240,42 @@ def run_verifier_pipeline(
                 print(f"{len(results) + 1}/{limit} {graph_row['id']}: no candidate paths", flush=True)
                 continue
 
-            selected = max(verified, key=lambda item: item["semantic_similarity"])
+            score_key = "semantic_similarity"
+            if comparison_mode == "cross_encoder":
+                comparator_row = {
+                    "example_id": graph_row["id"],
+                    "original_question": question,
+                    "candidates": [
+                        {
+                            **candidate,
+                            "is_positive": False,
+                            "negative_type": "unlabeled",
+                        }
+                        for candidate in verified
+                    ],
+                }
+                scored = score_comparator_rows(
+                    cross_encoder,
+                    cross_tokenizer,
+                    [comparator_row],
+                    cross_mode,
+                    cross_device,
+                    batch_size=1,
+                )[0]["candidates"]
+                verified = [
+                    {
+                        **candidate,
+                        "cross_encoder_score": scored_candidate[
+                            "cross_encoder_score"
+                        ],
+                    }
+                    for candidate, scored_candidate in zip(
+                        verified, scored, strict=True
+                    )
+                ]
+                score_key = "cross_encoder_score"
+
+            selected = max(verified, key=lambda item: item[score_key])
             selected_is_gold = bool(
                 selected and tuple(selected["relation_sequence"]) in set(gold_sequences)
             )
@@ -228,21 +298,22 @@ def run_verifier_pipeline(
                 "answer_metrics": answer_row,
                 "selected": selected,
                 "top_verified": sorted(
-                    verified, key=lambda item: item["semantic_similarity"], reverse=True
+                    verified, key=lambda item: item[score_key], reverse=True
                 )[:10],
                 "false_early_accept": bool(stopped_on_threshold and not selected_is_gold),
                 "gold_was_verified": bool(
                     proposal_gold_rank is not None and proposal_gold_rank <= len(verified)
                 ),
                 "low_confidence_unhandled": bool(
-                    selected["semantic_similarity"] < 0.5
+                    comparison_mode == "cosine"
+                    and selected["semantic_similarity"] < 0.5
                 ),
             }
             results.append(result)
             print(
                 f"{len(results)}/{limit} {graph_row['id']}: proposal_gold_rank={proposal_gold_rank} "
                 f"verified={len(verified)} "
-                f"best={(selected['semantic_similarity'] if selected else float('nan')):.3f} "
+                f"best={(selected[score_key] if selected else float('nan')):.3f} "
                 f"path_correct={selected_is_gold}",
                 flush=True,
             )
@@ -258,10 +329,11 @@ def run_verifier_pipeline(
         "proposal_cap": PATH_CAP,
         "verify_cap": VERIFY_CAP,
         "verify_batch_size": VERIFY_BATCH_SIZE,
-        "accept_threshold": ACCEPT_THRESHOLD,
-        "semantic_model": SEMANTIC_MODEL,
+        "accept_threshold": ACCEPT_THRESHOLD if comparison_mode == "cosine" else None,
+        "semantic_model": SEMANTIC_MODEL if comparison_mode == "cosine" else None,
+        "comparator_model": comparator_model,
         "generator_model": model_path,
-        "verification_signal": "generated-question semantic similarity",
+        "verification_signal": comparison_mode,
         "gold_topic_entity_used": True,
         "gold_path_or_hop_count_used_during_search": False,
         "raw_path_recall": sum(row["proposal_gold_rank"] is not None for row in results)

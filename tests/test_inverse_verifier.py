@@ -60,6 +60,13 @@ from inverse_verifier.causal_generator import (
     CausalInverseDataset,
     flatten_path_question_pairs,
 )
+from inverse_verifier.comparator import (
+    candidate_specs,
+    comparator_input_text,
+    comparator_path_text,
+    listwise_multi_positive_loss,
+)
+from inverse_verifier.selector import run_verifier_pipeline
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -1459,3 +1466,141 @@ def test_faithfulness_evaluates_both_executable_directions() -> None:
     assert backward["positive_path"]["hops"][0]["direction"] == "backward"
     assert backward["negative_paths"][0]["hops"][0]["direction"] == "forward"
     assert backward["negative_paths"][0]["negative_type"] == "executable_opposite_direction"
+
+
+def test_comparator_candidate_sets_support_multiple_positive_paths() -> None:
+    positive = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    alternate = {
+        **positive,
+        "hops": [
+            {
+                "relation": "written by",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+        "answer_entity": "Writer",
+    }
+    negative = {
+        **positive,
+        "hops": [
+            {
+                "relation": "publisher",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "organization",
+            }
+        ],
+        "answer_entity": "Publisher",
+        "negative_type": "sibling_relation",
+    }
+    candidates = candidate_specs(
+        {
+            "positive_path": positive,
+            "positive_answer_entity": "Writer",
+            "alternate_positive_paths": [alternate],
+            "negative_paths": [negative],
+        }
+    )
+
+    assert [candidate["is_positive"] for candidate in candidates] == [
+        True,
+        True,
+        False,
+    ]
+    assert candidates[-1]["negative_type"] == "sibling_relation"
+    assert candidates[-1]["answer_entity"] == "Publisher"
+
+
+def test_comparator_input_ablations_include_only_requested_channels() -> None:
+    question = "Who wrote the book?"
+    generated = "Which person authored the book?"
+    path = "Book --author--> Person"
+
+    question_generated = comparator_input_text(
+        question, generated, path, "question_generated"
+    )
+    assert generated in question_generated
+    assert path not in question_generated
+
+    question_path = comparator_input_text(
+        question, generated, path, "question_path"
+    )
+    assert generated not in question_path
+    assert path in question_path
+
+    all_channels = comparator_input_text(
+        question, generated, path, "question_generated_path"
+    )
+    assert question in all_channels
+    assert generated in all_channels
+    assert path in all_channels
+
+
+def test_comparator_path_serialization_includes_endpoint_and_direction() -> None:
+    text = comparator_path_text(
+        {
+            "anchor": "Harry Potter",
+            "anchor_type": "book",
+            "answer_type": "person",
+            "hops": [
+                {
+                    "relation": "author",
+                    "direction": "forward",
+                    "source_type": "book",
+                    "target_type": "person",
+                }
+            ],
+        },
+        "J. K. Rowling",
+    )
+
+    assert 'relation="author"' in text
+    assert "START:subject" in text
+    assert "Candidate endpoint: J. K. Rowling" in text
+
+
+def test_listwise_loss_assigns_probability_to_any_valid_path() -> None:
+    logits = torch.tensor([2.0, 1.0, 0.0, -1.0, 1.0], requires_grad=True)
+    labels = torch.tensor([True, True, False, True, False])
+    loss = listwise_multi_positive_loss(logits, labels, [(0, 3), (3, 5)])
+    expected = (
+        torch.logsumexp(logits[:3], dim=0)
+        - torch.logsumexp(logits[:2], dim=0)
+        + torch.logsumexp(logits[3:], dim=0)
+        - logits[3]
+    ) / 2
+
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[2] > 0
+    assert logits.grad[4] > 0
+
+
+def test_cross_encoder_pipeline_requires_a_comparator_checkpoint(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="requires comparator_model"):
+        run_verifier_pipeline(
+            tmp_path / "questions.json",
+            tmp_path / "graphs.jsonl",
+            "generator",
+            "retriever",
+            tmp_path / "output",
+            limit=1,
+            comparison_mode="cross_encoder",
+        )

@@ -4,6 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
+from .comparator import (
+    COMPARATOR_INPUT_MODES,
+    evaluate_comparator,
+    materialize_comparator_data,
+    train_comparator,
+)
 from .data import prepare_dataset
 from .dataset_builder import build_naturalized_dataset
 from .evaluate import evaluate, evaluate_gold_generation
@@ -150,6 +156,50 @@ def build_parser() -> argparse.ArgumentParser:
     generalize.add_argument("--batch-size", type=int, default=32)
     generalize.add_argument("--device", default="auto")
 
+    prepare_comparator = subparsers.add_parser(
+        "prepare-comparator",
+        help="materialize generated questions and hard-negative candidate sets",
+    )
+    prepare_comparator.add_argument("--data", type=Path, required=True)
+    prepare_comparator.add_argument("--generator", required=True)
+    prepare_comparator.add_argument("--output", type=Path, required=True)
+    prepare_comparator.add_argument("--batch-size", type=int, default=8)
+    prepare_comparator.add_argument("--device", default="auto")
+    prepare_comparator.add_argument("--limit", type=int)
+
+    train_comparator_parser = subparsers.add_parser(
+        "train-comparator",
+        help="train a listwise cross-encoder over path candidate sets",
+    )
+    train_comparator_parser.add_argument("--data", type=Path, required=True)
+    train_comparator_parser.add_argument("--output", type=Path, required=True)
+    train_comparator_parser.add_argument(
+        "--base-model", default="microsoft/deberta-v3-base"
+    )
+    train_comparator_parser.add_argument(
+        "--input-mode",
+        choices=COMPARATOR_INPUT_MODES,
+        default="question_generated_path",
+    )
+    train_comparator_parser.add_argument("--epochs", type=int, default=4)
+    train_comparator_parser.add_argument("--batch-size", type=int, default=4)
+    train_comparator_parser.add_argument("--learning-rate", type=float, default=2e-5)
+    train_comparator_parser.add_argument("--device", default="auto")
+    train_comparator_parser.add_argument("--limit", type=int)
+
+    evaluate_comparator_parser = subparsers.add_parser(
+        "evaluate-comparator",
+        help="evaluate a cross-encoder and optional cosine baseline",
+    )
+    evaluate_comparator_parser.add_argument("--data", type=Path, required=True)
+    evaluate_comparator_parser.add_argument("--model", required=True)
+    evaluate_comparator_parser.add_argument("--output", type=Path, required=True)
+    evaluate_comparator_parser.add_argument("--split", default="dev")
+    evaluate_comparator_parser.add_argument("--semantic-model")
+    evaluate_comparator_parser.add_argument("--batch-size", type=int, default=8)
+    evaluate_comparator_parser.add_argument("--device", default="auto")
+    evaluate_comparator_parser.add_argument("--limit", type=int)
+
     repair_data = subparsers.add_parser(
         "repair-training-data",
         help="add direction contrasts and remove malformed generated questions",
@@ -266,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--limit", type=int, default=25)
     verify.add_argument("--device", default="auto")
+    verify.add_argument(
+        "--comparison-mode",
+        choices=("cosine", "cross_encoder"),
+        default="cosine",
+    )
+    verify.add_argument(
+        "--comparator-model",
+        help="trained comparator checkpoint; required for cross_encoder mode",
+    )
 
     retrieve = subparsers.add_parser(
         "retrieve", help="retrieve a high-recall path set and union subgraph with SRTK"
@@ -375,6 +434,47 @@ def main() -> None:
         )
         print(json.dumps(metrics["training_relative_coverage"], indent=2))
         print(f"Wrote faithful generalization evaluation to {args.output}")
+    elif args.command == "prepare-comparator":
+        manifest = materialize_comparator_data(
+            args.data,
+            args.generator,
+            args.output,
+            batch_size=args.batch_size,
+            device_name=args.device,
+            limit=args.limit,
+        )
+        print(json.dumps(manifest["splits"], indent=2))
+        print(f"Wrote comparator candidate sets to {args.output}")
+    elif args.command == "train-comparator":
+        run = train_comparator(
+            args.data,
+            args.output,
+            args.base_model,
+            args.input_mode,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            device_name=args.device,
+            limit=args.limit,
+        )
+        print(
+            f"Best development R@1={run['best_dev_recall_at_1']:.3f} "
+            f"MRR={run['best_dev_mrr']:.3f}"
+        )
+        print(f"Saved comparator to {args.output / 'model'}")
+    elif args.command == "evaluate-comparator":
+        metrics = evaluate_comparator(
+            args.data,
+            args.model,
+            args.output,
+            semantic_model=args.semantic_model,
+            split=args.split,
+            batch_size=args.batch_size,
+            device_name=args.device,
+            limit=args.limit,
+        )
+        print(json.dumps(metrics, indent=2))
+        print(f"Wrote comparator evaluation to {args.output}")
     elif args.command == "repair-training-data":
         manifest = repair_faithful_corpus(args.data, args.output, args.glossary)
         print(json.dumps(manifest["counts"], indent=2))
@@ -457,6 +557,8 @@ def main() -> None:
             args.output,
             args.limit,
             args.device,
+            args.comparison_mode,
+            args.comparator_model,
         )
         print(
             f"Path recall@100={metrics['proposal_recall']['recall_at_100']:.3f} "

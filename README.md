@@ -193,3 +193,66 @@ The July 2026 build accepted 1,979 validated rows. GPT-4o mini verified the firs
 batches. When the API account reached its billing limit, a calibrated local Qwen 3 8B verifier
 completed the fifth batch; its model and pilot agreement are recorded in the manifest. See
 `docs/inverse_verifier_generation_report.md` for the corpus audit and remaining limitations.
+
+## Trainable Path Comparator
+
+The inverse generator and final comparator are separate modules. The generator
+verbalizes each executable path. The comparator receives a whole candidate set
+for one original question and learns to assign probability to any valid path
+with a listwise multi-positive softmax loss.
+
+First materialize the questions produced by the frozen generator. This prevents
+the comparator from training on oracle paraphrases that it would not observe at
+inference:
+
+```bash
+python3 -m inverse_verifier prepare-comparator \
+  --data runs/inverse_verifier/naturalized_dataset_3000_executable_direction_v1 \
+  --generator runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --output runs/inverse_verifier/comparator_data_qwen25_v1 \
+  --batch-size 8 \
+  --device cuda
+```
+
+Train the full comparison input with DeBERTa:
+
+```bash
+python3 -m inverse_verifier train-comparator \
+  --data runs/inverse_verifier/comparator_data_qwen25_v1 \
+  --base-model microsoft/deberta-v3-base \
+  --input-mode question_generated_path \
+  --output runs/inverse_verifier/deberta_comparator_qgp_v1 \
+  --device cuda
+```
+
+The two input ablations use the same command with `question_generated` or
+`question_path`. Evaluate a trained comparator against the unchanged cosine
+baseline:
+
+```bash
+python3 -m inverse_verifier evaluate-comparator \
+  --data runs/inverse_verifier/comparator_data_qwen25_v1 \
+  --model runs/inverse_verifier/deberta_comparator_qgp_v1/model \
+  --semantic-model BAAI/bge-small-en-v1.5 \
+  --output runs/inverse_verifier/deberta_comparator_qgp_v1_eval \
+  --device cuda
+```
+
+Candidate path serialization includes the start entity, ordered relation
+traversals and directions, intermediate and answer types, and the concrete
+endpoint when available. Relation proposal and inverse generation are not
+changed by comparator training.
+
+Use the trained comparator in the retrieval pipeline with:
+
+```bash
+python3 -m inverse_verifier verify \
+  --model runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --comparison-mode cross_encoder \
+  --comparator-model runs/inverse_verifier/deberta_comparator_qgp_v1/model \
+  --output runs/inverse_verifier/full_pipeline_cross_encoder_v1
+```
+
+Cross-encoder mode scores every generated candidate up to the existing
+verification cap before selecting an answer. It does not use the cosine
+threshold, because raw classifier logits are not calibrated to that threshold.
