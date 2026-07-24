@@ -65,6 +65,7 @@ from inverse_verifier.comparator import (
     comparator_input_text,
     comparator_path_text,
     listwise_multi_positive_loss,
+    materialize_comparator_data,
 )
 from inverse_verifier.selector import run_verifier_pipeline
 
@@ -1604,3 +1605,59 @@ def test_cross_encoder_pipeline_requires_a_comparator_checkpoint(
             limit=1,
             comparison_mode="cross_encoder",
         )
+
+
+def test_comparator_materializes_existing_heldout_predictions(
+    tmp_path: Path,
+) -> None:
+    generator = tmp_path / "generator"
+    generator.mkdir()
+    (generator / "relation_glossary.json").write_text("{}", encoding="utf-8")
+    predictions = tmp_path / "predictions.jsonl"
+    path = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "kg": "test",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    predictions.write_text(
+        json.dumps(
+            {
+                "slice": "unseen_composition",
+                "example_id": "example-1",
+                "question": "Who wrote Book?",
+                "kg": "test",
+                "candidates": [
+                    {
+                        "category": "positive",
+                        "is_positive": True,
+                        "generated_question": "Who authored Book?",
+                        "path": path,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "materialized"
+    manifest = materialize_comparator_data(
+        predictions,
+        str(generator),
+        output,
+    )
+    row = json.loads((output / "unseen_composition.jsonl").read_text())
+
+    assert manifest["source_kind"] == "existing_generator_predictions"
+    assert row["original_question"] == "Who wrote Book?"
+    assert row["candidates"][0]["negative_type"] == "positive"
+    assert "author" in row["candidates"][0]["path_text"]

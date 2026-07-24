@@ -13,7 +13,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from .data import ENTITY_PLACEHOLDER, read_jsonl, render_path
+from .data import (
+    ENTITY_PLACEHOLDER,
+    load_relation_glossary,
+    read_jsonl,
+    render_path,
+)
 from .metrics import ranking_metrics
 from .model import best_device, generate_joint_questions, load_seq2seq
 
@@ -134,6 +139,75 @@ def materialize_comparator_data(
 ) -> dict[str, Any]:
     """Generate the questions the comparator will actually observe at inference."""
     output.mkdir(parents=True, exist_ok=True)
+    if source.is_file():
+        glossary = load_relation_glossary(
+            Path(generator_model) / "relation_glossary.json"
+        )
+        rows_by_slice: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in read_jsonl(source):
+            candidates = []
+            for candidate in row["candidates"]:
+                path = candidate["path"]
+                answer_entity = (
+                    candidate.get("answer_entity")
+                    or path.get("answer_entity")
+                    or ""
+                )
+                candidates.append(
+                    {
+                        "path": path,
+                        "is_positive": candidate["is_positive"],
+                        "negative_type": candidate.get(
+                            "negative_type",
+                            candidate.get("category", "negative"),
+                        ),
+                        "answer_entity": answer_entity,
+                        "generated_question": candidate["generated_question"],
+                        "path_text": comparator_path_text(
+                            path, answer_entity, glossary
+                        ),
+                    }
+                )
+            rows_by_slice[row.get("slice", "test")].append(
+                {
+                    "example_id": row.get("example_id", ""),
+                    "kg": row.get("kg", ""),
+                    "original_question": row.get(
+                        "question", row.get("original_question", "")
+                    ),
+                    "candidates": candidates,
+                }
+            )
+        manifest: dict[str, Any] = {
+            "generator_model": generator_model,
+            "source": str(source),
+            "source_kind": "existing_generator_predictions",
+            "splits": {},
+        }
+        for split, rows in sorted(rows_by_slice.items()):
+            destination = output / f"{split}.jsonl"
+            with destination.open("w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            manifest["splits"][split] = {
+                "candidate_sets": len(rows),
+                "candidates": sum(len(row["candidates"]) for row in rows),
+                "positive_candidates": sum(
+                    candidate["is_positive"]
+                    for row in rows
+                    for candidate in row["candidates"]
+                ),
+            }
+            print(
+                f"Materialized {split}: {len(rows)} sets / "
+                f"{manifest['splits'][split]['candidates']} candidates",
+                flush=True,
+            )
+        (output / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        return manifest
+
     model, tokenizer, device = load_seq2seq(generator_model, device_name)
     glossary = getattr(model, "_relation_glossary", None)
     manifest: dict[str, Any] = {

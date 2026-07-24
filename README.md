@@ -256,3 +256,15 @@ python3 -m inverse_verifier verify \
 Cross-encoder mode scores every generated candidate up to the existing
 verification cap before selecting an answer. It does not use the cosine
 threshold, because raw classifier logits are not calibrated to that threshold.
+
+For held-out generator evaluations that already contain generated candidate
+questions, pass their `predictions.jsonl` directly to `prepare-comparator`.
+The command preserves each recorded evaluation slice and does not regenerate
+questions:
+
+```bash
+python3 -m inverse_verifier prepare-comparator \
+  --data runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1_kqa_eval/predictions.jsonl \
+  --generator runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --output runs/inverse_verifier/comparator_kqa_heldout_qwen25_v1
+```
