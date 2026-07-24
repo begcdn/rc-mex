@@ -69,6 +69,7 @@ from inverse_verifier.comparator import (
 )
 from inverse_verifier.selector import run_verifier_pipeline
 from inverse_verifier.semantic_benchmark import (
+    JUDGE_SYSTEM_PROMPT,
     apply_semantic_labels,
     parse_semantic_results,
     semantic_judge_record,
@@ -1688,6 +1689,8 @@ def test_semantic_judge_sees_questions_but_not_path_labels() -> None:
     assert "SECRET PATH" not in prompt
     assert "wrong_direction" not in prompt
     assert '"is_positive"' not in prompt
+    assert "signed to label X" in JUDGE_SYSTEM_PROMPT
+    assert 'who resides or has resided in X' in JUDGE_SYSTEM_PROMPT
 
 
 def test_semantic_labels_allow_equivalent_wrong_paths_and_multiple_positives() -> None:

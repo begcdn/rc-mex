@@ -13,26 +13,43 @@ from .openai_naturalize import (
 )
 
 
-JUDGE_SYSTEM_PROMPT = """You are labeling semantic equivalence for a question-comparison benchmark.
+JUDGE_SYSTEM_PROMPT = """You are labeling strict semantic equivalence for a question-comparison benchmark.
 
 For every candidate, decide whether it asks for exactly the same answer set as the original question.
 Equivalent wording may use different syntax or explicitly unfold a multi-hop relation.
 
-Mark false if any meaningful difference changes the requested answers, including:
+Before deciding, compare:
+1. the requested answer role and its semantic type;
+2. every relation and its subject/object direction;
+3. every intermediate dependency;
+4. every modifier, restriction, tense, and quantifier.
+
+Mark false if any difference could change the answer set, including:
 - reversed subject/object or relation direction;
 - a missing or extra condition/hop;
 - a different relation;
 - a different order or intermediate dependency;
 - a different requested answer role or answer type.
+- broader or narrower wording;
+- present tense versus "has ever";
+- a specific relation weakened to generic association.
+
+Examples of non-equivalence:
+- "signed to label X" is not equivalent to "associated with label X";
+- "which movie" is not equivalent to "which visual artwork";
+- "who resides in X" is not equivalent to "who resides or has resided in X".
 
 Judge only the text. You are not shown a knowledge-graph path and must not infer one.
 If two candidate questions express the same intent, both may be true.
-If a candidate is awkward but has one unambiguous interpretation, judge that interpretation.
+Do not repair a candidate using the original question or assume a dataset-specific
+meaning that is not expressed in its words. If awkward wording has one literal,
+unambiguous interpretation, judge that literal interpretation.
 
 Return JSON with an items array. Each item must contain:
 id, equivalent (boolean), issue, confidence (0 to 1), and reason.
 Use issue values: equivalent, direction, missing_constraint, extra_constraint,
-wrong_relation, wrong_order, wrong_answer_role, ambiguous, or other."""
+wrong_relation, wrong_order, wrong_answer_role, broader_or_narrower,
+tense_or_quantifier, ambiguous, or other."""
 
 
 def semantic_judge_record(
