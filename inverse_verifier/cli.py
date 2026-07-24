@@ -199,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--objective",
         choices=(
+            "causal_inverse",
             "faithful_inverse",
             "type_aware_generator",
             "inverse",
@@ -408,7 +409,9 @@ def main() -> None:
             objective=args.objective,
             relation_glossary_path=args.relation_glossary,
         )
-        if args.objective == "type_aware_generator":
+        if args.objective == "causal_inverse":
+            print(f"Best development token NLL: {run['best_dev_token_nll']:.3f}")
+        elif args.objective == "type_aware_generator":
             print(
                 "Best development type compatibility accuracy: "
                 f"{run['best_dev_pair_accuracy']:.3f}"

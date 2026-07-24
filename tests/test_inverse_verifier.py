@@ -56,6 +56,10 @@ from inverse_verifier.dataset_builder import (
     validate_glossary,
     validation_rejection,
 )
+from inverse_verifier.causal_generator import (
+    CausalInverseDataset,
+    flatten_path_question_pairs,
+)
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -1130,6 +1134,99 @@ def test_grounded_render_path_fallback_preserves_full_relation_identity() -> Non
 
     assert "book / book subject / works" in rendered
     assert "Relation ID: book.book_subject.works" in rendered
+
+
+def test_causal_training_flattens_each_path_with_its_own_question() -> None:
+    positive = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "kg": "test",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    negative = {
+        **positive,
+        "hops": [{**positive["hops"][0], "direction": "backward"}],
+        "question": "Which book did [ENTITY] write?",
+        "negative_type": "executable_opposite_direction",
+    }
+
+    pairs = flatten_path_question_pairs(
+        [
+            {
+                "question": "Who wrote [ENTITY]?",
+                "positive_path": positive,
+                "negative_paths": [negative],
+            }
+        ]
+    )
+
+    assert [pair["question"] for pair in pairs] == [
+        "Who wrote [ENTITY]?",
+        "Which book did [ENTITY] write?",
+    ]
+
+
+def test_causal_dataset_masks_prompt_and_uses_grounded_semantics() -> None:
+    class RecordingTokenizer:
+        eos_token = "<eos>"
+
+        def __init__(self) -> None:
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            return "formatted prompt"
+
+        def __call__(self, text, **kwargs):
+            if text == "formatted prompt":
+                return {"input_ids": [10, 11, 12]}
+            assert text == "Who wrote [ENTITY]?<eos>"
+            return {"input_ids": [20, 21]}
+
+    tokenizer = RecordingTokenizer()
+    path = {
+        "anchor": "Book",
+        "anchor_type": "book",
+        "answer_type": "person",
+        "kg": "test",
+        "hops": [
+            {
+                "relation": "author",
+                "direction": "forward",
+                "source_type": "book",
+                "target_type": "person",
+            }
+        ],
+    }
+    glossary = {
+        "test::author": {
+            "status": "semantic",
+            "description": "Connects a written work to its author.",
+            "subject_role": "written work",
+            "object_role": "author",
+            "fact_template": "{subject} was written by {object}.",
+        }
+    }
+
+    item = CausalInverseDataset(
+        [{"path": path, "question": "Who wrote [ENTITY]?"}],
+        tokenizer,
+        glossary,
+    )[0]
+
+    assert item["input_ids"] == [10, 11, 12, 20, 21]
+    assert item["labels"] == [-100, -100, -100, 20, 21]
+    assert "START (type: book; role: written work) was written by ANSWER" in (
+        tokenizer.messages[1]["content"]
+    )
 
 
 def test_direction_repair_excludes_symmetric_relations() -> None:

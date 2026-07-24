@@ -727,6 +727,24 @@ def train_model(
     objective: str = "inverse",
     relation_glossary_path: Path | None = None,
 ) -> dict[str, Any]:
+    if objective == "causal_inverse":
+        if relation_glossary_path is None:
+            raise ValueError("causal_inverse requires --relation-glossary")
+        from .causal_generator import train_causal_inverse_generator
+
+        return train_causal_inverse_generator(
+            train_path,
+            dev_path,
+            output,
+            base_model,
+            relation_glossary_path,
+            epochs,
+            batch_size,
+            learning_rate,
+            seed,
+            device_name,
+            limit,
+        )
     torch.manual_seed(seed)
     random.seed(seed)
     device = best_device(device_name)
@@ -1106,6 +1124,17 @@ def generate_joint_questions(
     max_new_tokens: int = 64,
     relation_glossary: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
+    if getattr(model, "_inverse_causal", False):
+        from .causal_generator import generate_causal_questions
+
+        return generate_causal_questions(
+            model,
+            tokenizer,
+            paths,
+            device,
+            batch_size,
+            max_new_tokens,
+        )
     generations: list[str] = []
     model.eval()
     backbone = model.generator if isinstance(model, JointInverseRanker) else model
@@ -1144,6 +1173,17 @@ def score_question_likelihood(
     relation_glossary: dict[str, dict[str, Any]] | None = None,
 ) -> list[float]:
     """Return length-normalized log-likelihood of each question given its path."""
+    if getattr(model, "_inverse_causal", False):
+        from .causal_generator import score_causal_question_likelihood
+
+        return score_causal_question_likelihood(
+            model,
+            tokenizer,
+            questions,
+            paths,
+            device,
+            batch_size,
+        )
     scores: list[float] = []
     model.eval()
     backbone = model.generator if isinstance(model, JointInverseRanker) else model
@@ -1334,6 +1374,11 @@ def type_compatibility_scores(
 
 def load_seq2seq(model_path: str, device_name: str = "auto") -> tuple[Any, Any, torch.device]:
     device = best_device(device_name)
+    if (Path(model_path) / "adapter_config.json").exists():
+        from .causal_generator import load_causal_inverse_generator
+
+        model, tokenizer = load_causal_inverse_generator(model_path, device)
+        return model, tokenizer, device
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     model = load_generator_backbone(model_path).to(device)
     return model, tokenizer, device
