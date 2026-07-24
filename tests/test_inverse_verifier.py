@@ -69,9 +69,13 @@ from inverse_verifier.comparator import (
 )
 from inverse_verifier.selector import run_verifier_pipeline
 from inverse_verifier.semantic_benchmark import (
+    ADJUDICATOR_SYSTEM_PROMPT,
     JUDGE_SYSTEM_PROMPT,
+    apply_adjudication,
     apply_semantic_labels,
     parse_semantic_results,
+    select_adjudication_candidates,
+    semantic_adjudication_record,
     semantic_judge_record,
 )
 
@@ -1795,3 +1799,93 @@ def test_semantic_result_parser_keeps_candidate_ids_scoped_by_question(
     assert not errors
     assert judgments["q1"]["items"][0]["equivalent"] is True
     assert judgments["q2"]["items"][0]["equivalent"] is False
+
+
+def test_semantic_adjudicator_is_difference_first_and_path_blind() -> None:
+    item = {
+        "example_id": "kqa:1",
+        "candidate_index": 2,
+        "original_question": "Who is Ada's partner?",
+        "candidate_question": "Who is partnered with Ada?",
+        "first_label": True,
+        "path_is_positive": False,
+        "negative_type": "wrong_direction",
+        "selection_reason": "path_semantic_disagreement",
+    }
+
+    record = semantic_adjudication_record(item, "judge")
+    prompt = record["body"]["messages"][1]["content"]
+
+    assert "Who is Ada's partner?" in prompt
+    assert "Who is partnered with Ada?" in prompt
+    assert "wrong_direction" not in prompt
+    assert "path_is_positive" not in prompt
+    assert "symmetric relation" in ADJUDICATOR_SYSTEM_PROMPT
+    assert "timeless relation" in ADJUDICATOR_SYSTEM_PROMPT
+    assert "Headquarters location" in ADJUDICATOR_SYSTEM_PROMPT
+
+
+def test_adjudication_selection_includes_disagreements_and_samples_agreements() -> None:
+    rows = [
+        {
+            "example_id": "q1",
+            "original_question": "Who wrote Book?",
+            "candidates": [
+                {
+                    "generated_question": "Who authored Book?",
+                    "is_positive": True,
+                    "path_is_positive": False,
+                    "negative_type": "wrong_direction",
+                    "semantic_judgment": {"issue": "equivalent"},
+                },
+                {
+                    "generated_question": "Who published Book?",
+                    "is_positive": False,
+                    "path_is_positive": False,
+                    "negative_type": "wrong_relation",
+                    "semantic_judgment": {"issue": "wrong_relation"},
+                },
+            ],
+        }
+    ]
+
+    selected = select_adjudication_candidates(rows, agreement_sample=1, seed=4)
+
+    assert len(selected) == 2
+    assert {
+        item["selection_reason"] for item in selected
+    } == {"path_semantic_disagreement", "agreement_sample"}
+
+
+def test_disputed_adjudication_excludes_whole_candidate_set() -> None:
+    rows = [
+        {
+            "example_id": "q1",
+            "original_question": "Which event followed X?",
+            "candidates": [
+                {
+                    "generated_question": "Which event follows X?",
+                    "is_positive": False,
+                    "path_is_positive": True,
+                    "semantic_judgment": {"issue": "tense_or_quantifier"},
+                }
+            ],
+        }
+    ]
+    selected = select_adjudication_candidates(rows, agreement_sample=0)
+    judgments = {
+        "q1-candidate-0": {
+            "equivalent": True,
+            "issue": "equivalent",
+            "differences": [],
+        }
+    }
+
+    clean, disputed, audit, summary = apply_adjudication(
+        rows, selected, judgments
+    )
+
+    assert not clean
+    assert disputed[0]["candidates"][0]["adjudication_disputed"] is True
+    assert audit[0]["judges_agree"] is False
+    assert summary["candidate_sets_excluded_as_disputed"] == 1

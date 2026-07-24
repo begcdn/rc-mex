@@ -17,7 +17,10 @@ from .generalization import evaluate_faithful_generalization
 from .model import train_model
 from .openai_naturalize import run_openai_naturalization
 from .selector import run_verifier_pipeline
-from .semantic_benchmark import build_semantic_benchmark
+from .semantic_benchmark import (
+    adjudicate_semantic_benchmark,
+    build_semantic_benchmark,
+)
 from .retrieval import SRTK_SCORER, run_retrieval_probe
 from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
 from .training_data import (
@@ -210,6 +213,17 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_benchmark.add_argument("--model", default="gpt-4o-2024-11-20")
     semantic_benchmark.add_argument("--workers", type=int, default=3)
     semantic_benchmark.add_argument("--limit", type=int)
+
+    semantic_adjudication = subparsers.add_parser(
+        "adjudicate-semantic-benchmark",
+        help="independently audit disputed semantic-equivalence labels",
+    )
+    semantic_adjudication.add_argument("--data", type=Path, required=True)
+    semantic_adjudication.add_argument("--output", type=Path, required=True)
+    semantic_adjudication.add_argument("--model", default="gpt-4o-2024-11-20")
+    semantic_adjudication.add_argument("--workers", type=int, default=3)
+    semantic_adjudication.add_argument("--agreement-sample", type=int, default=30)
+    semantic_adjudication.add_argument("--seed", type=int, default=17)
 
     repair_data = subparsers.add_parser(
         "repair-training-data",
@@ -496,6 +510,17 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Wrote semantic comparator benchmark to {args.output}")
+    elif args.command == "adjudicate-semantic-benchmark":
+        manifest = adjudicate_semantic_benchmark(
+            args.data,
+            args.output,
+            model=args.model,
+            workers=args.workers,
+            agreement_sample=args.agreement_sample,
+            seed=args.seed,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Wrote adjudicated semantic benchmark to {args.output}")
     elif args.command == "repair-training-data":
         manifest = repair_faithful_corpus(args.data, args.output, args.glossary)
         print(json.dumps(manifest["counts"], indent=2))
