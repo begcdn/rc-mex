@@ -18,6 +18,7 @@ from .data import (
     load_relation_glossary,
     read_jsonl,
     render_path,
+    unlabeled_answer_count,
 )
 from .metrics import ranking_metrics
 from .model import best_device, generate_joint_questions, load_seq2seq
@@ -27,8 +28,11 @@ COMPARATOR_INPUT_MODES = (
     "question_generated",
     "question_path",
     "question_generated_path",
+    "question_generated_answer",
+    "question_generated_path_answer",
 )
 MAX_SEQUENCE_LENGTH = 512
+ANSWER_SAMPLE_CAP = 8
 
 
 def _candidate_key(path: dict[str, Any]) -> str:
@@ -94,19 +98,57 @@ def comparator_path_text(
     return f"{text}\nCandidate endpoint: {endpoint}"
 
 
+def candidate_answers(candidate: dict[str, Any], path: dict[str, Any]) -> list[str]:
+    """Endpoint entities for a candidate, falling back to the single stored endpoint.
+
+    Synthetic training rows keep only one endpoint per path, so answer evidence is
+    thin there; executed candidates carry the full set.
+    """
+    answers = candidate.get("answers")
+    if answers:
+        return list(answers)
+    single = candidate.get("answer_entity") or path.get("answer_entity") or ""
+    return [single] if single.strip() else []
+
+
+def comparator_answer_text(
+    answers: list[str],
+    answer_type: str | None = None,
+    unlabeled_count: int = 0,
+) -> str:
+    """Describe the entities a path actually returns.
+
+    A path that answers "who is X married to" with 73 locations is wrong however
+    well its question reads, and a path whose endpoints are all unlabeled machine
+    ids cannot answer any natural-language question. Both facts come from executing
+    the path, never from gold.
+    """
+    labeled = [answer for answer in answers if answer.strip()]
+    sample = "; ".join(labeled[:ANSWER_SAMPLE_CAP]) or "none"
+    return (
+        f"type: {answer_type or 'entity'}\n"
+        f"count: {len(labeled)}\n"
+        f"unlabeled ids: {unlabeled_count} of {len(labeled)}\n"
+        f"sample: {sample}"
+    )
+
+
 def comparator_input_text(
     original_question: str,
     generated_question: str,
     path_text: str,
     mode: str,
+    answer_text: str = "",
 ) -> str:
     if mode not in COMPARATOR_INPUT_MODES:
         raise ValueError(f"unknown comparator input mode: {mode}")
     sections = [f"[ORIGINAL QUESTION]\n{original_question}"]
-    if mode in {"question_generated", "question_generated_path"}:
+    if mode != "question_path":
         sections.append(f"[GENERATED QUESTION]\n{generated_question}")
-    if mode in {"question_path", "question_generated_path"}:
+    if mode in {"question_path", "question_generated_path", "question_generated_path_answer"}:
         sections.append(f"[CANDIDATE PATH]\n{path_text}")
+    if mode.endswith("_answer"):
+        sections.append(f"[CANDIDATE ANSWERS]\n{answer_text or 'unknown'}")
     return "\n\n".join(sections)
 
 
@@ -153,6 +195,7 @@ def materialize_comparator_data(
                     or path.get("answer_entity")
                     or ""
                 )
+                answers = candidate_answers(candidate, path)
                 candidates.append(
                     {
                         "path": path,
@@ -165,6 +208,11 @@ def materialize_comparator_data(
                         "generated_question": candidate["generated_question"],
                         "path_text": comparator_path_text(
                             path, answer_entity, glossary
+                        ),
+                        "answer_text": comparator_answer_text(
+                            answers,
+                            path.get("answer_type"),
+                            unlabeled_answer_count(answers),
                         ),
                     }
                 )
@@ -249,6 +297,7 @@ def materialize_comparator_data(
                 generated_question = generated[cursor]
                 cursor += 1
                 category_counts[candidate["negative_type"]] += 1
+                answers = candidate_answers(candidate, candidate["path"])
                 output_candidates.append(
                     {
                         **candidate,
@@ -257,6 +306,11 @@ def materialize_comparator_data(
                             candidate["path"],
                             candidate["answer_entity"],
                             glossary,
+                        ),
+                        "answer_text": comparator_answer_text(
+                            answers,
+                            candidate["path"].get("answer_type"),
+                            unlabeled_answer_count(answers),
                         ),
                     }
                 )
@@ -323,6 +377,7 @@ class ComparatorCollator:
                         candidate["generated_question"],
                         candidate["path_text"],
                         self.mode,
+                        candidate.get("answer_text", ""),
                     )
                 )
                 labels.append(candidate["is_positive"])

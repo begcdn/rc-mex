@@ -19,6 +19,14 @@ KQA_CHAIN_SIGNATURES = {
 
 ENTITY_PLACEHOLDER = "[ENTITY]"
 
+# Freebase machine ids (``m.02x``, ``g.11b``) name mediator/CVT nodes that carry no
+# surface label, so they can never be the answer to a natural-language question.
+UNLABELED_ID = re.compile(r"^[a-z]\.[0-9a-z_]+$")
+
+
+def unlabeled_answer_count(answers: Iterable[str]) -> int:
+    return sum(bool(UNLABELED_ID.match(answer.strip())) for answer in answers)
+
 
 @dataclass(frozen=True)
 class Hop:
