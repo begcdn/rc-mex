@@ -61,8 +61,10 @@ from inverse_verifier.causal_generator import (
     flatten_path_question_pairs,
 )
 from inverse_verifier.comparator import (
+    ANSWER_CHANNELS,
     candidate_answers,
     candidate_specs,
+    comparator_answer_evidence,
     comparator_answer_text,
     comparator_input_text,
     comparator_path_text,
@@ -2019,34 +2021,47 @@ def test_evaluation_subset_coverage_reports_constraint_exclusions(tmp_path) -> N
     assert coverage["excluded_by_reason"] == {"constraints": 1, "order": 1}
 
 
-def test_comparator_answer_evidence_modes_carry_endpoint_shape() -> None:
-    answers = comparator_answer_text(
-        ["Jamaican English", "Jamaican Creole English Language"], "human language", 0
+def test_answer_channels_stay_separable_so_labels_cannot_leak_silently() -> None:
+    evidence = comparator_answer_evidence(
+        ["Vienna"], "city", 0
     )
-    assert "count: 2" in answers
-    assert "type: human language" in answers
-    assert "unlabeled ids: 0 of 2" in answers
+    assert evidence == {"type": "city", "count": 1, "unlabeled": 0, "labels": ["Vienna"]}
 
+    # The type channel must not carry the answer name: a comparator shown "Vienna"
+    # for "capital of Austria?" can score the pair from world knowledge without
+    # verifying the path at all, which would change the hypothesis under test.
+    type_only = comparator_answer_text(evidence, ANSWER_CHANNELS["question_generated_answer_type"])
+    assert type_only == "type: city"
+    assert "Vienna" not in type_only
+
+    count_only = comparator_answer_text(evidence, ANSWER_CHANNELS["question_generated_answer_count"])
+    assert "count: 1" in count_only
+    assert "Vienna" not in count_only
+
+    labels_only = comparator_answer_text(evidence, ANSWER_CHANNELS["question_generated_answer_labels"])
+    assert "Vienna" in labels_only
+    assert "type:" not in labels_only
+
+    assert comparator_answer_text(evidence, ()) == ""
+
+
+def test_comparator_answer_modes_select_one_channel_each() -> None:
+    evidence = comparator_answer_evidence(["Jamaican English", "Jamaican Creole"], "human language", 0)
     text = comparator_input_text(
         "what language do they speak?",
         "Which language is spoken there?",
         "path",
-        "question_generated_answer",
-        answers,
+        "question_generated_answer_type",
+        comparator_answer_text(evidence, ANSWER_CHANNELS["question_generated_answer_type"]),
     )
     assert "[CANDIDATE ANSWERS]" in text
-    assert "count: 2" in text
+    assert "type: human language" in text
     assert "[CANDIDATE PATH]" not in text
-
-    with_path = comparator_input_text(
-        "q", "g", "path-text", "question_generated_path_answer", answers
-    )
-    assert "[CANDIDATE PATH]" in with_path
-    assert "[CANDIDATE ANSWERS]" in with_path
+    assert "Jamaican English" not in text
 
     # Existing modes must stay byte-identical so trained checkpoints keep working.
     assert "[CANDIDATE ANSWERS]" not in comparator_input_text(
-        "q", "g", "path-text", "question_generated", answers
+        "q", "g", "path-text", "question_generated", "type: x"
     )
 
 
@@ -2188,9 +2203,11 @@ def test_pipeline_reports_selection_ablation_and_full_candidate_log(
     assert variants["argmax"]["answer_exact_match"] == 0.0
     assert variants["argmax_filtered"]["answer_exact_match"] == 1.0
     assert variants["vote_filtered"]["answer_exact_match"] == 1.0
-    assert metrics["selection_policy"] == "vote_filtered"
-    assert metrics["answer_exact_match"] == 1.0
-    assert metrics["unanswerable_endpoint_selection_rate"] == 0.0
+    # argmax is primary, so the headline metric reflects the unfiltered incumbent
+    # and the filtered/voting gains show up only in the ablation block.
+    assert metrics["selection_policy"] == "argmax"
+    assert metrics["answer_exact_match"] == 0.0
+    assert metrics["unanswerable_endpoint_selection_rate"] == 1.0
     assert metrics["evaluation_subset"]["supported_questions"] == 1
 
     row = json.loads((output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()[0])

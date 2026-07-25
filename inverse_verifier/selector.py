@@ -11,7 +11,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from .comparator import (
-    comparator_answer_text,
+    comparator_answer_evidence,
     comparator_path_text,
     load_comparator,
     score_comparator_rows,
@@ -52,7 +52,11 @@ SELECTION_VARIANTS: dict[str, dict[str, bool]] = {
     "vote": {"endpoint_filter": False, "aggregate_answers": True},
     "vote_filtered": {"endpoint_filter": True, "aggregate_answers": True},
 }
-PRIMARY_SELECTION = "vote_filtered"
+# The incumbent policy stays primary so the headline metric remains the matched
+# baseline. The others are ablations until a run shows a general improvement:
+# summing exponentiated scores treats duplicated aliases and correlated routes as
+# independent evidence, which inflates mass without adding support.
+PRIMARY_SELECTION = "argmax"
 
 
 def has_answerable_endpoint(candidate: dict[str, Any]) -> bool:
@@ -351,7 +355,7 @@ def run_verifier_pipeline(
                                 ", ".join(family.get("answers", [])[:10]),
                                 getattr(generator, "_relation_glossary", None),
                             ),
-                            "answer_text": comparator_answer_text(
+                            "answer_evidence": comparator_answer_evidence(
                                 family.get("answers", []),
                                 family["path"].get("answer_type"),
                                 unlabeled_answer_count(family.get("answers", [])),

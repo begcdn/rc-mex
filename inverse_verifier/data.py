@@ -19,8 +19,12 @@ KQA_CHAIN_SIGNATURES = {
 
 ENTITY_PLACEHOLDER = "[ENTITY]"
 
-# Freebase machine ids (``m.02x``, ``g.11b``) name mediator/CVT nodes that carry no
-# surface label, so they can never be the answer to a natural-language question.
+# The general principle is that an answer entity must be nameable: a question cannot
+# be asking for something the graph cannot name. Detecting that is dataset-specific.
+# In these preprocessed neighborhoods, nodes surfaced as raw machine ids are ones
+# whose labels were not resolved, and gold answers are labels, so such endpoints are
+# unusable. This is a property of the preprocessing, NOT a fact about Freebase: an
+# ``m.``/``g.`` id names ordinary entities as well as mediator/CVT nodes.
 UNLABELED_ID = re.compile(r"^[a-z]\.[0-9a-z_]+$")
 
 

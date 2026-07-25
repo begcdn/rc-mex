@@ -28,11 +28,22 @@ COMPARATOR_INPUT_MODES = (
     "question_generated",
     "question_path",
     "question_generated_path",
-    "question_generated_answer",
-    "question_generated_path_answer",
+    # Answer evidence is split into separable channels rather than one bundle.
+    # Answer *labels* let the comparator answer from world knowledge ("capital of
+    # Austria?" / "Vienna") instead of verifying the path, which would silently
+    # change the hypothesis under test. Type and cardinality carry no such shortcut,
+    # so each channel must be ablated on its own.
+    "question_generated_answer_type",
+    "question_generated_answer_count",
+    "question_generated_answer_labels",
 )
 MAX_SEQUENCE_LENGTH = 512
 ANSWER_SAMPLE_CAP = 8
+ANSWER_CHANNELS = {
+    "question_generated_answer_type": ("type",),
+    "question_generated_answer_count": ("count",),
+    "question_generated_answer_labels": ("labels",),
+}
 
 
 def _candidate_key(path: dict[str, Any]) -> str:
@@ -111,26 +122,48 @@ def candidate_answers(candidate: dict[str, Any], path: dict[str, Any]) -> list[s
     return [single] if single.strip() else []
 
 
-def comparator_answer_text(
+def comparator_answer_evidence(
     answers: list[str],
     answer_type: str | None = None,
     unlabeled_count: int = 0,
-) -> str:
-    """Describe the entities a path actually returns.
+) -> dict[str, Any]:
+    """Structured evidence about what a path actually returns.
 
-    A path that answers "who is X married to" with 73 locations is wrong however
-    well its question reads, and a path whose endpoints are all unlabeled machine
-    ids cannot answer any natural-language question. Both facts come from executing
-    the path, never from gold.
+    Stored structured rather than pre-rendered so that every answer-channel
+    ablation reads the same materialized data instead of needing one corpus per
+    arm. Comes from executing the path, never from gold.
     """
     labeled = [answer for answer in answers if answer.strip()]
-    sample = "; ".join(labeled[:ANSWER_SAMPLE_CAP]) or "none"
-    return (
-        f"type: {answer_type or 'entity'}\n"
-        f"count: {len(labeled)}\n"
-        f"unlabeled ids: {unlabeled_count} of {len(labeled)}\n"
-        f"sample: {sample}"
-    )
+    return {
+        "type": answer_type or "entity",
+        "count": len(labeled),
+        "unlabeled": unlabeled_count,
+        "labels": labeled[:ANSWER_SAMPLE_CAP],
+    }
+
+
+def comparator_answer_text(
+    evidence: dict[str, Any],
+    channels: tuple[str, ...] = (),
+) -> str:
+    """Render only the answer channels a given input mode is allowed to see.
+
+    ``labels`` exposes a world-knowledge shortcut: a comparator shown "Vienna" for
+    "capital of Austria?" can score the pair without verifying anything about the
+    path. ``type`` and ``count`` carry no such shortcut, so the channels stay
+    separable and are never bundled into one mode.
+    """
+    lines = []
+    if "type" in channels:
+        lines.append(f"type: {evidence.get('type', 'entity')}")
+    if "count" in channels:
+        lines.append(f"count: {evidence.get('count', 0)}")
+        lines.append(
+            f"unlabeled ids: {evidence.get('unlabeled', 0)} of {evidence.get('count', 0)}"
+        )
+    if "labels" in channels:
+        lines.append("sample: " + ("; ".join(evidence.get("labels", [])) or "none"))
+    return "\n".join(lines)
 
 
 def comparator_input_text(
@@ -145,9 +178,9 @@ def comparator_input_text(
     sections = [f"[ORIGINAL QUESTION]\n{original_question}"]
     if mode != "question_path":
         sections.append(f"[GENERATED QUESTION]\n{generated_question}")
-    if mode in {"question_path", "question_generated_path", "question_generated_path_answer"}:
+    if mode in {"question_path", "question_generated_path"}:
         sections.append(f"[CANDIDATE PATH]\n{path_text}")
-    if mode.endswith("_answer"):
+    if mode in ANSWER_CHANNELS:
         sections.append(f"[CANDIDATE ANSWERS]\n{answer_text or 'unknown'}")
     return "\n\n".join(sections)
 
@@ -209,7 +242,7 @@ def materialize_comparator_data(
                         "path_text": comparator_path_text(
                             path, answer_entity, glossary
                         ),
-                        "answer_text": comparator_answer_text(
+                        "answer_evidence": comparator_answer_evidence(
                             answers,
                             path.get("answer_type"),
                             unlabeled_answer_count(answers),
@@ -307,7 +340,7 @@ def materialize_comparator_data(
                             candidate["answer_entity"],
                             glossary,
                         ),
-                        "answer_text": comparator_answer_text(
+                        "answer_evidence": comparator_answer_evidence(
                             answers,
                             candidate["path"].get("answer_type"),
                             unlabeled_answer_count(answers),
@@ -377,7 +410,10 @@ class ComparatorCollator:
                         candidate["generated_question"],
                         candidate["path_text"],
                         self.mode,
-                        candidate.get("answer_text", ""),
+                        comparator_answer_text(
+                            candidate.get("answer_evidence", {}),
+                            ANSWER_CHANNELS.get(self.mode, ()),
+                        ),
                     )
                 )
                 labels.append(candidate["is_positive"])

@@ -68,56 +68,55 @@ cannot.
 question actually says. A method that verifies meaning by reconstructing the
 question is therefore not structurally disqualified from handling them.
 
-## 4. Two classes, with different costs
+## 4. Selection cannot enforce a restriction (corrected)
 
-Classifying the 472 excluded questions by what would be needed to admit them:
+An earlier version of this document claimed that answer-node restrictions come
+"for free" because the comparator can see the answer type. **That was wrong**, and
+the error matters enough to record.
 
-| Class | Questions | % of test | What it needs |
-|---|---:|---:|---|
-| Supported today | 1,167 | 71.2% | — |
-| **A** answer-node restriction | 137 | 8.4% | answer typing; **no action-space change** |
-| **B** intermediate-node join | 147 | 9.0% | branched candidates + secondary entity linking |
-| **C** multi/value constraint | 16 | 1.0% | ranges, comparison operators |
-| Other (>2 hops, `Order`, incomplete) | 172 | 10.5% | out of scope for this design |
+Selecting a path chooses among denotations; it cannot subset one. If a question
+asks for basketball teams and the best available path returns every team the
+athlete played for, showing the comparator the answer type may help it *recognize*
+the mismatch, but executing the selected path still returns the unfiltered set. To
+enforce a restriction the system must either execute a filter as part of the
+candidate, or score answer entities individually after execution. Question-level
+path selection does neither.
 
-### Class A costs nothing new
+The decisive measurement is therefore not "which node is constrained" but "can any
+linear path reach the gold denotation at all". Over the 1,628 graph rows joined
+with official questions, excluding via the real `supported_questions()`:
 
-A Class A constraint restricts which entities in the answer set are admissible:
-`notable_types = US County` for "what county is frederick md in?",
-`sports_team.sport = Basketball` for "what basketball teams has shaq played for?".
+| Constraint kind | Excluded | Linear path reaches gold set | **Needs executable filter** |
+|---|---:|---:|---:|
+| relation-value (`sport = Basketball`) | 258 | 100 (39%) | **158 (61%)** |
+| unary type (`notable_types = US County`) | 82 | 29 (35%) | **53 (65%)** |
+| value / range (dates) | 68 | 32 (47%) | **36 (53%)** |
+| other exclusions (>2 hops, `Order`, incomplete) | 65 | — | — |
 
-The path stays linear. The restriction is a property of the executed answer set,
-and the question states the required type in ordinary English ("what **county**",
-"what **basketball** teams"). Nothing needs filtering at proposal time: the
-comparator only needs to *see* each candidate's answer type and prefer the
-candidate whose type matches the question.
+Across all excluded constrained questions, 161 of 408 (39%) are reachable by
+selection alone and **247 (61%) require filtering the returned denotation**. The
+unary/relation-value split does not predict reachability: both sit near 35-39%.
 
-That channel already exists — commit `1a6cc4f` added `question_generated_answer`
-and `question_generated_path_answer`, carrying answer type, cardinality, unlabeled
-id count, and sample labels. It is untrained because the synthetic corpus stores
-one endpoint per path and therefore has no type or cardinality signal to learn.
+Two consequences:
 
-**Class A and the planned comparator retraining are the same piece of work.**
-Retraining on executed SRTK candidates supplies exactly the answer-type signal that
-Class A questions need. Coverage rises 71.2% → 79.6% with no change to the
-proposer, the path object, or the firewall.
+1. **No coverage claim may be made from a comparator change alone.** At most 39% of
+   excluded constrained questions are within reach of better selection, and only if
+   the comparator can distinguish the right path among candidates it already sees.
+2. **The action space needs an executable filter, not just a richer input to the
+   comparator.** That is a change to the candidate object and to execution, and it
+   is required before any constrained slice enters the evaluation.
 
-### Class B is a genuine architectural change
+The earlier answer-node / intermediate-node split is retained below only as a
+description of constraint shape. It is not a cost model.
 
-A Class B constraint joins the mediator to a second named entity:
-`tv.regular_tv_appearance.character = Ken Barlow` for "who plays ken barlow in
-coronation street?". This needs two things the current setup does not have:
+## 4b. Shape of the constraints
 
-1. **A branched candidate object.** Minimally, `PathSpec` gains an optional tuple
-   of `(node_index, relation, direction, bound_entity)` filters. This is one
-   optional field, not a general query language, and the CVT structure of Freebase
-   makes it the natural unit.
-2. **Secondary entity linking.** The bound entity is a second mention in the
-   question. The current setup deliberately supplies the gold topic entity to avoid
-   an entity-linking confound; Class B breaks that. Linking secondary mentions with
-   gold would be a new and much weaker firewall, and it must be stated as such.
-
-Cost 2 is the real one, and it is why Class B should not be bundled with Class A.
+Of 322 executable single `Equal`/`Entity` constraints, 210 attach to an
+intermediate mediator and 112 to the answer node; 263 (81.7%) are lexically
+recoverable from the question, and the failures are implicit rather than absent
+(`gender = Male` for "who is emma stone father?"). This supports the claim in §5
+that constraints are expressible in a reconstructed question. It says nothing about
+whether the pipeline can execute them.
 
 ## 5. Hypothesis
 
@@ -133,32 +132,41 @@ large, visible semantic difference.
 
 ## 6. Falsifying experiments
 
-**Class A (runnable as soon as the comparator is retrained):**
+**E1 — does answer evidence help at all, and through which channel?**
 
-Admit the 137 Class A questions. Train two comparators on identical executed-candidate
-data, differing only in input mode (`question_generated` vs
-`question_generated_answer`). Compare on the Class A slice and the currently supported
-slice separately.
+Train comparators on identical executed-candidate data differing only in input
+mode: `question_generated`, `..._answer_type`, `..._answer_count`,
+`..._answer_labels`. Evaluate on the currently supported slice only, since no
+constrained question is admissible until E3.
 
-- Supports: answer-mode wins on the Class A slice and does not regress on the
-  supported slice.
-- Weakens: answer-mode wins uniformly on both — the gain is generic answer-typing,
-  not constraint handling, and the Class A framing adds nothing.
-- Rejects: no gain on Class A. Answer-set evidence does not carry the restriction,
-  and Class A needs explicit filtering after all.
+- Supports: `type` and/or `count` beat the baseline. Structural answer evidence
+  carries signal the two question strings do not.
+- Confounded: only `labels` wins. That is consistent with the comparator answering
+  from world knowledge rather than verifying, so it must be re-checked under
+  entity-disjoint evaluation before any gain is attributed to verification.
+- Rejects: no channel beats the baseline.
 
-**Class B (only after Class A resolves):**
+**E2 — hard-negative mining, independent of constraints.**
 
-Extend the path object with one optional filter tuple. Report Class B under an
-explicitly labeled weaker firewall, with gold-linked secondary entities, as a
-controlled upper bound rather than an end-to-end result.
+Rebuild the comparator corpus from executed SRTK candidates on WebQSP train,
+labeling positives by answer-set equivalence. Justified by the train/inference
+negative-distribution mismatch alone. Held-out set must come from the same
+distribution, since the current synthetic dev is saturated at R@1 0.991 and cannot
+discriminate.
 
-- Supports: recall of annotated constrained paths is comparable to unconstrained
-  paths, and comparator pairwise accuracy on constraint-dropping negatives exceeds
-  its accuracy on nearby-relation negatives.
-- Rejects: the proposer cannot reach constrained paths at usable recall, in which
-  case the bottleneck is proposal, not verification, and the hypothesis is untested
-  rather than wrong.
+**E3 — executable constrained candidates.**
+
+Only after E1/E2. Extend the candidate object with an executable filter and
+measure, on the 408 excluded constrained questions, what fraction the extended
+proposer reaches and what fraction the verifier then selects correctly. Report
+under an explicitly weaker firewall, because binding a filter value requires
+linking a second entity mention.
+
+- Supports: constrained recall approaches unconstrained recall, and comparator
+  pairwise accuracy on constraint-dropping negatives exceeds its accuracy on
+  nearby-relation negatives — the restriction is the easier discrimination.
+- Rejects: the proposer cannot reach constrained candidates at usable recall, in
+  which case the bottleneck is proposal and the hypothesis is untested, not wrong.
 
 ## 7. Relation to prior work
 
@@ -178,15 +186,24 @@ are characterizations to check before any claim is written up.
 
 Confirm each of these against primary sources before using them as a contrast.
 
-## 8. Recommendation
+## 8. Recommendation (corrected)
 
-Do Class A and the comparator retraining as one experiment. They need the same
-corpus, they need no entity linking, they preserve the current firewall, and
-together they lift coverage 71.2% → 79.6% while testing the answer-evidence channel
-that is currently plumbed but untrained.
+1. **Make no coverage claim yet.** Define and implement an executable constrained
+   candidate first — a filter that runs during execution and subsets the
+   denotation. Until that exists, admitting constrained questions only adds
+   questions the pipeline provably cannot answer.
+2. **Keep answer evidence as separate ablation arms, not a bundle.** `type`,
+   `count`, and `labels` are separate input modes. Answer *labels* let a comparator
+   score "capital of Austria?" against "Vienna" from world knowledge without
+   verifying the path, which changes the hypothesis under test. Any gain from the
+   labels arm must be checked against entity-disjoint evaluation before it is
+   attributed to verification.
+3. **Comparator retraining on executed candidates remains worth doing** — the
+   train/inference negative-distribution mismatch is real and independent of any of
+   this — but it must be justified by hard-negative mining, not by a constraint
+   coverage claim.
+4. **Selection policies stay ablations.** `argmax` is primary until a run shows a
+   general improvement.
 
-Defer Class B until Class A reports. It requires secondary entity linking, which
-weakens the firewall, and its value depends on whether answer-set evidence already
-carries restriction meaning — which Class A answers.
-
-Do not attempt Class C. Sixteen questions cannot support a claim.
+Do not attempt value/range constraints. Sixty-eight questions, needing comparison
+operators and date normalization, cannot support a claim.
