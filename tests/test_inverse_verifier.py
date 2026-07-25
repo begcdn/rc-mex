@@ -61,7 +61,9 @@ from inverse_verifier.causal_generator import (
     flatten_path_question_pairs,
 )
 from inverse_verifier.comparator import (
+    candidate_answers,
     candidate_specs,
+    comparator_answer_text,
     comparator_input_text,
     comparator_path_text,
     listwise_multi_positive_loss,
@@ -457,8 +459,13 @@ def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
     assert validation_rejection(path, prediction, glossary) == "unusable_relation"
 from inverse_verifier.selector import (
     answer_metrics,
+    answer_set_key,
+    candidate_log_entry,
     enumerate_path_families,
+    evaluation_subset_coverage,
     first_gold_rank,
+    has_answerable_endpoint,
+    select_candidate,
 )
 from inverse_verifier.retrieval import (
     LocalQuestionGraph,
@@ -1889,3 +1896,308 @@ def test_disputed_adjudication_excludes_whole_candidate_set() -> None:
     assert disputed[0]["candidates"][0]["adjudication_disputed"] is True
     assert audit[0]["judges_agree"] is False
     assert summary["candidate_sets_excluded_as_disputed"] == 1
+
+
+def _scored(sequence: list[str], answers: list[str], score: float) -> dict:
+    return {
+        "relation_sequence": sequence,
+        "answers": answers,
+        "generated_question": " ".join(sequence),
+        "retrieval_score": 0.5,
+        "cross_encoder_score": score,
+    }
+
+
+def test_unlabeled_machine_id_endpoints_are_not_answerable() -> None:
+    assert has_answerable_endpoint(_scored(["r"], ["Jamaican English"], 1.0))
+    assert not has_answerable_endpoint(_scored(["r"], ["m.04gdzf4", "g.1hhc3tsc7"], 1.0))
+    assert not has_answerable_endpoint(_scored(["r"], [], 1.0))
+    # A single labelled endpoint is enough to keep a mixed CVT frontier.
+    assert has_answerable_endpoint(_scored(["r"], ["m.04gdzf4", "Kingston"], 1.0))
+
+
+def test_endpoint_filter_skips_machine_ids_but_falls_back_when_all_unlabeled() -> None:
+    candidates = [
+        _scored(["cvt"], ["m.0k5ntfn"], 5.0),
+        _scored(["good"], ["Kingston"], 1.0),
+    ]
+    assert select_candidate(candidates, "cross_encoder_score", True, False)[
+        "relation_sequence"
+    ] == ["good"]
+    assert select_candidate(candidates, "cross_encoder_score", False, False)[
+        "relation_sequence"
+    ] == ["cvt"]
+
+    only_unlabeled = [_scored(["cvt"], ["m.0k5ntfn"], 5.0)]
+    assert select_candidate(only_unlabeled, "cross_encoder_score", True, False)[
+        "relation_sequence"
+    ] == ["cvt"]
+
+
+def test_answer_voting_marginalizes_equivalent_routes() -> None:
+    # Two equivalent Freebase routes to the same answer outweigh one better-scoring
+    # path to a different answer, which argmax over paths cannot express.
+    candidates = [
+        _scored(["wrong"], ["Nairobi"], 2.0),
+        _scored(["route_a"], ["Kingston"], 1.8),
+        _scored(["route_b"], ["kingston"], 1.7),
+    ]
+    argmax = select_candidate(candidates, "cross_encoder_score", False, False)
+    voted = select_candidate(candidates, "cross_encoder_score", False, True)
+    assert argmax["answers"] == ["Nairobi"]
+    assert voted["answers"] == ["Kingston"]
+    # The representative is the best-scoring member of the winning answer set.
+    assert voted["relation_sequence"] == ["route_a"]
+
+
+def test_answer_set_key_is_order_and_case_insensitive() -> None:
+    assert answer_set_key(["Kingston", "Montego Bay"]) == answer_set_key(
+        ["montego bay", " kingston "]
+    )
+    assert answer_set_key(["Kingston", "Kingston"]) == ("kingston",)
+
+
+def test_selection_is_deterministic_under_tied_scores() -> None:
+    tied = [
+        _scored(["b"], ["Kingston"], 1.0),
+        _scored(["a"], ["Nairobi"], 1.0),
+    ]
+    first = select_candidate(tied, "cross_encoder_score", True, True)
+    assert first == select_candidate(list(reversed(tied)), "cross_encoder_score", True, True)
+
+
+def test_candidate_log_records_evaluation_only_fields() -> None:
+    entry = candidate_log_entry(
+        _scored(["people.person.nationality::forward"], ["Jamaica", "m.0k5ntfn"], 3.2),
+        "cross_encoder_score",
+        {("people.person.place_of_birth::forward",)},
+        {"jamaica"},
+    )
+    assert entry["matches_gold_path"] is False
+    assert entry["answer_overlaps_gold"] is True
+    assert entry["unlabeled_answer_count"] == 1
+    assert entry["answer_count"] == 2
+    assert entry["answers_truncated"] is False
+    assert entry["score"] == 3.2
+
+
+def test_evaluation_subset_coverage_reports_constraint_exclusions(tmp_path) -> None:
+    questions = {
+        "Questions": [
+            {
+                "QuestionId": "kept",
+                "RawQuestion": "who wrote it?",
+                "Parses": [{"InferentialChain": ["book.author"], "Sparql": ""}],
+            },
+            {
+                "QuestionId": "constrained",
+                "RawQuestion": "who was president in 2004?",
+                "Parses": [
+                    {
+                        "InferentialChain": ["gov.office_holder"],
+                        "Constraints": [{"Operator": "Equal"}],
+                        "Sparql": "",
+                    }
+                ],
+            },
+            {
+                "QuestionId": "ordered",
+                "RawQuestion": "what is the largest city?",
+                "Parses": [
+                    {"InferentialChain": ["loc.city"], "Order": {"SortOrder": "Desc"}, "Sparql": ""}
+                ],
+            },
+        ]
+    }
+    path = tmp_path / "WebQSP.test.json"
+    path.write_text(json.dumps(questions), encoding="utf-8")
+
+    coverage = evaluation_subset_coverage(path)
+
+    assert coverage["source_questions"] == 3
+    assert coverage["supported_questions"] == 1
+    assert coverage["excluded_by_reason"] == {"constraints": 1, "order": 1}
+
+
+def test_comparator_answer_evidence_modes_carry_endpoint_shape() -> None:
+    answers = comparator_answer_text(
+        ["Jamaican English", "Jamaican Creole English Language"], "human language", 0
+    )
+    assert "count: 2" in answers
+    assert "type: human language" in answers
+    assert "unlabeled ids: 0 of 2" in answers
+
+    text = comparator_input_text(
+        "what language do they speak?",
+        "Which language is spoken there?",
+        "path",
+        "question_generated_answer",
+        answers,
+    )
+    assert "[CANDIDATE ANSWERS]" in text
+    assert "count: 2" in text
+    assert "[CANDIDATE PATH]" not in text
+
+    with_path = comparator_input_text(
+        "q", "g", "path-text", "question_generated_path_answer", answers
+    )
+    assert "[CANDIDATE PATH]" in with_path
+    assert "[CANDIDATE ANSWERS]" in with_path
+
+    # Existing modes must stay byte-identical so trained checkpoints keep working.
+    assert "[CANDIDATE ANSWERS]" not in comparator_input_text(
+        "q", "g", "path-text", "question_generated", answers
+    )
+
+
+def test_candidate_answers_prefers_executed_set_over_single_endpoint() -> None:
+    path = {"answer_type": "city", "answer_entity": "Kingston"}
+    assert candidate_answers({"answers": ["A", "B"]}, path) == ["A", "B"]
+    assert candidate_answers({"answer_entity": "Montego Bay"}, path) == ["Montego Bay"]
+    assert candidate_answers({}, path) == ["Kingston"]
+    assert candidate_answers({}, {"answer_type": "city"}) == []
+
+
+def _stub_pipeline(monkeypatch, families):
+    """Drive run_verifier_pipeline with stubbed models so result assembly is covered."""
+    import inverse_verifier.selector as selector
+
+    class _Retriever:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def retrieve(self, question, graph_row):
+            return {"candidate_paths": families, "retrieved_subgraph": graph_row["graph"]}
+
+    monkeypatch.setattr(selector, "SRTKPathRetriever", _Retriever)
+    monkeypatch.setattr(
+        selector, "load_seq2seq", lambda model, device: (object(), object(), "cpu")
+    )
+    monkeypatch.setattr(
+        selector, "load_comparator", lambda model, device: (object(), object(), "cpu", "question_generated")
+    )
+    monkeypatch.setattr(
+        selector,
+        "generate_joint_questions",
+        lambda model, tokenizer, paths, device, batch_size=5: [
+            f"question for {path['hops'][0]['relation']}" for path in paths
+        ],
+    )
+
+    def _score(model, tokenizer, rows, mode, device, batch_size=1):
+        return [
+            {
+                **row,
+                "candidates": [
+                    {**candidate, "cross_encoder_score": candidate["stub_score"]}
+                    for candidate in row["candidates"]
+                ],
+            }
+            for row in rows
+        ]
+
+    monkeypatch.setattr(selector, "score_comparator_rows", _score)
+
+
+def test_pipeline_reports_selection_ablation_and_full_candidate_log(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def family(relation, answers, score):
+        return {
+            "path": {
+                "anchor": "Jamaica",
+                "anchor_type": "country",
+                "answer_type": "human language",
+                "kg": "webqsp",
+                "hops": [
+                    {
+                        "relation": relation,
+                        "direction": "forward",
+                        "source_type": "country",
+                        "target_type": "human language",
+                    }
+                ],
+            },
+            "relation_sequence": [f"{relation}::forward"],
+            "answers": answers,
+            "retrieval_score": score,
+            "supporting_triples": [],
+            "stub_score": score,
+        }
+
+    # The unlabeled CVT path outscores the correct one, so argmax fails where the
+    # endpoint filter succeeds.
+    families = [
+        family("location.country.statistics", ["m.0k5ntfn"], 5.0),
+        family("location.country.languages_spoken", ["Jamaican English"], 2.0),
+        family("location.country.official_language", ["Jamaican English"], 1.9),
+    ]
+    _stub_pipeline(monkeypatch, families)
+
+    questions = tmp_path / "questions.json"
+    questions.write_text(
+        json.dumps(
+            {
+                "Questions": [
+                    {
+                        "QuestionId": "q1",
+                        "RawQuestion": "what language do they speak in jamaica?",
+                        "Parses": [
+                            {
+                                "InferentialChain": ["location.country.languages_spoken"],
+                                "TopicEntityMid": "m.03_r3",
+                                "Sparql": "ns:m.03_r3 ns:location.country.languages_spoken ?x .",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    graphs = tmp_path / "graphs.jsonl"
+    graphs.write_text(
+        json.dumps(
+            {
+                "id": "q1",
+                "question": "what language do they speak in jamaica?",
+                "answer": ["Jamaican English"],
+                "q_entity": ["Jamaica"],
+                "graph": [
+                    ["Jamaica", "location.country.languages_spoken", "Jamaican English"]
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "run"
+    metrics = run_verifier_pipeline(
+        questions,
+        graphs,
+        "generator",
+        "retriever",
+        output,
+        limit=1,
+        comparison_mode="cross_encoder",
+        comparator_model="comparator",
+    )
+
+    variants = metrics["selection_variants"]
+    assert variants["argmax"]["answer_exact_match"] == 0.0
+    assert variants["argmax_filtered"]["answer_exact_match"] == 1.0
+    assert variants["vote_filtered"]["answer_exact_match"] == 1.0
+    assert metrics["selection_policy"] == "vote_filtered"
+    assert metrics["answer_exact_match"] == 1.0
+    assert metrics["unanswerable_endpoint_selection_rate"] == 0.0
+    assert metrics["evaluation_subset"]["supported_questions"] == 1
+
+    row = json.loads((output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert len(row["candidate_log"]) == len(families)
+    assert [entry["score"] for entry in row["candidate_log"]] == [5.0, 2.0, 1.9]
+    assert row["candidate_log"][0]["unlabeled_answer_count"] == 1
+    assert row["candidate_log"][1]["matches_gold_path"] is True
+    assert row["candidate_log"][2]["matches_gold_path"] is False
+    assert row["candidate_log"][2]["answer_overlaps_gold"] is True
+    assert "Selection ablation" in (output / "report.md").read_text(encoding="utf-8")
