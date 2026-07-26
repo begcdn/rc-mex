@@ -461,8 +461,8 @@ def test_strict_validation_rejects_metadata_even_when_model_accepts() -> None:
     assert validation_rejection(path, prediction, glossary) == "unusable_relation"
 from inverse_verifier.selector import (
     answer_metrics,
-    answer_set_key,
     candidate_log_entry,
+    candidate_score,
     enumerate_path_families,
     evaluation_subset_coverage,
     first_gold_rank,
@@ -1923,49 +1923,42 @@ def test_endpoint_filter_skips_machine_ids_but_falls_back_when_all_unlabeled() -
         _scored(["cvt"], ["m.0k5ntfn"], 5.0),
         _scored(["good"], ["Kingston"], 1.0),
     ]
-    assert select_candidate(candidates, "cross_encoder_score", True, False)[
+    assert select_candidate(candidates, "cross_encoder_score", "comparator", True)[
         "relation_sequence"
     ] == ["good"]
-    assert select_candidate(candidates, "cross_encoder_score", False, False)[
+    assert select_candidate(candidates, "cross_encoder_score", "comparator", False)[
         "relation_sequence"
     ] == ["cvt"]
 
     only_unlabeled = [_scored(["cvt"], ["m.0k5ntfn"], 5.0)]
-    assert select_candidate(only_unlabeled, "cross_encoder_score", True, False)[
+    assert select_candidate(only_unlabeled, "cross_encoder_score", "comparator", True)[
         "relation_sequence"
     ] == ["cvt"]
 
 
-def test_answer_voting_marginalizes_equivalent_routes() -> None:
-    # Two equivalent Freebase routes to the same answer outweigh one better-scoring
-    # path to a different answer, which argmax over paths cannot express.
-    candidates = [
-        _scored(["wrong"], ["Nairobi"], 2.0),
-        _scored(["route_a"], ["Kingston"], 1.8),
-        _scored(["route_b"], ["kingston"], 1.7),
-    ]
-    argmax = select_candidate(candidates, "cross_encoder_score", False, False)
-    voted = select_candidate(candidates, "cross_encoder_score", False, True)
-    assert argmax["answers"] == ["Nairobi"]
-    assert voted["answers"] == ["Kingston"]
-    # The representative is the best-scoring member of the winning answer set.
-    assert voted["relation_sequence"] == ["route_a"]
+def test_score_sources_combine_proposer_and_verifier_evidence() -> None:
+    # The verifier prefers "b"; the proposer strongly prefers "a". Selecting on the
+    # verifier alone discards the prior that says "b" sits deep in the pool.
+    a = {**_scored(["a"], ["Kingston"], 1.0), "retrieval_score": 9.0}
+    b = {**_scored(["b"], ["Nairobi"], 2.0), "retrieval_score": 0.5}
+    assert candidate_score(a, "cross_encoder_score", "comparator") == 1.0
+    assert candidate_score(a, "cross_encoder_score", "retrieval") == 9.0
+    assert candidate_score(a, "cross_encoder_score", "comparator_retrieval") == 10.0
+
+    pick = lambda src: select_candidate([a, b], "cross_encoder_score", src, False)["relation_sequence"]
+    assert pick("comparator") == ["b"]
+    assert pick("retrieval") == ["a"]
+    assert pick("comparator_retrieval") == ["a"]
+
+    with pytest.raises(ValueError, match="unknown selection score source"):
+        candidate_score(a, "cross_encoder_score", "nonsense")
 
 
-def test_answer_set_key_is_order_and_case_insensitive() -> None:
-    assert answer_set_key(["Kingston", "Montego Bay"]) == answer_set_key(
-        ["montego bay", " kingston "]
-    )
-    assert answer_set_key(["Kingston", "Kingston"]) == ("kingston",)
-
-
-def test_selection_is_deterministic_under_tied_scores() -> None:
-    tied = [
-        _scored(["b"], ["Kingston"], 1.0),
-        _scored(["a"], ["Nairobi"], 1.0),
-    ]
-    first = select_candidate(tied, "cross_encoder_score", True, True)
-    assert first == select_candidate(list(reversed(tied)), "cross_encoder_score", True, True)
+def test_missing_retrieval_score_does_not_crash_selection() -> None:
+    bare = _scored(["x"], ["Kingston"], 1.0)
+    bare.pop("retrieval_score")
+    assert candidate_score(bare, "cross_encoder_score", "comparator_retrieval") == 1.0
+    assert candidate_score(bare, "cross_encoder_score", "retrieval") == 0.0
 
 
 def test_candidate_log_records_evaluation_only_fields() -> None:
@@ -2200,12 +2193,12 @@ def test_pipeline_reports_selection_ablation_and_full_candidate_log(
     )
 
     variants = metrics["selection_variants"]
-    assert variants["argmax"]["answer_exact_match"] == 0.0
-    assert variants["argmax_filtered"]["answer_exact_match"] == 1.0
-    assert variants["vote_filtered"]["answer_exact_match"] == 1.0
-    # argmax is primary, so the headline metric reflects the unfiltered incumbent
-    # and the filtered/voting gains show up only in the ablation block.
-    assert metrics["selection_policy"] == "argmax"
+    assert variants["comparator"]["answer_exact_match"] == 0.0
+    assert variants["comparator_filtered"]["answer_exact_match"] == 1.0
+    assert variants["retrieval_filtered"]["answer_exact_match"] == 1.0
+    # The unfiltered comparator is primary, so the headline metric reflects the
+    # incumbent and every gain shows up only in the ablation block.
+    assert metrics["selection_policy"] == "comparator"
     assert metrics["answer_exact_match"] == 0.0
     assert metrics["unanswerable_endpoint_selection_rate"] == 1.0
     assert metrics["evaluation_subset"]["supported_questions"] == 1

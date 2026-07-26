@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -46,17 +45,29 @@ ANSWER_LOG_CAP = 50
 
 # Every variant is scored from the same forward passes, so a single run reports the
 # whole selection ablation instead of requiring one run per policy.
-SELECTION_VARIANTS: dict[str, dict[str, bool]] = {
-    "argmax": {"endpoint_filter": False, "aggregate_answers": False},
-    "argmax_filtered": {"endpoint_filter": True, "aggregate_answers": False},
-    "vote": {"endpoint_filter": False, "aggregate_answers": True},
-    "vote_filtered": {"endpoint_filter": True, "aggregate_answers": True},
+#
+# ``retrieval`` is the matched baseline the verifier has to beat: take the
+# proposer's own top-ranked candidate and run no verifier at all.
+#
+# Answer-set voting was measured here and rejected. Summing exponentiated scores
+# treats duplicated aliases and correlated routes as independent evidence, so mass
+# accumulates on answer sets reachable many ways. On full candidate lists it lost 10
+# and won 4 against the filtered incumbent, with the winning set backed by a median
+# 12 routes against 1. See docs/selection_findings.md.
+SELECTION_VARIANTS: dict[str, dict[str, Any]] = {
+    "retrieval": {"source": "retrieval", "endpoint_filter": False},
+    "retrieval_filtered": {"source": "retrieval", "endpoint_filter": True},
+    "comparator": {"source": "comparator", "endpoint_filter": False},
+    "comparator_filtered": {"source": "comparator", "endpoint_filter": True},
+    "comparator_retrieval_filtered": {
+        "source": "comparator_retrieval",
+        "endpoint_filter": True,
+    },
 }
-# The incumbent policy stays primary so the headline metric remains the matched
-# baseline. The others are ablations until a run shows a general improvement:
-# summing exponentiated scores treats duplicated aliases and correlated routes as
-# independent evidence, which inflates mass without adding support.
-PRIMARY_SELECTION = "argmax"
+# The incumbent stays primary. comparator_retrieval_filtered leads by a wide margin
+# on one run but is not adopted until a second confirms it: the top-10 replay of the
+# previous run ranked answer-set voting first and the full run reversed it.
+PRIMARY_SELECTION = "comparator"
 
 
 def has_answerable_endpoint(candidate: dict[str, Any]) -> bool:
@@ -65,42 +76,42 @@ def has_answerable_endpoint(candidate: dict[str, Any]) -> bool:
     return bool(answers) and unlabeled_answer_count(answers) < len(answers)
 
 
-def answer_set_key(answers: list[str]) -> tuple[str, ...]:
-    return tuple(sorted({answer.casefold().strip() for answer in answers if answer.strip()}))
+def candidate_score(candidate: dict[str, Any], score_key: str, source: str) -> float:
+    """Score a candidate under one evidence source.
+
+    ``comparator_retrieval`` adds the two log-scale scores, which treats the
+    proposer's question-conditioned score and the verifier's question-comparison
+    score as independent evidence about the same candidate. The proposer score is
+    the prior the verifier is meant to refine; selecting on the verifier alone
+    discards it.
+    """
+    if source == "retrieval":
+        return float(candidate.get("retrieval_score") or 0.0)
+    value = float(candidate[score_key])
+    if source == "comparator_retrieval":
+        return value + float(candidate.get("retrieval_score") or 0.0)
+    if source != "comparator":
+        raise ValueError(f"unknown selection score source: {source}")
+    return value
 
 
 def select_candidate(
     verified: list[dict[str, Any]],
     score_key: str,
+    source: str = "comparator",
     endpoint_filter: bool = True,
-    aggregate_answers: bool = True,
 ) -> dict[str, Any]:
     """Pick one candidate under a selection policy.
 
-    ``endpoint_filter`` drops paths whose endpoints are all unlabeled machine ids.
-    ``aggregate_answers`` marginalizes over paths: equivalent Freebase routes that
-    return the same answer set reinforce each other instead of splitting the vote.
-    Neither policy consults gold.
+    ``endpoint_filter`` drops paths whose endpoints carry no surface label and so
+    cannot answer any natural-language question. No policy consults gold.
     """
     pool = verified
     if endpoint_filter:
         answerable = [candidate for candidate in verified if has_answerable_endpoint(candidate)]
         # Reported as endpoint_filter_fallback_rate rather than applied silently.
         pool = answerable or verified
-    if not aggregate_answers:
-        return max(pool, key=lambda candidate: candidate[score_key])
-
-    ceiling = max(candidate[score_key] for candidate in pool)
-    mass: dict[tuple[str, ...], float] = defaultdict(float)
-    representative: dict[tuple[str, ...], dict[str, Any]] = {}
-    for candidate in pool:
-        key = answer_set_key(candidate["answers"])
-        mass[key] += math.exp(candidate[score_key] - ceiling)
-        best = representative.get(key)
-        if best is None or candidate[score_key] > best[score_key]:
-            representative[key] = candidate
-    winner = max(mass, key=lambda key: (mass[key], representative[key][score_key], key))
-    return representative[winner]
+    return max(pool, key=lambda candidate: candidate_score(candidate, score_key, source))
 
 
 def evaluation_subset_coverage(path: Path) -> dict[str, Any]:
