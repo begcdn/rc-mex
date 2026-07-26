@@ -300,7 +300,7 @@ def train_causal_inverse_generator(
         "dev_rows": len(read_jsonl(dev_path)),
         "train_path_question_pairs": len(train_pairs),
         "dev_path_question_pairs": len(dev_pairs),
-        "input_contract": "grounded_relation_semantics_v1",
+        "input_contract": "grounded_relation_semantics_v2",
         "relation_glossary_entries": len(glossary),
         "best_dev_token_nll": best_dev_nll,
         "elapsed_seconds": time.time() - started,

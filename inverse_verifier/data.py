@@ -132,6 +132,41 @@ def load_relation_glossary(path: Path | str | None) -> dict[str, dict[str, Any]]
     return data
 
 
+def canonical_role(entry: dict[str, Any], key: str, observed_type: str | None) -> str:
+    """Name a node position by the relation's schema role, not by what the path hit.
+
+    The observed type is the union of the Freebase types of the entities a path
+    happened to land on, so ``location.location.containedby`` reaching Ecuador and
+    the Pacific Ocean renders as "administrative division or body of water". The
+    generator then writes that disjunction into the question, which no user would
+    ask, and which measurably buries the correct path. The schema role is a
+    property of the relation alone, so the serialization stays a function of the
+    path rather than of the graph's contents.
+
+    An observed type is used only when the glossary supplies no role, and never as
+    a disjunction.
+    """
+    role = normalize_space(str(entry.get(key) or ""))
+    if role and role.casefold() != "entity":
+        return role
+    first_observed = normalize_space(str(observed_type or "")).split(" / ")[0]
+    return first_observed or role or "entity"
+
+
+def canonical_answer_role(
+    path: dict[str, Any], glossary: dict[str, dict[str, Any]] | None
+) -> str:
+    """Schema role of the node the question asks for."""
+    hops = path.get("hops") or []
+    if not hops or glossary is None:
+        return normalize_space(str(path.get("answer_type") or "")).split(" / ")[0] or "entity"
+    hop = hops[-1]
+    kg = hop.get("kg") or path.get("kg", "unknown")
+    entry = glossary.get(f"{kg}::{hop['relation']}", {})
+    key = "object_role" if hop["direction"] == "forward" else "subject_role"
+    return canonical_role(entry, key, hop.get("target_type"))
+
+
 def _grounded_hop_lines(
     path: dict[str, Any],
     hop: dict[str, Any],
@@ -145,8 +180,6 @@ def _grounded_hop_lines(
     entry = glossary.get(f"{kg}::{relation}", {})
     semantic = entry.get("status") == "semantic"
     description = normalize_space(str(entry.get("description", ""))) if semantic else ""
-    subject_role = normalize_space(str(entry.get("subject_role", "entity"))) or "entity"
-    object_role = normalize_space(str(entry.get("object_role", "entity"))) or "entity"
     template = str(entry.get("fact_template", "")) if semantic else ""
 
     if hop["direction"] == "forward":
@@ -156,8 +189,10 @@ def _grounded_hop_lines(
         fact_subject, fact_object = destination, source
         subject_type, object_type = hop["target_type"], hop["source_type"]
 
-    subject = f"{fact_subject} (type: {subject_type}; role: {subject_role})"
-    obj = f"{fact_object} (type: {object_type}; role: {object_role})"
+    subject_role = canonical_role(entry, "subject_role", subject_type)
+    object_role = canonical_role(entry, "object_role", object_type)
+    subject = f"{fact_subject} (role: {subject_role})"
+    obj = f"{fact_object} (role: {object_role})"
     if "{subject}" in template and "{object}" in template:
         try:
             bound_fact = normalize_space(template.format(subject=subject, object=obj))
@@ -196,6 +231,18 @@ def render_path(
         path = path_to_dict(path)
     anchor = ENTITY_PLACEHOLDER if mask_anchor else path["anchor"]
     anchor_type = path.get("anchor_type") or "entity"
+    if relation_glossary is not None:
+        # The anchor's observed type is disjunctive for the same reason answer types
+        # are, and it reaches the question as an apposition ("Leonardo da Vinci, who
+        # is a film character or visual artist").
+        hops = path.get("hops") or []
+        if hops:
+            first = hops[0]
+            entry = relation_glossary.get(
+                f"{first.get('kg') or path.get('kg', 'unknown')}::{first['relation']}", {}
+            )
+            key = "subject_role" if first["direction"] == "forward" else "object_role"
+            anchor_type = canonical_role(entry, key, anchor_type)
     lines = []
     if include_instruction:
         lines.append("Write a question for this KG path.")
@@ -225,7 +272,9 @@ def render_path(
             f"types={source}:{hop['source_type']},{destination}:{hop['target_type']}."
         )
     if relation_glossary is not None:
-        lines.append(f"Requested answer: ANSWER (type: {path.get('answer_type') or 'entity'}).")
+        lines.append(
+            f"Requested answer: ANSWER (type: {canonical_answer_role(path, relation_glossary)})."
+        )
     if include_instruction:
         lines.append("Question:")
     return "\n".join(lines)
