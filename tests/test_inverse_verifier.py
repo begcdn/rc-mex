@@ -27,6 +27,7 @@ from inverse_verifier.comparator_corpus import (
     label_candidates,
     sample_candidates,
 )
+from inverse_verifier.rescore import score_pairs
 from inverse_verifier.metrics import ranking_metrics, rouge_l, token_f1
 from inverse_verifier.evaluate import generated_question_similarity_scores, similarity_distribution
 from inverse_verifier.model import (
@@ -2440,3 +2441,55 @@ def test_anchor_type_uses_its_own_relation_to_disambiguate() -> None:
     assert path["anchor_type"] == "US President"
     assert path["answer_type"] == "US Vice President"
     assert answers == ["Hannibal Hamlin"]
+
+
+def test_rescoring_selects_by_the_new_score_and_ignores_the_searcher(monkeypatch, tmp_path: Path) -> None:
+    import inverse_verifier.rescore as rescore
+
+    row = {
+        "question_id": "q1",
+        "question": "what language do they speak in jamaica?",
+        "gold_answers": ["Jamaican English"],
+        "gold_sequences": [["languages_spoken::forward"]],
+        "candidate_log": [
+            {
+                "relation_sequence": ["official_language::forward"],
+                "generated_question": "What is the official language of Jamaica?",
+                "answers": ["Jamaican English"],
+                "retrieval_score": 99.0,
+                "score": 9.0,
+                "matches_gold_path": False,
+            },
+            {
+                "relation_sequence": ["languages_spoken::forward"],
+                "generated_question": "What language is spoken in Jamaica?",
+                "answers": ["Jamaican English", "Jamaican Creole"],
+                "retrieval_score": 0.1,
+                "score": -9.0,
+                "matches_gold_path": True,
+            },
+        ],
+    }
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    # Stand-in comparator that prefers the second candidate, opposing both the
+    # stored comparator score and the searcher's score.
+    monkeypatch.setattr(rescore, "score_pairs", lambda pairs, *a, **k: [0.0, 5.0])
+
+    result = rescore.rescore_run(predictions, "stub", "cross_encoder", tmp_path / "out")
+
+    assert result["selected_gold_path_accuracy"] == 1.0
+    assert result["candidate_pairs"] == 2
+    # The annotated path returns a superset, so exact match is 0 while the
+    # gold-equivalent credit and the path metric both register.
+    assert result["answer_exact_match"] == 0.0
+    assert result["answer_has_correct_answer"] == 1.0
+    assert (tmp_path / "out" / "metrics.json").exists()
+    selections = json.loads((tmp_path / "out" / "selections.jsonl").read_text().splitlines()[0])
+    assert selections["matches_gold_path"] is True
+
+
+def test_rescoring_rejects_an_unknown_scorer_kind() -> None:
+    with pytest.raises(ValueError, match="unknown scorer kind"):
+        score_pairs([("a", "b")], "stub", "nonsense")

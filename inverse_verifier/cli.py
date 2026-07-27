@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .comparator_corpus import build_comparator_corpus
+from .rescore import SCORER_KINDS, rescore_run
 from .comparator import (
     COMPARATOR_INPUT_MODES,
     evaluate_comparator,
@@ -171,6 +172,18 @@ def build_parser() -> argparse.ArgumentParser:
     corpus.add_argument("--random-negatives", type=int, default=4)
     corpus.add_argument("--dev-fraction", type=float, default=0.1)
     corpus.add_argument("--seed", type=int, default=17)
+
+    rescore = subparsers.add_parser(
+        "rescore",
+        help="re-rank a finished run with a different comparator, no graph pass",
+    )
+    rescore.add_argument("--predictions", type=Path, required=True)
+    rescore.add_argument("--model", required=True)
+    rescore.add_argument("--kind", choices=SCORER_KINDS, default="cross_encoder")
+    rescore.add_argument("--output", type=Path)
+    rescore.add_argument("--batch-size", type=int, default=64)
+    rescore.add_argument("--device", default="auto")
+    rescore.add_argument("--no-endpoint-filter", action="store_true")
 
     prepare_comparator = subparsers.add_parser(
         "prepare-comparator",
@@ -482,6 +495,17 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Wrote comparator corpus to {args.output}")
+    elif args.command == "rescore":
+        result = rescore_run(
+            args.predictions,
+            args.model,
+            args.kind,
+            args.output,
+            device=args.device,
+            batch_size=args.batch_size,
+            endpoint_filter=not args.no_endpoint_filter,
+        )
+        print(json.dumps(result, indent=2))
     elif args.command == "prepare-comparator":
         manifest = materialize_comparator_data(
             args.data,
