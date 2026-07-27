@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import random
 import urllib.error
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,11 @@ from inverse_verifier.data import (
     relation_inventory,
     render_path,
     assign_kqa_splits,
+)
+from inverse_verifier.comparator_corpus import (
+    build_comparator_corpus,
+    label_candidates,
+    sample_candidates,
 )
 from inverse_verifier.metrics import ranking_metrics, rouge_l, token_f1
 from inverse_verifier.evaluate import generated_question_similarity_scores, similarity_distribution
@@ -477,6 +484,7 @@ from inverse_verifier.retrieval import (
     encode_edge,
     dominant_type,
     gold_path_available,
+    schema_type_hint,
     materialize_path,
 )
 
@@ -2269,9 +2277,166 @@ def test_frontier_type_is_dominant_not_a_union_of_everything_reached() -> None:
     assert answers == ["Ecuador", "Galapagos Province", "Pacific Ocean"]
 
 
-def test_dominant_type_breaks_ties_deterministically() -> None:
-    from collections import Counter
-
+def test_dominant_type_prefers_a_clear_majority() -> None:
     assert dominant_type(Counter({"City": 3, "Town": 1})) == "City"
-    assert dominant_type(Counter({"Zebra": 2, "Apple": 2})) == "Apple"
+    # A genuine tie with no schema hint is not resolved by guessing.
+    assert dominant_type(Counter({"Zebra": 2, "Apple": 2})) == "entity"
     assert dominant_type(Counter()) == "entity"
+
+
+def _cand(seq, answers, score, question="q"):
+    return {
+        "relation_sequence": seq,
+        "answers": answers,
+        "score": score,
+        "generated_question": question,
+        "path": {
+            "anchor": "Jamaica",
+            "anchor_type": "Country",
+            "answer_type": "Human Language",
+            "kg": "webqsp",
+            "hops": [
+                {
+                    "relation": seq[0].rsplit("::", 1)[0],
+                    "direction": "forward",
+                    "source_type": "Country",
+                    "target_type": "Human Language",
+                }
+            ],
+        },
+    }
+
+
+def test_labelling_credits_any_route_that_returns_the_gold_answers() -> None:
+    candidates = [
+        _cand(["annotated::forward"], ["Kingston"], 1.0),
+        _cand(["other::forward"], ["kingston"], 2.0),      # same answers, different path
+        _cand(["wrong::forward"], ["Nairobi"], 3.0),
+        _cand(["partial::forward"], ["Kingston", "Nairobi"], 0.5),  # superset, not equal
+    ]
+
+    labelled = label_candidates(candidates, ["Kingston"], {("annotated::forward",)})
+
+    assert [c["is_positive"] for c in labelled] == [True, True, False, False]
+    assert [c["negative_type"] for c in labelled] == [
+        "positive", "answer_equivalent", "proposed", "proposed",
+    ]
+
+
+def test_labelling_without_gold_answers_falls_back_to_the_annotated_path() -> None:
+    labelled = label_candidates(
+        [_cand(["a::forward"], ["X"], 1.0), _cand(["b::forward"], [], 1.0)],
+        [],
+        {("a::forward",)},
+    )
+    assert [c["is_positive"] for c in labelled] == [True, False]
+
+
+def test_negatives_are_sampled_hardest_first() -> None:
+    rng = random.Random(0)
+    labelled = [
+        {**_cand(["gold"], ["A"], 0.1), "is_positive": True, "negative_type": "positive"},
+        *[
+            {**_cand([f"n{i}"], ["B"], float(i)), "is_positive": False, "negative_type": "proposed"}
+            for i in range(20)
+        ],
+    ]
+
+    sampled = sample_candidates(labelled, rng, hard=3, random_count=0)
+
+    assert sampled is not None
+    kept = [c["relation_sequence"][0] for c in sampled if not c["is_positive"]]
+    # The three the incumbent comparator scores highest are exactly what it must
+    # learn to reject.
+    assert kept == ["n19", "n18", "n17"]
+
+
+def test_groups_without_a_positive_are_dropped_not_forced() -> None:
+    rng = random.Random(0)
+    negatives = [
+        {**_cand(["n"], ["B"], 1.0), "is_positive": False, "negative_type": "proposed"}
+    ]
+    assert sample_candidates(negatives, rng) is None
+
+
+def test_comparator_corpus_round_trips_into_trainable_groups(tmp_path: Path) -> None:
+    rows = []
+    for index in range(10):
+        rows.append(
+            {
+                "question_id": f"q{index}",
+                "question": f"question {index}?",
+                "gold_answers": ["Kingston"],
+                "gold_sequences": [["annotated::forward"]],
+                "candidate_log": [
+                    _cand(["annotated::forward"], ["Kingston"], 1.0, "gold question"),
+                    *[
+                        _cand([f"n{j}::forward"], ["Nairobi"], float(j), f"wrong {j}")
+                        for j in range(30)
+                    ],
+                ],
+            }
+        )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    manifest = build_comparator_corpus(predictions, tmp_path / "corpus", hard=5, random_count=2)
+
+    assert manifest["candidate_sets"] == 10
+    assert manifest["dropped_no_positive"] == 0
+    assert manifest["train_candidate_sets"] + manifest["dev_candidate_sets"] == 10
+    train = [json.loads(line) for line in (tmp_path / "corpus" / "train.jsonl").read_text().splitlines()]
+    group = train[0]
+    assert any(c["is_positive"] for c in group["candidates"])
+    assert len(group["candidates"]) == 1 + 5 + 2
+    assert group["original_question"].startswith("question")
+    # Every group must be usable by the listwise loss.
+    for row in train:
+        assert any(c["is_positive"] for c in row["candidates"])
+
+
+def test_schema_hint_resolves_which_of_many_freebase_types_applies() -> None:
+    # Abraham Lincoln is typed Artwork, Book, Film, Location, US President ... and
+    # they all tie on count, so alphabetical order rendered him "an artwork".
+    counts = Counter(
+        ["Artwork", "Book", "Fictional Character", "Film", "Location", "US President"]
+    )
+    assert dominant_type(counts, schema_type_hint("government.us_president.vice_president")) == (
+        "US President"
+    )
+    assert schema_type_hint("government.us_president.vice_president") == "us president"
+    assert schema_type_hint("people.person.place_of_birth") == "person"
+    assert schema_type_hint("bare") == ""
+
+
+def test_ambiguous_types_render_as_entity_rather_than_a_confident_guess() -> None:
+    # No schema hint can separate these, and asserting either one states something
+    # false about the entity.
+    counts = Counter(["Film character", "U.S. Congressperson"])
+    assert dominant_type(counts, schema_type_hint("law.inventor.inventions")) == "entity"
+    assert dominant_type(counts) == "entity"
+    # An unambiguous majority still wins outright.
+    assert dominant_type(Counter({"City": 3, "Town": 1})) == "City"
+    assert dominant_type(Counter(["Island Group"])) == "Island Group"
+    assert dominant_type(Counter()) == "entity"
+
+
+def test_anchor_type_uses_its_own_relation_to_disambiguate() -> None:
+    graph = LocalQuestionGraph(
+        [
+            ["Abraham Lincoln", "government.us_president.vice_president", "Hannibal Hamlin"],
+            ["Abraham Lincoln", "common.topic.notable_types", "Artwork"],
+            ["Abraham Lincoln", "common.topic.notable_types", "US President"],
+            ["Hannibal Hamlin", "common.topic.notable_types", "US Vice President"],
+        ]
+    )
+
+    path, answers, _ = materialize_path(
+        graph, "Abraham Lincoln", ("government.us_president.vice_president::forward",)
+    )
+
+    assert path["anchor_type"] == "US President"
+    assert path["answer_type"] == "US Vice President"
+    assert answers == ["Hannibal Hamlin"]

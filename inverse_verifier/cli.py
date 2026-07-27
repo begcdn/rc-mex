@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .comparator_corpus import build_comparator_corpus
 from .comparator import (
     COMPARATOR_INPUT_MODES,
     evaluate_comparator,
@@ -159,6 +160,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generalize.add_argument("--batch-size", type=int, default=32)
     generalize.add_argument("--device", default="auto")
+
+    corpus = subparsers.add_parser(
+        "comparator-corpus",
+        help="turn a verify run into listwise comparator training data",
+    )
+    corpus.add_argument("--predictions", type=Path, required=True)
+    corpus.add_argument("--output", type=Path, required=True)
+    corpus.add_argument("--hard-negatives", type=int, default=12)
+    corpus.add_argument("--random-negatives", type=int, default=4)
+    corpus.add_argument("--dev-fraction", type=float, default=0.1)
+    corpus.add_argument("--seed", type=int, default=17)
 
     prepare_comparator = subparsers.add_parser(
         "prepare-comparator",
@@ -459,6 +471,17 @@ def main() -> None:
         )
         print(json.dumps(metrics["training_relative_coverage"], indent=2))
         print(f"Wrote faithful generalization evaluation to {args.output}")
+    elif args.command == "comparator-corpus":
+        manifest = build_comparator_corpus(
+            args.predictions,
+            args.output,
+            seed=args.seed,
+            dev_fraction=args.dev_fraction,
+            hard=args.hard_negatives,
+            random_count=args.random_negatives,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Wrote comparator corpus to {args.output}")
     elif args.command == "prepare-comparator":
         manifest = materialize_comparator_data(
             args.data,

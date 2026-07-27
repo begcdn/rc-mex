@@ -281,6 +281,10 @@ def candidate_log_entry(
         "generated_question": candidate["generated_question"],
         "retrieval_score": candidate.get("retrieval_score"),
         "score": candidate[score_key],
+        # Kept so a run can be turned into comparator training data without
+        # re-executing the graph, including the path-only ablation arms.
+        "path": candidate.get("path"),
+        "answer_evidence": candidate.get("answer_evidence"),
         "answer_count": len(answers),
         "unlabeled_answer_count": unlabeled_answer_count(answers),
         "answers": answers[:ANSWER_LOG_CAP],

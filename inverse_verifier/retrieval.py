@@ -70,24 +70,53 @@ class LocalQuestionGraph:
         label = relation_words(relation)
         return label if direction == "forward" else f"inverse of {label}"
 
-    def entity_type(self, entity: str) -> str:
-        return dominant_type(Counter(self.types.get(entity, set())))
+    def entity_type(self, entity: str, relation: str = "") -> str:
+        return dominant_type(
+            Counter(self.types.get(entity, set())), schema_type_hint(relation)
+        )
 
 
-def dominant_type(counts: Counter[str]) -> str:
+def schema_type_hint(relation: str) -> str:
+    """The entity type a Freebase relation id encodes for its subject.
+
+    ``government.us_president.vice_president`` is stated of a US President, so the
+    id itself says which of an entity's many types is the relevant one here.
+    """
+    pieces = relation.removeprefix("ns:").split(".")
+    if len(pieces) < 2:
+        return ""
+    return pieces[-2].replace("_", " ").casefold()
+
+
+def dominant_type(counts: Counter[str], schema_hint: str = "") -> str:
     """One type for a frontier, not the union of every type it contains.
 
     Joining every observed type produced answer types like "administrative division
     / body of water" for a path reaching both Ecuador and the Pacific Ocean, which
-    the generator then wrote into the question. No user asks that, and the training
-    corpus contains such unions in 1% of paths against 39% of live candidates, so
-    the serialization drifted away from what the generator was trained on. Ties
-    break alphabetically to keep the rendering deterministic.
+    the generator wrote straight into the question.
+
+    Freebase gives most entities several unrelated types, and they nearly always
+    tie on count, so any arbitrary tie-break decides the rendering. Alphabetical
+    order produced "Abraham Lincoln, an artwork" and "Benjamin Franklin, a film
+    character". The relation id resolves it when it can: a relation stated of a US
+    President selects that type. Otherwise this returns "entity" rather than
+    asserting one of several equally supported types, because a vague true
+    description beats a confident false one.
     """
     if not counts:
         return "entity"
     best = max(counts.values())
-    return sorted(name for name, count in counts.items() if count == best)[0]
+    top = sorted(name for name, count in counts.items() if count == best)
+    if len(top) == 1:
+        return top[0]
+    if schema_hint:
+        for name in top:
+            if name.casefold() == schema_hint:
+                return name
+        for name in top:
+            if schema_hint in name.casefold() or name.casefold() in schema_hint:
+                return name
+    return "entity"
 
 
 def materialize_path(
@@ -99,7 +128,8 @@ def materialize_path(
     frontier = {anchor}
     hops = []
     used_triples: set[tuple[str, str, str]] = set()
-    source_type = graph.entity_type(anchor)
+    first_relation = decode_edge(directed_relations[0])[0] if directed_relations else ""
+    source_type = graph.entity_type(anchor, first_relation)
     for edge in directed_relations:
         relation, direction = decode_edge(edge)
         next_frontier: set[str] = set()
@@ -119,7 +149,9 @@ def materialize_path(
         hops.append(Hop(relation, direction, source_type, target_type))
         frontier = next_frontier
         source_type = target_type
-    spec = PathSpec(anchor, graph.entity_type(anchor), tuple(hops), source_type, "webqsp")
+    spec = PathSpec(
+        anchor, graph.entity_type(anchor, first_relation), tuple(hops), source_type, "webqsp"
+    )
     return path_to_dict(spec), sorted(frontier), [list(triple) for triple in sorted(used_triples)]
 
 
