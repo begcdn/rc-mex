@@ -34,7 +34,17 @@ from .selector import (
 )
 
 
-SCORER_KINDS = ("cross_encoder", "nli_bidirectional", "bi_encoder")
+SCORER_KINDS = ("cross_encoder", "nli_bidirectional", "bi_encoder", "qwen3_reranker")
+
+# Instruction-following rerankers take the relevance criterion in words, so the
+# strict-equivalence rubric used in the manual judging can be stated directly
+# rather than learned.
+EQUIVALENCE_INSTRUCTION = (
+    "Given a user's question, find the question that asks for exactly the same "
+    "thing. Two questions are not the same if they differ in the direction of a "
+    "relation, or in the type of thing being asked for, or if one adds or drops a "
+    "condition."
+)
 
 
 def _device(name: str = "auto") -> str:
@@ -65,6 +75,9 @@ def score_pairs(
         left = model.encode([a for a, _ in pairs], batch_size=batch_size, normalize_embeddings=True)
         right = model.encode([b for _, b in pairs], batch_size=batch_size, normalize_embeddings=True)
         return [float((left[i] * right[i]).sum()) for i in range(len(pairs))]
+
+    if kind == "qwen3_reranker":
+        return _score_qwen3(pairs, model_name, resolved, batch_size)
 
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -106,6 +119,46 @@ def score_pairs(
         forward = run(batch).log_softmax(dim=-1)[:, entail]
         backward = run([(b, a) for a, b in batch]).log_softmax(dim=-1)[:, entail]
         scores.extend((forward + backward).tolist())
+    return scores
+
+
+def _score_qwen3(
+    pairs: list[tuple[str, str]],
+    model_name: str,
+    device: str,
+    batch_size: int,
+    instruction: str = EQUIVALENCE_INSTRUCTION,
+) -> list[float]:
+    """Score with a Qwen3 reranker, which answers yes/no rather than emitting a logit."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16
+    ).to(device).eval()
+    yes_id = tokenizer.convert_tokens_to_ids("yes")
+    no_id = tokenizer.convert_tokens_to_ids("no")
+
+    prefix = (
+        "<|im_start|>system\nJudge whether the Document meets the requirements based "
+        "on the Query and the Instruct provided. Note that the answer can only be "
+        '"yes" or "no".<|im_end|>\n<|im_start|>user\n'
+    )
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    scores: list[float] = []
+    for start in range(0, len(pairs), batch_size):
+        texts = [
+            f"{prefix}<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}{suffix}"
+            for query, doc in pairs[start : start + batch_size]
+        ]
+        encoded = tokenizer(
+            texts, padding=True, truncation=True, max_length=1024, return_tensors="pt"
+        ).to(device)
+        with torch.no_grad():
+            logits = model(**encoded).logits[:, -1, :].float()
+        pair = torch.stack([logits[:, no_id], logits[:, yes_id]], dim=1).log_softmax(dim=1)
+        scores.extend(pair[:, 1].cpu().tolist())
     return scores
 
 
@@ -284,6 +337,7 @@ def rescore_with_comparator(
 
     gold_path = gold_equivalent = 0
     totals = {"exact_match": 0.0, "f1": 0.0, "has_correct_answer": 0.0}
+    picks = []
     for row, result in zip(rows, scored, strict=True):
         candidates = result["candidates"]
         pool = candidates
@@ -298,6 +352,20 @@ def rescore_with_comparator(
         metrics = answer_metrics(best["answers"], row.get("gold_answers", []))
         for key in totals:
             totals[key] += metrics[key]
+        # Per-question picks, so two runs can be compared on the same questions
+        # rather than only by their averages.
+        picks.append(
+            {
+                "question_id": row["question_id"],
+                "question": row["question"],
+                "relation_sequence": best["relation_sequence"],
+                "generated_question": best["generated_question"],
+                "matches_gold_path": is_gold,
+                "exact_match": metrics["exact_match"],
+                "f1": metrics["f1"],
+                "answers": best["answers"][:20],
+            }
+        )
 
     count = max(len(rows), 1)
     result = {
@@ -313,4 +381,5 @@ def rescore_with_comparator(
     if output is not None:
         output.mkdir(parents=True, exist_ok=True)
         (output / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        write_jsonl(output / "picks.jsonl", picks)
     return result
