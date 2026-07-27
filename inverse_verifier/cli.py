@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .comparator_corpus import build_comparator_corpus
-from .rescore import SCORER_KINDS, rescore_run
+from .rescore import SCORER_KINDS, rescore_run, rescore_with_comparator
 from .comparator import (
     COMPARATOR_INPUT_MODES,
     evaluate_comparator,
@@ -184,6 +184,13 @@ def build_parser() -> argparse.ArgumentParser:
     rescore.add_argument("--batch-size", type=int, default=64)
     rescore.add_argument("--device", default="auto")
     rescore.add_argument("--no-endpoint-filter", action="store_true")
+    rescore.add_argument(
+        "--comparator",
+        help="trained comparator checkpoint; uses its stored input mode instead of --kind",
+    )
+    rescore.add_argument(
+        "--graphs", type=Path, help="graphs file, to rebuild paths for path-using modes"
+    )
 
     prepare_comparator = subparsers.add_parser(
         "prepare-comparator",
@@ -496,6 +503,18 @@ def main() -> None:
         print(json.dumps(manifest, indent=2))
         print(f"Wrote comparator corpus to {args.output}")
     elif args.command == "rescore":
+        if args.comparator:
+            result = rescore_with_comparator(
+                args.predictions,
+                args.comparator,
+                args.output,
+                graphs=args.graphs,
+                device=args.device,
+                batch_size=args.batch_size,
+                endpoint_filter=not args.no_endpoint_filter,
+            )
+            print(json.dumps(result, indent=2))
+            return
         result = rescore_run(
             args.predictions,
             args.model,

@@ -177,4 +177,140 @@ def rescore_run(
         output.mkdir(parents=True, exist_ok=True)
         (output / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_jsonl(output / "selections.jsonl", selections)
+        # Every candidate's score, so independently-scored runs can be combined
+        # afterwards without re-running any model.
+        cursor = 0
+        dumped = []
+        for row in rows:
+            scored = []
+            for candidate in row["candidate_log"]:
+                scored.append(
+                    {
+                        "relation_sequence": candidate["relation_sequence"],
+                        "score": scores[cursor],
+                        "matches_gold_path": candidate["matches_gold_path"],
+                    }
+                )
+                cursor += 1
+            dumped.append({"question_id": row["question_id"], "candidates": scored})
+        write_jsonl(output / "scores.jsonl", dumped)
+    return result
+
+
+def rebuild_paths(predictions: list[dict[str, Any]], graphs: Path) -> None:
+    """Fill in each candidate's path by re-executing its relations on the graph.
+
+    Runs before the path field was logged do not carry it, and the path-only and
+    combined comparator modes need it. Re-executing the stored relation sequence
+    reproduces exactly what the pipeline built, so no run has to be repeated.
+    """
+    from .retrieval import LocalQuestionGraph, materialize_path
+
+    by_id = {row["question_id"]: row for row in predictions}
+    with graphs.open(encoding="utf-8") as handle:
+        for line in handle:
+            graph_row = json.loads(line)
+            row = by_id.get(graph_row["id"])
+            if row is None:
+                continue
+            graph = LocalQuestionGraph(graph_row.get("graph", []))
+            anchors = graph_row.get("q_entity", [])
+            for candidate in row["candidate_log"]:
+                if candidate.get("path"):
+                    continue
+                for anchor in anchors:
+                    path, answers, _ = materialize_path(
+                        graph, anchor, tuple(candidate["relation_sequence"])
+                    )
+                    if answers:
+                        candidate["path"] = path
+                        break
+
+
+def rescore_with_comparator(
+    predictions: Path,
+    model_path: str,
+    output: Path | None = None,
+    graphs: Path | None = None,
+    device: str = "auto",
+    batch_size: int = 8,
+    endpoint_filter: bool = True,
+) -> dict[str, Any]:
+    """Re-rank a run with a trained comparator checkpoint, in whichever mode it stores."""
+    from .comparator import (
+        comparator_answer_evidence,
+        comparator_path_text,
+        load_comparator,
+        score_comparator_rows,
+    )
+    from .data import unlabeled_answer_count
+
+    started = time.time()
+    rows = read_jsonl(predictions)
+    model, tokenizer, resolved, mode = load_comparator(model_path, device)
+    if mode != "question_generated" and graphs is not None:
+        rebuild_paths(rows, graphs)
+
+    scored_rows = []
+    for row in rows:
+        candidates = []
+        for candidate in row["candidate_log"]:
+            path = candidate.get("path") or {}
+            answers = candidate.get("answers", [])
+            candidates.append(
+                {
+                    **candidate,
+                    "is_positive": False,
+                    "negative_type": "unlabeled",
+                    "path_text": comparator_path_text(path, ", ".join(answers[:10]))
+                    if path
+                    else "",
+                    "answer_evidence": candidate.get("answer_evidence")
+                    or comparator_answer_evidence(
+                        answers, path.get("answer_type"), unlabeled_answer_count(answers)
+                    ),
+                }
+            )
+        scored_rows.append(
+            {
+                "example_id": row["question_id"],
+                "original_question": row["question"],
+                "candidates": candidates,
+            }
+        )
+    scored = score_comparator_rows(
+        model, tokenizer, scored_rows, mode, resolved, batch_size
+    )
+
+    gold_path = gold_equivalent = 0
+    totals = {"exact_match": 0.0, "f1": 0.0, "has_correct_answer": 0.0}
+    for row, result in zip(rows, scored, strict=True):
+        candidates = result["candidates"]
+        pool = candidates
+        if endpoint_filter:
+            pool = [c for c in candidates if has_answerable_endpoint(c)] or candidates
+        best = max(pool, key=lambda c: c["cross_encoder_score"])
+        gold_sequences = {tuple(s) for s in row.get("gold_sequences", [])}
+        equivalent = gold_equivalent_answer_sets(candidates, gold_sequences)
+        is_gold = tuple(best["relation_sequence"]) in gold_sequences
+        gold_path += is_gold
+        gold_equivalent += is_gold or answer_set_key(best["answers"]) in equivalent
+        metrics = answer_metrics(best["answers"], row.get("gold_answers", []))
+        for key in totals:
+            totals[key] += metrics[key]
+
+    count = max(len(rows), 1)
+    result = {
+        "predictions": str(predictions),
+        "model": model_path,
+        "input_mode": mode,
+        "questions": len(rows),
+        "selected_gold_path_accuracy": gold_path / count,
+        "selected_gold_equivalent_accuracy": gold_equivalent / count,
+        **{f"answer_{k}": v / count for k, v in totals.items()},
+        "elapsed_seconds": time.time() - started,
+    }
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
