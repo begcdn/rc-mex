@@ -34,7 +34,13 @@ from .selector import (
 )
 
 
-SCORER_KINDS = ("cross_encoder", "nli_bidirectional", "bi_encoder", "qwen3_reranker")
+SCORER_KINDS = (
+    "cross_encoder",
+    "nli_bidirectional",
+    "bi_encoder",
+    "qwen3_reranker",
+    "bge_gemma",
+)
 
 # Instruction-following rerankers take the relevance criterion in words, so the
 # rubric used in the manual judging can be stated directly rather than learned.
@@ -84,6 +90,9 @@ def score_pairs(
 
     if kind == "qwen3_reranker":
         return _score_qwen3(pairs, model_name, resolved, batch_size)
+
+    if kind == "bge_gemma":
+        return _score_bge_gemma(pairs, model_name, resolved, batch_size)
 
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -165,6 +174,77 @@ def _score_qwen3(
             logits = model(**encoded).logits[:, -1, :].float()
         pair = torch.stack([logits[:, no_id], logits[:, yes_id]], dim=1).log_softmax(dim=1)
         scores.extend(pair[:, 1].cpu().tolist())
+    return scores
+
+
+def _score_bge_gemma(
+    pairs: list[tuple[str, str]],
+    model_name: str,
+    device: str,
+    batch_size: int,
+    max_length: int = 512,
+) -> list[float]:
+    """Score with BAAI's LLM-based reranker, which uses its own prompt layout.
+
+    Format is taken from the model card: the query prefixed "A: ", the passage
+    prefixed "B: ", the instruction appended last, and the score read from the
+    logit of the "Yes" token at the final position. Feeding it the Qwen3 chat
+    template instead would still produce numbers, which is why the layout is
+    reproduced rather than guessed.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    prompt = (
+        "Given a query A and a passage B, determine whether the passage contains an "
+        "answer to the query by providing a prediction of either 'Yes' or 'No'."
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16
+    ).to(device).eval()
+    yes_loc = tokenizer("Yes", add_special_tokens=False)["input_ids"][0]
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    sep_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
+
+    scores: list[float] = []
+    for start in range(0, len(pairs), batch_size):
+        items = []
+        for query, passage in pairs[start : start + batch_size]:
+            query_ids = tokenizer(
+                f"A: {query}",
+                add_special_tokens=False,
+                max_length=max_length * 3 // 4,
+                truncation=True,
+            )["input_ids"]
+            passage_ids = tokenizer(
+                f"B: {passage}",
+                add_special_tokens=False,
+                max_length=max_length,
+                truncation=True,
+            )["input_ids"]
+            item = tokenizer.prepare_for_model(
+                [tokenizer.bos_token_id] + query_ids,
+                sep_ids + passage_ids,
+                truncation="only_second",
+                max_length=max_length,
+                padding=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+                add_special_tokens=False,
+            )
+            item["input_ids"] = item["input_ids"] + sep_ids + prompt_ids
+            item["attention_mask"] = [1] * len(item["input_ids"])
+            items.append(item)
+        encoded = tokenizer.pad(
+            items,
+            padding=True,
+            max_length=max_length + len(sep_ids) + len(prompt_ids),
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            logits = model(**encoded, return_dict=True).logits[:, -1, yes_loc]
+        scores.extend(logits.view(-1).float().cpu().tolist())
     return scores
 
 
