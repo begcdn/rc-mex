@@ -1,121 +1,117 @@
 # Where We Stand
 
-A consolidation. What is established, what is assumed, what was wrong, and what
-decides the next step.
+Supersedes the earlier version, whose headline conclusions — that the comparator
+scores ~53% and that the verifier does not beat its own proposer — were both
+overturned.
 
-## The hypothesis
+## Result
+
+On 100 WebQSP test questions, same candidates throughout:
+
+| selector | gold path | answer EM | F1 |
+|---|---:|---:|---:|
+| no verifier (proposer's own top pick) | 0.53 | 0.53 | 0.585 |
+| original DeBERTa comparator | 0.41 | 0.52 | 0.565 |
+| BGE-reranker-v2-m3, off the shelf | 0.51 | 0.65 | 0.709 |
+| **BGE fine-tuned, `question_generated`** | 0.66 | 0.71 | 0.772 |
+| **BGE fine-tuned, `question_path`** | 0.71 | 0.72 | 0.794 |
+| **BGE fine-tuned, `question_generated_path`** | 0.70 | **0.74** | 0.801 |
+
+**0.53 → 0.74 exact match.** The verifier decisively beats the no-verifier
+baseline for the first time. Two changes produced it: a reranker-class base model
+instead of a paraphrase-class one, and fine-tuning on real pipeline candidates
+labelled by answer-set equivalence.
+
+## The hypothesis, restated against evidence
 
 > A candidate path is correct if the question generated from it means the same as
 > the question the user asked.
 
-For that to work, four things must hold. Three have been measured. The fourth
-never has, and it is the one that decides whether the method can work at all.
-
 | # | Requirement | Status |
 |---|---|---|
-| 1 | The generator faithfully turns a path into its question | **88%**, hand-judged on 90 real cases |
-| 2 | The correct path is among the candidates | **90%** at K=100 |
-| 3 | The comparator can tell same-meaning from different-meaning | **~53%**, and only as a proxy |
-| 4 | **Meaning-equivalence actually separates right paths from wrong ones** | **never tested** |
+| 1 | The generator faithfully turns a path into its question | 88%, hand-judged |
+| 2 | The correct path is among the candidates | 90% at K=100 |
+| 3 | The comparator can rank a correct candidate first | **0.71–0.74 EM** |
+| 4 | Meaning-equivalence separates right paths from wrong ones | **supported** — a verifier reading only generated questions reaches 0.71 against 0.53 for none |
+| 5 | **The generated question beats the raw path** | **not supported** |
 
-## Requirement 4 is the real question
+Requirement 5 was never part of the original hypothesis but is what decides the
+contribution. Paired over the same 100 questions:
 
-The method assumes that a wrong path produces a question that *means something
-different*. Where that fails, no comparator can help, because the information
-needed is not in the question.
+| comparison | metric | W–L | p |
+|---|---|---:|---:|
+| generated vs path | answer EM | 7–8 | 1.000 |
+| generated vs path | gold path | 6–11 | 0.332 |
+| both vs generated | answer EM | 7–4 | 0.549 |
 
-"Where is JaMarcus Russell from?" — nationality and place of birth are both honest
-readings of that English sentence. They give different answers. WebQSP picked one.
-No amount of meaning-comparison recovers which one was intended, because the
-question does not say.
+Nothing separates them. Generating a question is neither better nor worse than
+showing the reranker the serialized path.
 
-The hand audit already hints at the size of this: **15 of 90 annotated paths do not
-answer their own question**, and several disagreements were of exactly this kind.
+Two facts qualify that:
 
-This makes the labelling task in `comparator_labels_to_judge.md` more valuable than
-originally framed. It measures two things, not one:
+- The arms **pick the same candidate on only 67 of 100 questions**, and at least
+  one of them is right on **79**. There is 5–7 points of complementary signal that
+  neither arm nor their naive concatenation captures.
+- The generated-question arm runs **6× faster** (18s against 115s), because a
+  question is short and a serialized path is not.
 
-- **Comparator accuracy** — given candidates whose meaning is known, does it rank a
-  correct one first?
-- **The ceiling of the method** — how often do *several* candidates mean the same
-  thing as the original while returning *different* answers? Every such case is
-  unwinnable by meaning-comparison alone.
+## Base model: family and training, not size
 
-If the ceiling is high, the comparator is the problem and it is fixable. If the
-ceiling is low, the architecture needs a different framing, and no amount of
-comparator work will help. **We do not currently know which world we are in, and
-almost every hour spent so far assumed the first.**
+All off the shelf, same 100 questions:
 
-## Established
+| model | size | answer EM |
+|---|---:|---:|
+| bge-reranker-base (v1) | 278M | 0.44 |
+| bge-reranker-large (v1) | 560M | 0.43 |
+| bge-reranker-v2-m3 | 568M | **0.65** |
+| Qwen3-Reranker-0.6B + equivalence instruction | 0.6B | 0.57 |
+| QQP roberta-large | 355M | 0.51 |
+| NLI deberta-v3-large (bidirectional) | 435M | 0.36 |
 
-- **Firewall is clean.** Zero question-id or question-text overlap between WebQSP
-  train and test. All 580 generator-corpus anchors come from train graphs.
-- **Gold is correctly defined.** Executing every annotated path over 1,155
-  questions yields zero cases returning a non-empty answer set with no gold
-  overlap — the signature a direction bug would leave.
-- **Nothing cheats.** `select_candidate` takes no gold argument.
-- **Generator ≈ 88%** faithful; holds under either annotator alone (90% / 86%).
-- **Comparator ≈ 53%** on cases where the generator provably worked.
-- **The comparator does not beat the proposer's own top pick** — 0.41 against 0.50,
-  17 wins to 25 losses, p = 0.28. No demonstrated benefit in either direction.
-- **No off-the-shelf comparator beats the trained one:** QQP-large 0.35, STS-B 0.32,
-  NLI-base 0.25, NLI-large 0.19, QQP-distil 0.22, against 0.41. Bidirectional
-  entailment, which I predicted would be the stronger prior, is the worst.
-- **Winner's curse is real.** As the candidate pool grows 1→100, the winning score
-  climbs from −2.74 to −0.31 while accuracy falls 0.50→0.43, and the gold path's own
-  score does not improve. Scoring candidates independently and taking the maximum
-  systematically selects for lucky overestimates.
-- **Ensembling two comparators beats both** (0.53→0.58 EM), consistent with the
-  variance story, but p = 0.18.
+Doubling size within v1 changes nothing (0.44 → 0.43); at the same size, v2 gains
+22 points. Within this family size is not the lever. That does not license a claim
+about modern families — Qwen3-Reranker-4B is the outstanding test.
 
-## Assumed, not established
+Instruction-following did not help at 0.6B. Bidirectional entailment, predicted to
+be the strongest general prior, was the worst.
 
-- That the training corpus is the binding constraint. It is small (2,022 rows, 709
-  relations, 45% seen once) and 72% of relations met at inference were never seen.
-  But a model trained on 400k human pairs (QQP) does *worse*, and unseen-relation
-  candidates are barely overrepresented among errors (12% vs 5%). Volume is
-  probably not the lever.
-- That path-selection accuracy is the right target. 17% of annotated paths do not
-  answer their own question, so this metric has a noise floor and a ceiling well
-  below 1.0.
-- That the method is novel. The search was four queries with noisy results. A
-  proper related-work pass has never been done. Query-graph reranking with
-  answer-type information is structurally close.
+**Fine-tuning on 506 examples was worth more than any base-model swap** (0.65 →
+0.74), which also settles the earlier question: that corpus size is sufficient to
+improve an already-strong ranker.
 
-## Mistakes made
+## Three framings
 
-1. **Tuned before measuring.** Endpoint filters, type fixes, voting, K sweeps and
-   ensembles were all attempts to move a metric that cannot isolate what they
-   change. This is the root cause of the project feeling directionless.
-2. **Fixed the disjunctive-type bug in the wrong component.** It appeared in 39% of
-   live candidates and 1% of the training corpus; both numbers were available and
-   never compared. Cost a generator retrain, which then hallucinated types.
-3. **Promoted `vote_filtered` to primary on a one-question margin** before any run.
-   The full run reversed it.
-4. **Claimed constraint coverage came "free."** Selection cannot subset a
-   denotation; 61% of constrained questions need an executable filter.
-5. **Never checked where the field stands** until asked. WebQSP SOTA is ~88% Hits@1;
-   this pipeline is at ~63% in an easier setting.
-6. **Ignored multiple comparisons.** ~20 comparisons so far; the endpoint filter's
-   p = 0.031 does not survive correction.
+1. **"A reranker over executed KG paths, fine-tuned on answer-equivalence labels,
+   lifts a strong retriever from 0.53 to 0.74."** Fully supported today. The
+   answer-equivalence labelling is the novel piece: it found 40% more valid
+   training candidates than annotated-path matching, because Freebase reaches one
+   answer many ways and 17% of annotated paths do not answer their own question.
+2. **"Question generation is an equally good, cheaper, schema-independent way to
+   feed that reranker."** Supported on cost and parity, not on accuracy. The
+   schema-independence claim is untested and is the one experiment that would make
+   this framing real: a generated question is KG-agnostic, a serialized Freebase
+   path is not. If the generated-question comparator transfers to another graph and
+   the path one does not, the generator earns its place.
+3. **"Reconstructing the question is what verifies the path."** Closed. Requirement
+   5 fails.
 
-## What decides the next step
+## Still true and still limiting
 
-Label the 500 candidates. Two numbers come out:
+- **Controlled setting.** Gold topic entities supplied, 71% of questions, two hops.
+  Not comparable to the ~88% Hits@1 published on full WebQSP.
+- **n = 100**, ±0.10 intervals. Only paired tests carry weight, and ~25 comparisons
+  have now been run without correction.
+- **17% of annotated paths do not answer their own question**, a noise floor under
+  every path-match number.
+- **The comparator has never been measured in isolation.** The 500-item labelling
+  task exists for this and is unstarted; it would also give the ceiling number that
+  decides ranker-versus-filter.
 
-**A. Comparator accuracy** — the benchmark everything else is measured against.
+## Next
 
-**B. Ceiling** — the fraction of questions where several equally-valid meanings map
-to different answers.
-
-- **If B is small (<15%)**: the method can work. Improve the comparator — real-data
-  training, larger base model, group-wise scoring instead of independent scoring.
-  Then demonstrate value by reranking an existing system's candidates (RoG), which
-  is a far easier claim than beating SOTA from scratch.
-- **If B is large (>30%)**: meaning-comparison alone cannot select paths, and the
-  architecture needs a different role. The natural one is as a *filter* rather than
-  a *ranker* — reject paths whose question clearly differs, and let another signal
-  break the remaining ties.
-
-Either result is publishable. The current state — three requirements measured, the
-fourth assumed — is not.
+1. **Decide the framing.** Framing 1 is defensible now.
+2. **Cross-KG transfer**, which is the only experiment that rescues framing 2.
+3. **Rerank another system's candidates** (RoG) — a plug-in improvement is a far
+   easier claim than beating SOTA from scratch.
+4. The 500 meaning labels, which remain the only clean measurement of the
+   comparator alone.
