@@ -178,7 +178,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-rank a finished run with a different comparator, no graph pass",
     )
     rescore.add_argument("--predictions", type=Path, required=True)
-    rescore.add_argument("--model", required=True)
+    rescore.add_argument(
+        "--model", help="off-the-shelf model id; mutually exclusive with --comparator"
+    )
     rescore.add_argument("--kind", choices=SCORER_KINDS, default="cross_encoder")
     rescore.add_argument("--output", type=Path)
     rescore.add_argument("--batch-size", type=int, default=64)
@@ -503,6 +505,8 @@ def main() -> None:
         print(json.dumps(manifest, indent=2))
         print(f"Wrote comparator corpus to {args.output}")
     elif args.command == "rescore":
+        if bool(args.model) == bool(args.comparator):
+            parser.error("rescore needs exactly one of --model or --comparator")
         if args.comparator:
             result = rescore_with_comparator(
                 args.predictions,
