@@ -466,8 +466,10 @@ from inverse_verifier.selector import (
     candidate_log_entry,
     candidate_score,
     enumerate_path_families,
+    answer_set_key,
     evaluation_subset_coverage,
     first_gold_rank,
+    gold_equivalent_answer_sets,
     has_answerable_endpoint,
     select_candidate,
 )
@@ -2207,6 +2209,12 @@ def test_pipeline_reports_selection_ablation_and_full_candidate_log(
     assert metrics["answer_exact_match"] == 0.0
     assert metrics["unanswerable_endpoint_selection_rate"] == 1.0
     assert metrics["evaluation_subset"]["supported_questions"] == 1
+    # official_language is not the annotated path but returns exactly what it
+    # returns, so the comparator is not marked wrong for choosing it.
+    v = row_variants = metrics["selection_variants"]
+    assert v["comparator_filtered"]["selected_gold_path_accuracy"] == 1.0
+    assert v["comparator"]["selected_gold_path_accuracy"] == 0.0
+    assert v["comparator"]["selected_gold_equivalent_accuracy"] == 0.0
 
     row = json.loads((output / "predictions.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert len(row["candidate_log"]) == len(families)
@@ -2282,3 +2290,26 @@ def test_canonical_answer_role_follows_traversal_direction() -> None:
     assert canonical_answer_role(bwd, glossary) == "Composer"
     # Without a glossary the stored answer type is used, still de-disjoined.
     assert canonical_answer_role({"answer_type": "city / town", "hops": []}, None) == "city"
+
+
+def test_gold_equivalent_credits_a_different_route_to_the_same_answers() -> None:
+    # WebQSP annotates one path, but Freebase reaches the same answers many ways.
+    # Scoring only exact path identity marks the verifier wrong for being right.
+    verified = [
+        {"relation_sequence": ["annotated::forward"], "answers": ["Novelist", "Playwright"]},
+        {"relation_sequence": ["other::forward"], "answers": ["playwright", " Novelist "]},
+        {"relation_sequence": ["wrong::forward"], "answers": ["Nairobi"]},
+    ]
+    gold = {("annotated::forward",)}
+
+    equivalent = gold_equivalent_answer_sets(verified, gold)
+
+    assert answer_set_key(verified[1]["answers"]) in equivalent
+    assert answer_set_key(verified[2]["answers"]) not in equivalent
+    # Order and case must not matter when comparing answer sets.
+    assert answer_set_key(["B", "a"]) == answer_set_key([" A ", "b"])
+
+
+def test_gold_equivalent_is_empty_when_no_annotated_path_was_verified() -> None:
+    verified = [{"relation_sequence": ["other::forward"], "answers": ["Kingston"]}]
+    assert gold_equivalent_answer_sets(verified, {("annotated::forward",)}) == set()

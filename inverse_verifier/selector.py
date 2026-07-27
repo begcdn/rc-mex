@@ -76,6 +76,26 @@ def has_answerable_endpoint(candidate: dict[str, Any]) -> bool:
     return bool(answers) and unlabeled_answer_count(answers) < len(answers)
 
 
+def answer_set_key(answers: list[str]) -> tuple[str, ...]:
+    return tuple(sorted({answer.casefold().strip() for answer in answers if answer.strip()}))
+
+
+def gold_equivalent_answer_sets(
+    verified: list[dict[str, Any]], gold_sequences: set[tuple[str, ...]]
+) -> set[tuple[str, ...]]:
+    """Answer sets produced by an annotated path, for evaluation only.
+
+    Freebase reaches one answer many ways, so a candidate that is not the
+    annotated path can still return exactly what the annotated path returns.
+    Scoring only exact path identity marks the verifier wrong for being right.
+    """
+    return {
+        answer_set_key(candidate["answers"])
+        for candidate in verified
+        if tuple(candidate["relation_sequence"]) in gold_sequences
+    }
+
+
 def candidate_score(candidate: dict[str, Any], score_key: str, source: str) -> float:
     """Score a candidate under one evidence source.
 
@@ -423,16 +443,20 @@ def run_verifier_pipeline(
             gold_sequence_set = {tuple(sequence) for sequence in gold_sequences}
             gold_answers = graph_row.get("answer", [])
             gold_answer_set = {answer.casefold().strip() for answer in gold_answers}
+            gold_answer_sets = gold_equivalent_answer_sets(verified, gold_sequence_set)
             variants = {}
             for name, policy in SELECTION_VARIANTS.items():
                 choice = select_candidate(verified, score_key, **policy)
+                is_gold = tuple(choice["relation_sequence"]) in gold_sequence_set
                 variants[name] = {
                     "relation_sequence": choice["relation_sequence"],
                     "generated_question": choice["generated_question"],
                     "score": choice[score_key],
                     "answer_count": len(choice["answers"]),
-                    "selected_is_gold_path": tuple(choice["relation_sequence"])
-                    in gold_sequence_set,
+                    "selected_is_gold_path": is_gold,
+                    "selected_is_gold_equivalent": bool(
+                        is_gold or answer_set_key(choice["answers"]) in gold_answer_sets
+                    ),
                     "answer_metrics": answer_metrics(choice["answers"], gold_answers),
                 }
             endpoint_filter_fell_back = not any(
@@ -518,6 +542,11 @@ def run_verifier_pipeline(
                     for row in results
                 )
                 / max(count, 1),
+                "selected_gold_equivalent_accuracy": sum(
+                    row["selection_variants"][name]["selected_is_gold_equivalent"]
+                    for row in results
+                )
+                / max(count, 1),
                 **{
                     f"answer_{metric}": sum(
                         row["selection_variants"][name]["answer_metrics"][metric]
@@ -556,6 +585,11 @@ def run_verifier_pipeline(
         )
         / max(sum(row["gold_path_in_available_graph"] for row in results), 1),
         "selected_gold_path_accuracy": sum(row["selected_is_gold_path"] for row in results)
+        / max(count, 1),
+        "selected_gold_equivalent_accuracy": sum(
+            row["selection_variants"][PRIMARY_SELECTION]["selected_is_gold_equivalent"]
+            for row in results
+        )
         / max(count, 1),
         "gold_verified_rate": sum(row["gold_was_verified"] for row in results) / max(count, 1),
         "threshold_stop_rate": sum(row["stopped_on_threshold"] for row in results) / max(count, 1),
@@ -600,10 +634,13 @@ def run_verifier_pipeline(
         "",
         f"All variants reuse the same generator and comparator scores; `{PRIMARY_SELECTION}` is reported above.",
         "",
-        "| Selection | Selected gold path | Answer EM | Answer F1 |",
-        "|---|---:|---:|---:|",
+        "`gold-equivalent` credits a non-annotated path that returns exactly what the annotated path returns.",
+        "",
+        "| Selection | Selected gold path | Gold-equivalent | Answer EM | Answer F1 |",
+        "|---|---:|---:|---:|---:|",
         *[
             f"| `{name}` | {values['selected_gold_path_accuracy']:.3f} | "
+            f"{values['selected_gold_equivalent_accuracy']:.3f} | "
             f"{values['answer_exact_match']:.3f} | {values['answer_f1']:.3f} |"
             for name, values in metrics["selection_variants"].items()
         ],
