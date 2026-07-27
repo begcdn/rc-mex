@@ -506,7 +506,7 @@ def main() -> None:
         print(f"Wrote comparator corpus to {args.output}")
     elif args.command == "rescore":
         if bool(args.model) == bool(args.comparator):
-            parser.error("rescore needs exactly one of --model or --comparator")
+            raise SystemExit("rescore needs exactly one of --model or --comparator")
         if args.comparator:
             result = rescore_with_comparator(
                 args.predictions,
