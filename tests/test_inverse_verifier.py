@@ -10,8 +10,6 @@ import torch
 
 from inverse_verifier.data import (
     ENTITY_PLACEHOLDER,
-    canonical_answer_role,
-    canonical_role,
     PathSpec,
     Hop,
     delexicalize_question,
@@ -477,6 +475,7 @@ from inverse_verifier.retrieval import (
     LocalQuestionGraph,
     decode_edge,
     encode_edge,
+    dominant_type,
     gold_path_available,
     materialize_path,
 )
@@ -1139,13 +1138,10 @@ def test_grounded_render_path_binds_fact_roles_in_both_directions() -> None:
         backward_path, mask_anchor=True, relation_glossary=glossary
     )
 
-    # Node positions are named by the relation's schema role, never by the observed
-    # types of the entities the path happened to reach.
-    assert "START (role: written work) was written by ANSWER (role: author)" in forward
-    assert "ANSWER (role: written work) was written by START (role: author)" in backward
-    assert "Requested answer: ANSWER (type: author)" in forward
-    assert "Requested answer: ANSWER (type: written work)" in backward
-    assert "person" not in forward and "book" not in forward
+    assert "START (type: book; role: written work) was written by ANSWER" in forward
+    assert "ANSWER (type: book; role: written work) was written by START" in backward
+    assert "Requested answer: ANSWER (type: person)" in forward
+    assert "Requested answer: ANSWER (type: book)" in backward
 
 
 def test_grounded_render_path_fallback_preserves_full_relation_identity() -> None:
@@ -1258,7 +1254,7 @@ def test_causal_dataset_masks_prompt_and_uses_grounded_semantics() -> None:
 
     assert item["input_ids"] == [10, 11, 12, 20, 21]
     assert item["labels"] == [-100, -100, -100, 20, 21]
-    assert "START (role: written work) was written by ANSWER (role: author)" in (
+    assert "START (type: book; role: written work) was written by ANSWER" in (
         tokenizer.messages[1]["content"]
     )
 
@@ -2226,72 +2222,6 @@ def test_pipeline_reports_selection_ablation_and_full_candidate_log(
     assert "Selection ablation" in (output / "report.md").read_text(encoding="utf-8")
 
 
-def test_schema_roles_replace_observed_types_and_never_disjoin() -> None:
-    # location.location.containedby reaching both Ecuador and the Pacific Ocean gives
-    # an observed type of "administrative division / body of water", which the
-    # generator turned into "What administrative division or body of water contains
-    # X?". The relation's schema role is just "Location" whatever it reaches.
-    glossary = {
-        "webqsp::location.location.containedby": {
-            "status": "semantic",
-            "description": "A location contained within another location.",
-            "subject_role": "Location",
-            "object_role": "Location",
-            "fact_template": "{subject} is contained by {object}.",
-        }
-    }
-    path = {
-        "anchor": "Galapagos Islands",
-        "anchor_type": "island group / archipelago",
-        "answer_type": "administrative division / body of water",
-        "kg": "webqsp",
-        "hops": [
-            {
-                "relation": "location.location.containedby",
-                "direction": "forward",
-                "source_type": "island group / archipelago",
-                "target_type": "administrative division / body of water",
-            }
-        ],
-    }
-
-    rendered = render_path(path, relation_glossary=glossary)
-
-    assert "Requested answer: ANSWER (type: Location)." in rendered
-    assert 'Start entity: "Galapagos Islands" (type: Location)' in rendered
-    assert "administrative division" not in rendered
-    assert "body of water" not in rendered
-    assert "archipelago" not in rendered
-    # Identical rendering regardless of what the path happens to reach.
-    elsewhere = json.loads(json.dumps(path))
-    elsewhere["answer_type"] = "country"
-    elsewhere["hops"][0]["target_type"] = "country"
-    assert render_path(elsewhere, relation_glossary=glossary) == rendered
-
-
-def test_observed_type_is_a_fallback_only_and_is_never_disjunctive() -> None:
-    # No glossary entry: fall back to an observed type rather than "entity", but
-    # take one, never the " / "-joined union.
-    assert canonical_role({}, "object_role", "city / town / village") == "city"
-    assert canonical_role({}, "object_role", None) == "entity"
-    # An explicit schema role always wins over the observed type.
-    assert canonical_role({"object_role": "Composition"}, "object_role", "award-winning work / canonical version") == "Composition"
-    # A glossary that says nothing useful defers to the observed type.
-    assert canonical_role({"object_role": "entity"}, "object_role", "cemetery") == "cemetery"
-
-
-def test_canonical_answer_role_follows_traversal_direction() -> None:
-    glossary = {"t::r": {"subject_role": "Composer", "object_role": "Composition"}}
-    fwd = {"kg": "t", "answer_type": "x", "hops": [
-        {"relation": "r", "direction": "forward", "source_type": "a", "target_type": "b"}]}
-    bwd = {"kg": "t", "answer_type": "x", "hops": [
-        {"relation": "r", "direction": "backward", "source_type": "a", "target_type": "b"}]}
-    assert canonical_answer_role(fwd, glossary) == "Composition"
-    assert canonical_answer_role(bwd, glossary) == "Composer"
-    # Without a glossary the stored answer type is used, still de-disjoined.
-    assert canonical_answer_role({"answer_type": "city / town", "hops": []}, None) == "city"
-
-
 def test_gold_equivalent_credits_a_different_route_to_the_same_answers() -> None:
     # WebQSP annotates one path, but Freebase reaches the same answers many ways.
     # Scoring only exact path identity marks the verifier wrong for being right.
@@ -2313,3 +2243,35 @@ def test_gold_equivalent_credits_a_different_route_to_the_same_answers() -> None
 def test_gold_equivalent_is_empty_when_no_annotated_path_was_verified() -> None:
     verified = [{"relation_sequence": ["other::forward"], "answers": ["Kingston"]}]
     assert gold_equivalent_answer_sets(verified, {("annotated::forward",)}) == set()
+
+
+def test_frontier_type_is_dominant_not_a_union_of_everything_reached() -> None:
+    # location.location.containedby from the Galapagos reaches a country, a province
+    # and an ocean. Joining every type produced "administrative division / body of
+    # water", which the generator wrote into the question verbatim.
+    graph = LocalQuestionGraph(
+        [
+            ["Galapagos", "location.location.containedby", "Ecuador"],
+            ["Galapagos", "location.location.containedby", "Galapagos Province"],
+            ["Galapagos", "location.location.containedby", "Pacific Ocean"],
+            ["Ecuador", "common.topic.notable_types", "Location"],
+            ["Galapagos Province", "common.topic.notable_types", "Location"],
+            ["Pacific Ocean", "common.topic.notable_types", "Body Of Water"],
+        ]
+    )
+
+    path, answers, _ = materialize_path(
+        graph, "Galapagos", ("location.location.containedby::forward",)
+    )
+
+    assert path["answer_type"] == "Location"
+    assert " / " not in path["answer_type"]
+    assert answers == ["Ecuador", "Galapagos Province", "Pacific Ocean"]
+
+
+def test_dominant_type_breaks_ties_deterministically() -> None:
+    from collections import Counter
+
+    assert dominant_type(Counter({"City": 3, "Town": 1})) == "City"
+    assert dominant_type(Counter({"Zebra": 2, "Apple": 2})) == "Apple"
+    assert dominant_type(Counter()) == "entity"

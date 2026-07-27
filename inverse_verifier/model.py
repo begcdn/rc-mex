@@ -1003,7 +1003,7 @@ def train_model(
         "best_dev_selection_loss": best_dev_loss,
         "regime": regime,
         "objective": objective,
-        "input_contract": "grounded_relation_semantics_v2" if relation_glossary else "legacy",
+        "input_contract": "grounded_relation_semantics_v1" if relation_glossary else "legacy",
         "relation_glossary_entries": len(relation_glossary),
         "history": history,
     }

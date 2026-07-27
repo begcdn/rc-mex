@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +71,23 @@ class LocalQuestionGraph:
         return label if direction == "forward" else f"inverse of {label}"
 
     def entity_type(self, entity: str) -> str:
-        return " / ".join(sorted(self.types.get(entity, set()))) or "entity"
+        return dominant_type(Counter(self.types.get(entity, set())))
+
+
+def dominant_type(counts: Counter[str]) -> str:
+    """One type for a frontier, not the union of every type it contains.
+
+    Joining every observed type produced answer types like "administrative division
+    / body of water" for a path reaching both Ecuador and the Pacific Ocean, which
+    the generator then wrote into the question. No user asks that, and the training
+    corpus contains such unions in 1% of paths against 39% of live candidates, so
+    the serialization drifted away from what the generator was trained on. Ties
+    break alphabetically to keep the rendering deterministic.
+    """
+    if not counts:
+        return "entity"
+    best = max(counts.values())
+    return sorted(name for name, count in counts.items() if count == best)[0]
 
 
 def materialize_path(
@@ -87,18 +103,19 @@ def materialize_path(
     for edge in directed_relations:
         relation, direction = decode_edge(edge)
         next_frontier: set[str] = set()
-        target_types: set[str] = set()
+        target_types: Counter[str] = Counter()
         for entity in frontier:
             for candidate, target in graph.adjacency.get(entity, []):
                 if candidate != edge:
                     continue
+                if target not in next_frontier:
+                    target_types.update(graph.types.get(target, set()))
                 next_frontier.add(target)
-                target_types.update(graph.types.get(target, set()))
                 if direction == "forward":
                     used_triples.add((entity, relation, target))
                 else:
                     used_triples.add((target, relation, entity))
-        target_type = " / ".join(sorted(target_types)) or "entity"
+        target_type = dominant_type(target_types)
         hops.append(Hop(relation, direction, source_type, target_type))
         frontier = next_frontier
         source_type = target_type
