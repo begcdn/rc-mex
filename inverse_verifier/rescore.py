@@ -37,13 +37,19 @@ from .selector import (
 SCORER_KINDS = ("cross_encoder", "nli_bidirectional", "bi_encoder", "qwen3_reranker")
 
 # Instruction-following rerankers take the relevance criterion in words, so the
-# strict-equivalence rubric used in the manual judging can be stated directly
-# rather than learned.
+# rubric used in the manual judging can be stated directly rather than learned.
+# It is deliberately permissive about surface form: the hand labelling counted
+# extra words, a named answer type, plural/singular and partial names as matches,
+# and only reversed direction, a different relation, or a wrong added description
+# as mismatches.
 EQUIVALENCE_INSTRUCTION = (
-    "Given a user's question, find the question that asks for exactly the same "
-    "thing. Two questions are not the same if they differ in the direction of a "
-    "relation, or in the type of thing being asked for, or if one adds or drops a "
-    "condition."
+    "Given a user's question, find the question that asks for the same thing. "
+    "Judge meaning, not wording. Two questions still match if one is longer, "
+    "names the type of answer it wants (\"which author\" for \"who\"), uses "
+    "singular where the other uses plural, or uses a partial or alternative name "
+    "for the same entity. They do not match if a relation runs in the opposite "
+    "direction, if a different relation is used, or if a description is added that "
+    "is wrong or that changes which things would be returned."
 )
 
 
