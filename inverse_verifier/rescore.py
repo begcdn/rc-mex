@@ -40,6 +40,7 @@ SCORER_KINDS = (
     "bi_encoder",
     "qwen3_reranker",
     "bge_gemma",
+    "bge_gemma_norm",
 )
 
 # Instruction-following rerankers take the relevance criterion in words, so the
@@ -91,8 +92,10 @@ def score_pairs(
     if kind == "qwen3_reranker":
         return _score_qwen3(pairs, model_name, resolved, batch_size)
 
-    if kind == "bge_gemma":
-        return _score_bge_gemma(pairs, model_name, resolved, batch_size)
+    if kind in {"bge_gemma", "bge_gemma_norm"}:
+        return _score_bge_gemma(
+            pairs, model_name, resolved, batch_size, normalize=kind.endswith("_norm")
+        )
 
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -183,6 +186,7 @@ def _score_bge_gemma(
     device: str,
     batch_size: int,
     max_length: int = 512,
+    normalize: bool = False,
 ) -> list[float]:
     """Score with BAAI's LLM-based reranker, which uses its own prompt layout.
 
@@ -203,6 +207,7 @@ def _score_bge_gemma(
         model_name, torch_dtype=torch.float16
     ).to(device).eval()
     yes_loc = tokenizer("Yes", add_special_tokens=False)["input_ids"][0]
+    no_loc = tokenizer("No", add_special_tokens=False)["input_ids"][0]
     prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     sep_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
 
@@ -243,8 +248,17 @@ def _score_bge_gemma(
             return_tensors="pt",
         ).to(device)
         with torch.no_grad():
-            logits = model(**encoded, return_dict=True).logits[:, -1, yes_loc]
-        scores.extend(logits.view(-1).float().cpu().tolist())
+            last = model(**encoded, return_dict=True).logits[:, -1, :].float()
+        if normalize:
+            # Contrast yes against no rather than reading the raw yes logit. A raw
+            # causal-LM logit drifts with input length and content; the contrast
+            # cancels that, which matters when ranking thousands of pairs of very
+            # different lengths. The model card documents the raw form, so both are
+            # available and comparable.
+            pair = torch.stack([last[:, no_loc], last[:, yes_loc]], dim=1)
+            scores.extend(pair.log_softmax(dim=1)[:, 1].cpu().tolist())
+        else:
+            scores.extend(last[:, yes_loc].view(-1).cpu().tolist())
     return scores
 
 
