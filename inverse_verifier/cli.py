@@ -23,6 +23,11 @@ from .semantic_benchmark import (
     adjudicate_semantic_benchmark,
     build_semantic_benchmark,
 )
+from .selection_experiment import (
+    audit_view_runs,
+    build_fixed_supervision_study,
+    export_answer_equivalent_path_audit,
+)
 from .retrieval import SRTK_SCORER, run_retrieval_probe
 from .synthetic import evaluate_faithful_generation, naturalize_corpus, synthesize_corpus
 from .training_data import (
@@ -173,6 +178,41 @@ def build_parser() -> argparse.ArgumentParser:
     corpus.add_argument("--dev-fraction", type=float, default=0.1)
     corpus.add_argument("--seed", type=int, default=17)
 
+    supervision_study = subparsers.add_parser(
+        "build-supervision-study",
+        help="build fixed candidate pools for annotated/denotation label ablations",
+    )
+    supervision_study.add_argument("--predictions", type=Path, required=True)
+    supervision_study.add_argument("--output", type=Path, required=True)
+    supervision_study.add_argument("--hard-negatives", type=int, default=12)
+    supervision_study.add_argument("--random-negatives", type=int, default=4)
+    supervision_study.add_argument("--dev-fraction", type=float, default=0.1)
+    supervision_study.add_argument("--seed", type=int, default=17)
+
+    audit_views = subparsers.add_parser(
+        "audit-views",
+        help="compare cross-view disagreement with same-view model disagreement",
+    )
+    audit_views.add_argument("--predictions", type=Path, required=True)
+    audit_views.add_argument(
+        "--generated-runs", type=Path, nargs="+", required=True
+    )
+    audit_views.add_argument("--path-runs", type=Path, nargs="+", required=True)
+    audit_views.add_argument(
+        "--path-labels",
+        type=Path,
+        help="optional independently labeled candidates.jsonl from export-path-audit",
+    )
+    audit_views.add_argument("--output", type=Path, required=True)
+
+    export_path_audit = subparsers.add_parser(
+        "export-path-audit",
+        help="export raw non-annotated paths that exactly reach the gold answer",
+    )
+    export_path_audit.add_argument("--predictions", type=Path, required=True)
+    export_path_audit.add_argument("--graphs", type=Path)
+    export_path_audit.add_argument("--output", type=Path, required=True)
+
     rescore = subparsers.add_parser(
         "rescore",
         help="re-rank a finished run with a different comparator, no graph pass",
@@ -224,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_comparator_parser.add_argument("--learning-rate", type=float, default=2e-5)
     train_comparator_parser.add_argument("--device", default="auto")
     train_comparator_parser.add_argument("--limit", type=int)
+    train_comparator_parser.add_argument("--seed", type=int, default=17)
 
     evaluate_comparator_parser = subparsers.add_parser(
         "evaluate-comparator",
@@ -504,6 +545,39 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Wrote comparator corpus to {args.output}")
+    elif args.command == "build-supervision-study":
+        manifest = build_fixed_supervision_study(
+            args.predictions,
+            args.output,
+            seed=args.seed,
+            dev_fraction=args.dev_fraction,
+            hard_negatives=args.hard_negatives,
+            random_negatives=args.random_negatives,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Wrote fixed supervision study to {args.output}")
+    elif args.command == "audit-views":
+        metrics = audit_view_runs(
+            args.predictions,
+            args.generated_runs,
+            args.path_runs,
+            args.output,
+            path_labels=args.path_labels,
+        )
+        comparison = metrics["comparison"]
+        print(
+            "Cross-view excess oracle gain: "
+            f"{comparison['cross_view_excess_oracle_gain']}"
+        )
+        print(f"Wrote representation audit to {args.output}")
+    elif args.command == "export-path-audit":
+        manifest = export_answer_equivalent_path_audit(
+            args.predictions,
+            args.output,
+            graphs=args.graphs,
+        )
+        print(json.dumps(manifest, indent=2))
+        print(f"Wrote raw path audit to {args.output}")
     elif args.command == "rescore":
         if bool(args.model) == bool(args.comparator):
             raise SystemExit("rescore needs exactly one of --model or --comparator")
@@ -551,6 +625,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             device_name=args.device,
             limit=args.limit,
+            seed=args.seed,
         )
         print(
             f"Best development R@1={run['best_dev_recall_at_1']:.3f} "

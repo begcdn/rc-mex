@@ -292,6 +292,7 @@ def rescore_run(
         if endpoint_filter:
             pool = [c for c in candidates if has_answerable_endpoint(c)] or candidates
         best = max(pool, key=lambda c: c["rescore"])
+        best_index = candidates.index(best)
 
         gold_sequences = {tuple(s) for s in row.get("gold_sequences", [])}
         equivalent = gold_equivalent_answer_sets(candidates, gold_sequences)
@@ -305,6 +306,7 @@ def rescore_run(
             {
                 "question_id": row["question_id"],
                 "question": row["question"],
+                "candidate_index": best_index,
                 "relation_sequence": best["relation_sequence"],
                 "generated_question": best["generated_question"],
                 "rescore": best["rescore"],
@@ -336,9 +338,10 @@ def rescore_run(
         dumped = []
         for row in rows:
             scored = []
-            for candidate in row["candidate_log"]:
+            for candidate_index, candidate in enumerate(row["candidate_log"]):
                 scored.append(
                     {
+                        "candidate_index": candidate_index,
                         "relation_sequence": candidate["relation_sequence"],
                         "score": scores[cursor],
                         "matches_gold_path": candidate["matches_gold_path"],
@@ -438,12 +441,14 @@ def rescore_with_comparator(
     gold_path = gold_equivalent = 0
     totals = {"exact_match": 0.0, "f1": 0.0, "has_correct_answer": 0.0}
     picks = []
+    dumped_scores = []
     for row, result in zip(rows, scored, strict=True):
         candidates = result["candidates"]
         pool = candidates
         if endpoint_filter:
             pool = [c for c in candidates if has_answerable_endpoint(c)] or candidates
         best = max(pool, key=lambda c: c["cross_encoder_score"])
+        best_index = candidates.index(best)
         gold_sequences = {tuple(s) for s in row.get("gold_sequences", [])}
         equivalent = gold_equivalent_answer_sets(candidates, gold_sequences)
         is_gold = tuple(best["relation_sequence"]) in gold_sequences
@@ -458,12 +463,30 @@ def rescore_with_comparator(
             {
                 "question_id": row["question_id"],
                 "question": row["question"],
+                "candidate_index": best_index,
                 "relation_sequence": best["relation_sequence"],
                 "generated_question": best["generated_question"],
+                "cross_encoder_score": best["cross_encoder_score"],
                 "matches_gold_path": is_gold,
                 "exact_match": metrics["exact_match"],
                 "f1": metrics["f1"],
                 "answers": best["answers"][:20],
+            }
+        )
+        dumped_scores.append(
+            {
+                "question_id": row["question_id"],
+                "candidates": [
+                    {
+                        "candidate_index": index,
+                        "relation_sequence": candidate["relation_sequence"],
+                        "score": candidate["cross_encoder_score"],
+                        "matches_gold_path": candidate.get(
+                            "matches_gold_path", False
+                        ),
+                    }
+                    for index, candidate in enumerate(candidates)
+                ],
             }
         )
 
@@ -472,6 +495,7 @@ def rescore_with_comparator(
         "predictions": str(predictions),
         "model": model_path,
         "input_mode": mode,
+        "endpoint_filter": endpoint_filter,
         "questions": len(rows),
         "selected_gold_path_accuracy": gold_path / count,
         "selected_gold_equivalent_accuracy": gold_equivalent / count,
@@ -482,4 +506,5 @@ def rescore_with_comparator(
         output.mkdir(parents=True, exist_ok=True)
         (output / "metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_jsonl(output / "picks.jsonl", picks)
+        write_jsonl(output / "scores.jsonl", dumped_scores)
     return result

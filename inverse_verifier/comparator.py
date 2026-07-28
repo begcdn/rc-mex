@@ -490,11 +490,15 @@ def train_comparator(
     learning_rate: float = 2e-5,
     device_name: str = "auto",
     limit: int | None = None,
+    seed: int = 17,
 ) -> dict[str, Any]:
     if mode not in COMPARATOR_INPUT_MODES:
         raise ValueError(f"unknown comparator input mode: {mode}")
-    random.seed(17)
-    torch.manual_seed(17)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     device = best_device(device_name)
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -515,6 +519,7 @@ def train_comparator(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collator,
+        generator=torch.Generator().manual_seed(seed),
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     total_steps = max(len(loader) * epochs, 1)
@@ -593,6 +598,7 @@ def train_comparator(
                         "base_model": base_model,
                         "max_sequence_length": MAX_SEQUENCE_LENGTH,
                         "loss": "listwise_multi_positive_softmax",
+                        "seed": seed,
                     },
                     indent=2,
                 ),
@@ -608,6 +614,7 @@ def train_comparator(
         "epochs": epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
+        "seed": seed,
         "best_dev_recall_at_1": best_key[0],
         "best_dev_mrr": best_key[1],
         "elapsed_seconds": time.time() - started,

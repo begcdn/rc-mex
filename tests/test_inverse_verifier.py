@@ -90,6 +90,11 @@ from inverse_verifier.semantic_benchmark import (
     semantic_adjudication_record,
     semantic_judge_record,
 )
+from inverse_verifier.selection_experiment import (
+    audit_view_runs,
+    build_fixed_supervision_study,
+    export_answer_equivalent_path_audit,
+)
 
 
 def test_openai_naturalization_payload_is_sanitized() -> None:
@@ -2396,6 +2401,310 @@ def test_comparator_corpus_round_trips_into_trainable_groups(tmp_path: Path) -> 
     # Every group must be usable by the listwise loss.
     for row in train:
         assert any(c["is_positive"] for c in row["candidates"])
+
+
+def _selection_study_candidate(
+    index: int,
+    answers: list[str],
+    score: float,
+) -> dict:
+    relation = f"relation.{index}"
+    return {
+        "relation_sequence": [f"{relation}::forward"],
+        "answers": answers,
+        "score": score,
+        "generated_question": f"What follows relation {index}?",
+        "path": {
+            "anchor": "Anchor",
+            "anchor_type": "entity",
+            "answer_type": "entity",
+            "kg": "webqsp",
+            "hops": [
+                {
+                    "relation": relation,
+                    "direction": "forward",
+                    "source_type": "entity",
+                    "target_type": "entity",
+                }
+            ],
+        },
+    }
+
+
+def test_fixed_supervision_study_changes_only_labels(tmp_path: Path) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    rows = []
+    for index in range(2):
+        candidates = [
+            _selection_study_candidate(0, ["Gold"], 3.0),
+            _selection_study_candidate(1, ["Wrong"], 2.0),
+            _selection_study_candidate(2, ["Other"], 1.0),
+        ]
+        rows.append(
+            {
+                "question_id": f"q{index}",
+                "question": "Which entity is correct?",
+                "gold_answers": ["Gold"],
+                # The annotated path is intentionally not the denotation match.
+                "gold_sequences": [["relation.1::forward"]],
+                "candidate_log": candidates,
+            }
+        )
+    predictions.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    manifest = build_fixed_supervision_study(
+        predictions,
+        tmp_path / "study",
+        dev_fraction=0.5,
+        hard_negatives=1,
+        random_negatives=0,
+    )
+
+    assert manifest["comparison_questions"] == 2
+    rendered = {}
+    for mode in ("annotated", "denotation", "annotated_or_denotation"):
+        mode_rows = []
+        for split in ("train", "dev"):
+            mode_rows.extend(
+                json.loads(line)
+                for line in (
+                    tmp_path / "study" / mode / f"{split}.jsonl"
+                ).read_text().splitlines()
+            )
+        rendered[mode] = {
+            row["example_id"]: row["candidates"] for row in mode_rows
+        }
+
+    for question_id in ("q0", "q1"):
+        pools = [
+            [
+                candidate["source_candidate_index"]
+                for candidate in rendered[mode][question_id]
+            ]
+            for mode in rendered
+        ]
+        assert pools[0] == pools[1] == pools[2]
+        assert [
+            candidate["source_candidate_index"]
+            for candidate in rendered["annotated"][question_id]
+            if candidate["is_positive"]
+        ] == [1]
+        assert [
+            candidate["source_candidate_index"]
+            for candidate in rendered["denotation"][question_id]
+            if candidate["is_positive"]
+        ] == [0]
+        assert {
+            candidate["source_candidate_index"]
+            for candidate in rendered["annotated_or_denotation"][question_id]
+            if candidate["is_positive"]
+        } == {0, 1}
+
+
+def _write_score_run(
+    directory: Path,
+    question_scores: dict[str, list[float]],
+) -> None:
+    directory.mkdir()
+    (directory / "metrics.json").write_text(
+        json.dumps({"endpoint_filter": True}), encoding="utf-8"
+    )
+    (directory / "scores.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "question_id": question_id,
+                    "candidates": [
+                        {"candidate_index": index, "score": score}
+                        for index, score in enumerate(scores)
+                    ],
+                }
+            )
+            for question_id, scores in question_scores.items()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_view_audit_compares_cross_view_with_same_view_null(
+    tmp_path: Path,
+) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    rows = []
+    for index in range(3):
+        rows.append(
+            {
+                "question_id": f"q{index}",
+                "question": f"Question {index}?",
+                "gold_answers": ["Gold"],
+                "candidate_log": [
+                    {
+                        "relation_sequence": ["gold::forward"],
+                        "generated_question": "Gold question?",
+                        "answers": ["Gold"],
+                    },
+                    {
+                        "relation_sequence": ["wrong::forward"],
+                        "generated_question": "Wrong question?",
+                        "answers": ["Wrong"],
+                    },
+                ],
+            }
+        )
+    predictions.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    generated_a = tmp_path / "generated-a"
+    generated_b = tmp_path / "generated-b"
+    path_a = tmp_path / "path-a"
+    _write_score_run(
+        generated_a,
+        {"q0": [2, 1], "q1": [2, 1], "q2": [1, 2]},
+    )
+    _write_score_run(
+        generated_b,
+        {"q0": [2, 1], "q1": [1, 2], "q2": [1, 2]},
+    )
+    _write_score_run(
+        path_a,
+        {"q0": [2, 1], "q1": [1, 2], "q2": [2, 1]},
+    )
+
+    metrics = audit_view_runs(
+        predictions,
+        [generated_a, generated_b],
+        [path_a],
+        tmp_path / "audit",
+    )
+
+    target = metrics["comparison"]["matched_cross_view_pair"]
+    assert target["left_run"] == "generated-a"
+    assert target["right_run"] == "path-a"
+    assert target["left_exact_match"] == pytest.approx(2 / 3)
+    assert target["right_exact_match"] == pytest.approx(2 / 3)
+    assert target["oracle_exact_match"] == 1.0
+    assert metrics["comparison"]["cross_view_excess_oracle_gain"] == pytest.approx(
+        1 / 3
+    )
+    assert (tmp_path / "audit" / "report.md").is_file()
+    assert (tmp_path / "audit" / "cases.jsonl").is_file()
+
+
+def test_path_audit_keeps_raw_path_and_generator_labels_separate(
+    tmp_path: Path,
+) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    candidates = [
+        _selection_study_candidate(0, ["Gold"], 2.0),
+        _selection_study_candidate(1, ["Gold"], 1.0),
+        _selection_study_candidate(2, ["Wrong"], 0.0),
+    ]
+    predictions.write_text(
+        json.dumps(
+            {
+                "question_id": "q1",
+                "question": "Which entity is correct?",
+                "gold_answers": ["Gold"],
+                "gold_sequences": [["relation.0::forward"]],
+                "candidate_log": candidates,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    manifest = export_answer_equivalent_path_audit(
+        predictions, tmp_path / "path-audit"
+    )
+
+    assert manifest["path_instances"] == 1
+    row = json.loads(
+        (tmp_path / "path-audit" / "candidates.jsonl")
+        .read_text()
+        .splitlines()[0]
+    )
+    assert row["source_candidate_index"] == 1
+    assert row["path"]["hops"][0]["relation"] == "relation.1"
+    assert row["path_label"] is None
+    assert row["generator_faithfulness"] is None
+    assert "Path label:" in (tmp_path / "path-audit" / "audit.md").read_text()
+
+
+def test_view_audit_tests_directional_spurious_path_signal(
+    tmp_path: Path,
+) -> None:
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "question_id": "q0",
+                "question": "Which answer?",
+                "gold_answers": ["Gold"],
+                "candidate_log": [
+                    {
+                        "relation_sequence": ["valid::forward"],
+                        "generated_question": "Which answer?",
+                        "answers": ["Gold"],
+                    },
+                    {
+                        "relation_sequence": ["shortcut::forward"],
+                        "generated_question": "Which unrelated answer?",
+                        "answers": ["Gold"],
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    generated_a = tmp_path / "generated-a"
+    generated_b = tmp_path / "generated-b"
+    path_a = tmp_path / "path-a"
+    _write_score_run(generated_a, {"q0": [2.0, 0.0]})
+    _write_score_run(generated_b, {"q0": [1.5, 0.5]})
+    _write_score_run(path_a, {"q0": [0.0, 2.0]})
+    labels = tmp_path / "labels.jsonl"
+    labels.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "question_id": "q0",
+                        "source_candidate_index": 0,
+                        "path_label": "direct_intent",
+                        "generator_faithfulness": "faithful",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "question_id": "q0",
+                        "source_candidate_index": 1,
+                        "path_label": "correlated_shortcut",
+                        "generator_faithfulness": "faithful",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = audit_view_runs(
+        predictions,
+        [generated_a, generated_b],
+        [path_a],
+        tmp_path / "audit",
+        path_labels=labels,
+    )
+
+    signal = metrics["spurious_path_test"]
+    assert signal["audited_candidates"] == 2
+    assert signal["auc_path_rank_advantage_predicts_spurious"] == 1.0
+    assert (tmp_path / "audit" / "path_label_cases.jsonl").is_file()
 
 
 def test_schema_hint_resolves_which_of_many_freebase_types_applies() -> None:
