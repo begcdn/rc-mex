@@ -29,7 +29,7 @@ how much noise we trained on.
 
 correct answer: Jamaican English, Jamaican Creole English Language
 
-- [ ] What human language is spoken in Jamaica?  ``
+- [y] What human language is spoken in Jamaica?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -39,13 +39,13 @@ correct answer: Jamaican English, Jamaican Creole English Language
 
 correct answer: Mobile
 
-- [ ] What is the city, town, or village where JaMarcus Russell, an American football player, has lived?  ``
+- [y] What is the city, town, or village where JaMarcus Russell, an American football player, has lived?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the city or town that is located in the same county as the city where JaMarcus Russell, an American football player, was born?  ``
+- [n] What is the city or town that is located in the same county as the city where JaMarcus Russell, an American football player, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] In which city, town, or village has an entity lived who has also lived with JaMarcus Russell, an American football player?  ``
+- [n] In which city, town, or village has an entity lived who has also lived with JaMarcus Russell, an American football player?  ``  <!-- labelled by Claude -->
 
-- [ ] Which city, town, or village is located in the same county as the city where JaMarcus Russell, an American football player, was born?  ``
+- [n] Which city, town, or village is located in the same county as the city where JaMarcus Russell, an American football player, was born?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -55,13 +55,13 @@ correct answer: Mobile
 
 correct answer: Diamond
 
-- [ ] Which city, town, or village is located near the city, town, or village where George Washington Carver, an inventor, was born?  ``
+- [n] Which city, town, or village is located near the city, town, or village where George Washington Carver, an inventor, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the city, town, or village that is located in the same county as the city, town, or village where George Washington Carver, an inventor, was born?  ``
+- [n] What is the city, town, or village that is located in the same county as the city, town, or village where George Washington Carver, an inventor, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] In which city, town, or village was George Washington Carver, an inventor, born?  ``
+- [y] In which city, town, or village was George Washington Carver, an inventor, born?  ``  <!-- labelled by Claude -->
 
-- [ ] Which city, town, or village is located in the same city, town, or village as the birthplace of George Washington Carver, an inventor?  ``
+- [n] Which city, town, or village is located in the same city, town, or village as the birthplace of George Washington Carver, an inventor?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -71,11 +71,11 @@ correct answer: Diamond
 
 correct answer: Lightning rod, Glass harmonica, Bifocals, Franklin stove
 
-- [ ] What invention was created by the film character that Benjamin Franklin is based on?  ``
+- [n] What invention was created by the film character that Benjamin Franklin is based on?  ``  <!-- labelled by Claude -->
 
-- [ ] What invention was created by the film character based on Benjamin Franklin?  ``
+- [n] What invention was created by the film character based on Benjamin Franklin?  ``  <!-- labelled by Claude -->
 
-- [ ] What invention was created by Benjamin Franklin, a film character?  ``
+- [y] What invention was created by Benjamin Franklin, a film character?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -85,7 +85,7 @@ correct answer: Lightning rod, Glass harmonica, Bifocals, Franklin stove
 
 correct answer: Lyndon B. Johnson
 
-- [ ] Which US President is John F. Kennedy associated with?  ``
+- [n] Which US President is John F. Kennedy associated with?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -95,7 +95,7 @@ correct answer: Lyndon B. Johnson
 
 correct answer: Central Time Zone
 
-- [ ] What is the time zone of the capital city of Louisiana, a US state?  ``
+- [n] What is the time zone of the capital city of Louisiana, a US state?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -105,7 +105,7 @@ correct answer: Central Time Zone
 
 correct answer: Semi-presidential system, Provisional government
 
-- [ ] What is the form of government in Egypt?  ``
+- [y] What is the form of government in Egypt?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -115,13 +115,13 @@ correct answer: Semi-presidential system, Provisional government
 
 correct answer: Memphis
 
-- [ ] Where did the artwork depicted in Martin Luther King, Jr. pass away?  ``
+- [n] Where did the artwork depicted in Martin Luther King, Jr. pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the artwork representing Martin Luther King, Jr. pass away?  ``
+- [n] Where did the artwork representing Martin Luther King, Jr. pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that Martin Luther King, Jr., an artwork, passed away in?  ``
+- [y] What is the entity that Martin Luther King, Jr., an artwork, passed away in?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that is located at the same place as the entity where Martin Luther King, Jr., an artwork, passed away?  ``
+- [n] What is the entity that is located at the same place as the entity where Martin Luther King, Jr., an artwork, passed away?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -131,13 +131,13 @@ correct answer: Memphis
 
 correct answer: Baltimore
 
-- [ ] What is the entity where the author Edgar Allan Poe passed away?  ``
+- [y] What is the entity where the author Edgar Allan Poe passed away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the author who was translated from Edgar Allan Poe pass away?  ``
+- [n] Where did the author who was translated from Edgar Allan Poe pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the author represented in fiction by Edgar Allan Poe pass away?  ``
+- [n] Where did the author represented in fiction by Edgar Allan Poe pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the author who is an edition of Edgar Allan Poe pass away?  ``
+- [n] Where did the author who is an edition of Edgar Allan Poe pass away?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -147,7 +147,7 @@ correct answer: Baltimore
 
 correct answer: Fox Theatre, Jimmy Carter Library and Museum, Centennial Olympic Park, Cobb Energy Performing Arts Centre
 
-- [ ] What venue is near Atlanta?  ``
+- [?] What venue is near Atlanta?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -157,11 +157,11 @@ correct answer: Fox Theatre, Jimmy Carter Library and Museum, Centennial Olympic
 
 correct answer: Electoral district of South Brisbane
 
-- [ ] What is the district represented by the position held by Anna Bligh, a politician?  ``
+- [y] What is the district represented by the position held by Anna Bligh, a politician?  ``  <!-- labelled by Claude -->
 
-- [ ] What entity is represented by the position held by Anna Bligh, a politician?  ``
+- [y] What entity is represented by the position held by Anna Bligh, a politician?  ``  <!-- labelled by Claude -->
 
-- [ ] What entity is represented by the position held by Anna Bligh, who is a politician?  ``
+- [y] What entity is represented by the position held by Anna Bligh, who is a politician?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -171,9 +171,9 @@ correct answer: Electoral district of South Brisbane
 
 correct answer: Central European Time Zone
 
-- [ ] What is the time zone of the capital city of Sweden?  ``
+- [n] What is the time zone of the capital city of Sweden?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the time zone of the location containing Sweden?  ``
+- [n] What is the time zone of the location containing Sweden?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -183,7 +183,7 @@ correct answer: Central European Time Zone
 
 correct answer: Carolina Panthers
 
-- [ ] Which team is associated with the salary of Cam Newton, an American football player?  ``
+- [n] Which team is associated with the salary of Cam Newton, an American football player?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -193,13 +193,13 @@ correct answer: Carolina Panthers
 
 correct answer: Frederick County
 
-- [ ] What is the US county whose county seat is a city or town that is located in Frederick?  ``
+- [n] What is the US county whose county seat is a city or town that is located in Frederick?  ``  <!-- labelled by Claude -->
 
-- [ ] In which US county is Frederick located?  ``
+- [y] In which US county is Frederick located?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the US county where a city or town that is located in Frederick is situated?  ``
+- [n] What is the US county where a city or town that is located in Frederick is situated?  ``  <!-- labelled by Claude -->
 
-- [ ] Which US county has Frederick as its county seat?  ``
+- [n] Which US county has Frederick as its county seat?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -209,7 +209,7 @@ correct answer: Frederick County
 
 correct answer: Mountain Time Zone
 
-- [ ] What is the time zone of the capital city of Utah, a US state?  ``
+- [n] What is the time zone of the capital city of Utah, a US state?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -219,7 +219,7 @@ correct answer: Mountain Time Zone
 
 correct answer: Somebody to Love, All Around The World, Wait for a Minute, Roller Coaster
 
-- [ ] What is the composition that Justin Bieber composed?  ``
+- [y] What is the composition that Justin Bieber composed?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -229,13 +229,13 @@ correct answer: Somebody to Love, All Around The World, Wait for a Minute, Rolle
 
 correct answer: Saint Michael Parish
 
-- [ ] What entity is part of the country that Rihanna, a book, originates from?  ``
+- [n] What entity is part of the country that Rihanna, a book, originates from?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the place where the book written by Rihanna was born?  ``
+- [n] What is the place where the book written by Rihanna was born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is a first-level administrative division of the country that Rihanna, a book, originates from?  ``
+- [n] What is a first-level administrative division of the country that Rihanna, a book, originates from?  ``  <!-- labelled by Claude -->
 
-- [ ] Where was the author of Rihanna born?  ``
+- [n] Where was the author of Rihanna born?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -245,13 +245,13 @@ correct answer: Saint Michael Parish
 
 correct answer: Mission Hills
 
-- [ ] What is the neighborhood where the musical recording that performed or created George Lopez was born?  ``
+- [n] What is the neighborhood where the musical recording that performed or created George Lopez was born?  ``  <!-- labelled by Claude -->
 
-- [ ] In which neighborhood was the season included in George Lopez born?  ``
+- [n] In which neighborhood was the season included in George Lopez born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the neighborhood that is located in the same area as the neighborhood where George Lopez, a musical recording, was born?  ``
+- [n] What is the neighborhood that is located in the same area as the neighborhood where George Lopez, a musical recording, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] In which neighborhood was the track included in George Lopez born?  ``
+- [n] In which neighborhood was the track included in George Lopez born?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -261,7 +261,7 @@ correct answer: Mission Hills
 
 correct answer: Ṭūbā, Mahdi, Monotheism, Prophets in Islam
 
-- [ ] What is a belief of Islam, a religion?  ``
+- [y] What is a belief of Islam, a religion?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -271,13 +271,13 @@ correct answer: Ṭūbā, Mahdi, Monotheism, Prophets in Islam
 
 correct answer: Jamie Dornan
 
-- [ ] What is an entity that shares the same gender as Christian Grey, a film character?  ``
+- [n] What is an entity that shares the same gender as Christian Grey, a film character?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the actor for the performance that portrays Christian Grey, a film character?  ``
+- [y] Who is the actor for the performance that portrays Christian Grey, a film character?  ``  <!-- labelled by Claude -->
 
-- [ ] Who acted in the film in which Christian Grey, a film character, was portrayed?  ``
+- [n] Who acted in the film in which Christian Grey, a film character, was portrayed?  ``  <!-- labelled by Claude -->
 
-- [ ] Who acted in the performance that portrays Christian Grey, a film character?  ``
+- [y] Who acted in the performance that portrays Christian Grey, a film character?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -287,11 +287,11 @@ correct answer: Jamie Dornan
 
 correct answer: Tuberculosis
 
-- [ ] What was the cause of death for the fictional character based on George Orwell?  ``
+- [n] What was the cause of death for the fictional character based on George Orwell?  ``  <!-- labelled by Claude -->
 
-- [ ] What was the cause of death for the author who is represented in fiction as George Orwell?  ``
+- [n] What was the cause of death for the author who is represented in fiction as George Orwell?  ``  <!-- labelled by Claude -->
 
-- [ ] What was the cause of death of the author who George Orwell is based on?  ``
+- [n] What was the cause of death of the author who George Orwell is based on?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -301,7 +301,7 @@ correct answer: Tuberculosis
 
 correct answer: Nazi Germany
 
-- [ ] Which country has the military commander that was commanded by Adolf Hitler, a military commander?  ``
+- [n] Which country has the military commander that was commanded by Adolf Hitler, a military commander?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -311,13 +311,13 @@ correct answer: Nazi Germany
 
 correct answer: Wyandotte County
 
-- [ ] Which US county has Kansas City as its county seat?  ``
+- [n] Which US county has Kansas City as its county seat?  ``  <!-- labelled by Claude -->
 
-- [ ] In which US county is Kansas City located?  ``
+- [y] In which US county is Kansas City located?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the US county where a city or town that is located in Kansas City is situated?  ``
+- [n] What is the US county where a city or town that is located in Kansas City is situated?  ``  <!-- labelled by Claude -->
 
-- [ ] Which US county is a second-level division of the entity where Kansas City is located?  ``
+- [n] Which US county is a second-level division of the entity where Kansas City is located?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -327,13 +327,13 @@ correct answer: Wyandotte County
 
 correct answer: Manhattan
 
-- [ ] What is the county seat of the entity where Eleanor Roosevelt passed away?  ``
+- [n] What is the county seat of the entity where Eleanor Roosevelt passed away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the book that has Eleanor Roosevelt as its subject pass away?  ``
+- [n] Where did the book that has Eleanor Roosevelt as its subject pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] Where did the book that represents Eleanor Roosevelt pass away?  ``
+- [n] Where did the book that represents Eleanor Roosevelt pass away?  ``  <!-- labelled by Claude -->
 
-- [ ] What entity is administratively part of the city, town, or village where Eleanor Roosevelt, a book, was born?  ``
+- [n] What entity is administratively part of the city, town, or village where Eleanor Roosevelt, a book, was born?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -343,7 +343,7 @@ correct answer: Manhattan
 
 correct answer: United States Dollar
 
-- [ ] What is the currency used in Puerto Rico?  ``
+- [y] What is the currency used in Puerto Rico?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -353,13 +353,13 @@ correct answer: United States Dollar
 
 correct answer: Lung cancer, Brain tumor
 
-- [ ] What is the cause of death for the album released by Carl Wilson, a composer?  ``
+- [n] What is the cause of death for the album released by Carl Wilson, a composer?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the cause of death for the composer who released an album titled Carl Wilson?  ``
+- [n] What is the cause of death for the composer who released an album titled Carl Wilson?  ``  <!-- labelled by Claude -->
 
-- [ ] What was the cause of death for the composer who performs the album Carl Wilson?  ``
+- [n] What was the cause of death for the composer who performs the album Carl Wilson?  ``  <!-- labelled by Claude -->
 
-- [ ] What disease or medical condition caused the death of the composer who is the primary release of Carl Wilson?  ``
+- [n] What disease or medical condition caused the death of the composer who is the primary release of Carl Wilson?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -369,11 +369,11 @@ correct answer: Lung cancer, Brain tumor
 
 correct answer: Williamson County
 
-- [ ] In which US county is Brentwood located?  ``
+- [y] In which US county is Brentwood located?  ``  <!-- labelled by Claude -->
 
-- [ ] In which US county is a city or town that is located in Brentwood located?  ``
+- [n] In which US county is a city or town that is located in Brentwood located?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the US county where a city or town that is located in Brentwood is situated?  ``
+- [n] What is the US county where a city or town that is located in Brentwood is situated?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -383,7 +383,7 @@ correct answer: Williamson County
 
 correct answer: Manassas Station Operations, First Battle of Kernstown, First Battle of Rappahannock Station, Second Battle of Bull Run
 
-- [ ] Which military conflict involved the commander commanded by Stonewall Jackson, a composer?  ``
+- [n] Which military conflict involved the commander commanded by Stonewall Jackson, a composer?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -393,13 +393,13 @@ correct answer: Manassas Station Operations, First Battle of Kernstown, First Ba
 
 correct answer: Pancreatic cancer
 
-- [ ] What disease or medical condition is Patrick Swayze, a film actor, associated with?  ``
+- [y] What disease or medical condition is Patrick Swayze, a film actor, associated with?  ``  <!-- labelled by Claude -->
 
-- [ ] What disease or medical condition is the parent classification of the medical condition associated with Patrick Swayze, a film actor?  ``
+- [n] What disease or medical condition is the parent classification of the medical condition associated with Patrick Swayze, a film actor?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the disease or medical condition that Patrick Swayze, a film actor, has?  ``
+- [y] What is the disease or medical condition that Patrick Swayze, a film actor, has?  ``  <!-- labelled by Claude -->
 
-- [ ] What disease or medical condition is included in the same ICD-9 CM classification as the cause of death of Patrick Swayze, a film actor?  ``
+- [n] What disease or medical condition is included in the same ICD-9 CM classification as the cause of death of Patrick Swayze, a film actor?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -409,7 +409,7 @@ correct answer: Pancreatic cancer
 
 correct answer: Vienna
 
-- [ ] What is the capital of Austria?  ``
+- [y] What is the capital of Austria?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -419,9 +419,9 @@ correct answer: Vienna
 
 correct answer: Nepal
 
-- [ ] What is the entity containing the city, town, or village where Gautama Buddha, a religious leader, was born?  ``
+- [y] What is the entity containing the city, town, or village where Gautama Buddha, a religious leader, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the nationality of the deceased person who is a child of Gautama Buddha, a religious leader?  ``
+- [n] What is the nationality of the deceased person who is a child of Gautama Buddha, a religious leader?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -431,13 +431,13 @@ correct answer: Nepal
 
 correct answer: Weld County
 
-- [ ] What is the US county where a city or town that is located in Greeley is situated?  ``
+- [n] What is the US county where a city or town that is located in Greeley is situated?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the US county whose county seat is a city or town that is located in Greeley?  ``
+- [n] What is the US county whose county seat is a city or town that is located in Greeley?  ``  <!-- labelled by Claude -->
 
-- [ ] Which US county has Greeley as its county seat?  ``
+- [n] Which US county has Greeley as its county seat?  ``  <!-- labelled by Claude -->
 
-- [ ] In which US county is Greeley located?  ``
+- [y] In which US county is Greeley located?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -447,11 +447,11 @@ correct answer: Weld County
 
 correct answer: Denmark
 
-- [ ] What is the main country for the language spoken in Greenland?  ``
+- [n] What is the main country for the language spoken in Greenland?  ``  <!-- labelled by Claude -->
 
-- [ ] Which country has a spoken language that is also the main language of Greenland?  ``
+- [n] Which country has a spoken language that is also the main language of Greenland?  ``  <!-- labelled by Claude -->
 
-- [ ] Which country speaks the language that has Greenland as its main country?  ``
+- [n] Which country speaks the language that has Greenland as its main country?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -461,7 +461,7 @@ correct answer: Denmark
 
 correct answer: Simplified Chinese character, Chinese characters, Nüshu script, Traditional Chinese characters
 
-- [ ] What is the language writing system used by Chinese language?  ``
+- [y] What is the language writing system used by Chinese language?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -471,9 +471,9 @@ correct answer: Simplified Chinese character, Chinese characters, Nüshu script,
 
 correct answer: Damon Evans, Jay Hammer, Isabel Sanford, Sherman Hemsley
 
-- [ ] Who is the TV program creator featured in the TV program The Jeffersons?  ``
+- [n] Who is the TV program creator featured in the TV program The Jeffersons?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the TV program creator that has starred in the role of a regular cast member of The Jeffersons?  ``
+- [n] Who is the TV program creator that has starred in the role of a regular cast member of The Jeffersons?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -483,7 +483,7 @@ correct answer: Damon Evans, Jay Hammer, Isabel Sanford, Sherman Hemsley
 
 correct answer: Synapse, San Francisco Call, San Francisco Business Times, The Golden Era
 
-- [ ] Which newspaper circulates in the area of San Francisco?  ``
+- [y] Which newspaper circulates in the area of San Francisco?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -493,7 +493,7 @@ correct answer: Synapse, San Francisco Call, San Francisco Business Times, The G
 
 correct answer: Europe
 
-- [ ] What is the continent that includes Armenia?  ``
+- [y] What is the continent that includes Armenia?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -503,13 +503,13 @@ correct answer: Europe
 
 correct answer: New York City
 
-- [ ] What is the city, town, or village that is located near the city, town, or village where Richard Nixon, a US President, passed away?  ``
+- [n] What is the city, town, or village that is located near the city, town, or village where Richard Nixon, a US President, passed away?  ``  <!-- labelled by Claude -->
 
-- [ ] Which city, town, or village is located near the city, town, or village where Richard Nixon, a US President, passed away?  ``
+- [n] Which city, town, or village is located near the city, town, or village where Richard Nixon, a US President, passed away?  ``  <!-- labelled by Claude -->
 
-- [ ] Which city, town, or village is a subsumed entity of the city, town, or village where Richard Nixon, a US President, passed away?  ``
+- [n] Which city, town, or village is a subsumed entity of the city, town, or village where Richard Nixon, a US President, passed away?  ``  <!-- labelled by Claude -->
 
-- [ ] What city, town, or village is the city, town, or village that Richard Nixon, a US President, passed away in, subsumed by?  ``
+- [n] What city, town, or village is the city, town, or village that Richard Nixon, a US President, passed away in, subsumed by?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -519,13 +519,13 @@ correct answer: New York City
 
 correct answer: Haitian Creole, French
 
-- [ ] What is the spoken language of an edition of Haiti?  ``
+- [n] What is the spoken language of an edition of Haiti?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the spoken language of the book that Haiti is about?  ``
+- [n] What is the spoken language of the book that Haiti is about?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the official language of the book that is the subject of Haiti?  ``
+- [n] What is the official language of the book that is the subject of Haiti?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the official language of an edition of Haiti?  ``
+- [n] What is the official language of an edition of Haiti?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -535,7 +535,7 @@ correct answer: Haitian Creole, French
 
 correct answer: Melinda McGraw, Hannah Gunn, Ilyssa Fradin
 
-- [ ] Who acted in the film where Barbara Gordon, a comic book character, is portrayed?  ``
+- [n] Who acted in the film where Barbara Gordon, a comic book character, is portrayed?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -545,13 +545,13 @@ correct answer: Melinda McGraw, Hannah Gunn, Ilyssa Fradin
 
 correct answer: New Rochelle
 
-- [ ] What is an entity that subsumes the birthplace of Jay Leno, a TV episode?  ``
+- [n] What is an entity that subsumes the birthplace of Jay Leno, a TV episode?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that Jay Leno, a TV episode, was born in?  ``
+- [y] What is the entity that Jay Leno, a TV episode, was born in?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that is located in the same place as where Jay Leno, a TV episode, was born?  ``
+- [n] What is the entity that is located in the same place as where Jay Leno, a TV episode, was born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that the birthplace of Jay Leno, a TV episode, subsumes?  ``
+- [n] What is the entity that the birthplace of Jay Leno, a TV episode, subsumes?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -561,7 +561,7 @@ correct answer: New Rochelle
 
 correct answer: Mon Language, Saek language, Akha Language, Hmong language
 
-- [ ] What human language is spoken in Thailand?  ``
+- [y] What human language is spoken in Thailand?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -571,7 +571,7 @@ correct answer: Mon Language, Saek language, Akha Language, Hmong language
 
 correct answer: Bard, Author, Writer, Poet
 
-- [ ] What is the profession of the artwork that depicts Robert Burns?  ``
+- [n] What is the profession of the artwork that depicts Robert Burns?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -581,7 +581,7 @@ correct answer: Bard, Author, Writer, Poet
 
 correct answer: France, Australia, United States of America, Argentina
 
-- [ ] Which combatant was included in the entity that was involved in the military conflict Gulf War?  ``
+- [y] Which combatant was included in the entity that was involved in the military conflict Gulf War?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -591,7 +591,7 @@ correct answer: France, Australia, United States of America, Argentina
 
 correct answer: Salamanca
 
-- [ ] In which city, town, or village was Francisco Vázquez de Coronado, an author, born?  ``
+- [y] In which city, town, or village was Francisco Vázquez de Coronado, an author, born?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -601,7 +601,7 @@ correct answer: Salamanca
 
 correct answer: Midian, Isaac, Medan, Ishmael
 
-- [ ] Who is the deceased person whose parent is Abraham, a film character?  ``
+- [y] Who is the deceased person whose parent is Abraham, a film character?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -611,7 +611,7 @@ correct answer: Midian, Isaac, Medan, Ishmael
 
 correct answer: Ram Singh Thakur, Rabindranath Tagore
 
-- [ ] Who is the author that composed the national anthem Jana Gana Mana?  ``
+- [y] Who is the author that composed the national anthem Jana Gana Mana?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -621,13 +621,13 @@ correct answer: Ram Singh Thakur, Rabindranath Tagore
 
 correct answer: Daryl Sabara
 
-- [ ] Who acted in the performance that portrays Juni Cortez, a film character?  ``
+- [y] Who acted in the performance that portrays Juni Cortez, a film character?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the actor for the performance that portrays Juni Cortez, a film character?  ``
+- [y] Who is the actor for the performance that portrays Juni Cortez, a film character?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the entity that has starred in the role of the television program in which Juni Cortez appeared?  ``
+- [n] Who is the entity that has starred in the role of the television program in which Juni Cortez appeared?  ``  <!-- labelled by Claude -->
 
-- [ ] What is an entity that shares the same gender as Juni Cortez, a film character?  ``
+- [n] What is an entity that shares the same gender as Juni Cortez, a film character?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -637,7 +637,7 @@ correct answer: Daryl Sabara
 
 correct answer: Nipsey Russell, Reinhold Niebuhr, Saul Alinsky
 
-- [ ] Which author has influenced Barack Obama, a film character?  ``
+- [y] Which author has influenced Barack Obama, a film character?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -647,13 +647,13 @@ correct answer: Nipsey Russell, Reinhold Niebuhr, Saul Alinsky
 
 correct answer: Sevierville
 
-- [ ] What is the entity that Dolly Parton, a musical artist, originates from?  ``
+- [y] What is the entity that Dolly Parton, a musical artist, originates from?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the entity that Dolly Parton, a musical artist, was born in?  ``
+- [y] What is the entity that Dolly Parton, a musical artist, was born in?  ``  <!-- labelled by Claude -->
 
-- [ ] In which entity was Dolly Parton, a musical artist, born?  ``
+- [y] In which entity was Dolly Parton, a musical artist, born?  ``  <!-- labelled by Claude -->
 
-- [ ] What is an entity that shares a common origin with Dolly Parton, a musical artist?  ``
+- [n] What is an entity that shares a common origin with Dolly Parton, a musical artist?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -663,7 +663,7 @@ correct answer: Sevierville
 
 correct answer: Catalan language, Occitan language, Spanish Language, Galician Language
 
-- [ ] What human language is spoken in Spain?  ``
+- [y] What human language is spoken in Spain?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -673,9 +673,9 @@ correct answer: Catalan language, Occitan language, Spanish Language, Galician L
 
 correct answer: Vint Cerf, Robert  E. Kahn
 
-- [ ] Which academic is an original idea for Transmission Control Protocol?  ``
+- [n] Which academic is an original idea for Transmission Control Protocol?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the academic that invented Transmission Control Protocol?  ``
+- [y] Who is the academic that invented Transmission Control Protocol?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -685,9 +685,9 @@ correct answer: Vint Cerf, Robert  E. Kahn
 
 correct answer: Jordan national football team, Al-Wehdat SC
 
-- [ ] What is the sports team located at the book that is about Jordan?  ``
+- [n] What is the sports team located at the book that is about Jordan?  ``  <!-- labelled by Claude -->
 
-- [ ] Which sports team is based in Jordan?  ``
+- [?] Which sports team is based in Jordan?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -697,13 +697,13 @@ correct answer: Jordan national football team, Al-Wehdat SC
 
 correct answer: Haitian Creole, Spanish Language, Lucumi Language
 
-- [ ] What is the human language spoken in a book that is about Cuba?  ``
+- [n] What is the human language spoken in a book that is about Cuba?  ``  <!-- labelled by Claude -->
 
-- [ ] What human language is spoken in Cuba?  ``
+- [y] What human language is spoken in Cuba?  ``  <!-- labelled by Claude -->
 
-- [ ] What human language is spoken by a book that is about Cuba?  ``
+- [n] What human language is spoken by a book that is about Cuba?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the human language spoken in the book that is the subject of Cuba?  ``
+- [n] What is the human language spoken in the book that is the subject of Cuba?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -713,7 +713,7 @@ correct answer: Haitian Creole, Spanish Language, Lucumi Language
 
 correct answer: Madrid Arena, Festimad, Parque Warner Madrid, Plaza de Cibeles
 
-- [ ] Which tourist attraction is near Madrid?  ``
+- [y] Which tourist attraction is near Madrid?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -723,13 +723,13 @@ correct answer: Madrid Arena, Festimad, Parque Warner Madrid, Plaza de Cibeles
 
 correct answer: Cornet, Trumpet
 
-- [ ] What musical instrument does the fictional character based on Louis Armstrong play?  ``
+- [n] What musical instrument does the fictional character based on Louis Armstrong play?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the musical instrument played by the fictional character that Louis Armstrong is based on?  ``
+- [n] What is the musical instrument played by the fictional character that Louis Armstrong is based on?  ``  <!-- labelled by Claude -->
 
-- [ ] What musical instrument does the fictional character representing Louis Armstrong play?  ``
+- [n] What musical instrument does the fictional character representing Louis Armstrong play?  ``  <!-- labelled by Claude -->
 
-- [ ] What musical instrument does a fictional character represented in fiction as Louis Armstrong play?  ``
+- [n] What musical instrument does a fictional character represented in fiction as Louis Armstrong play?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -739,9 +739,9 @@ correct answer: Cornet, Trumpet
 
 correct answer: Pacific Time Zone
 
-- [ ] What is the time zone of the capital of California, a US state?  ``
+- [n] What is the time zone of the capital of California, a US state?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the time zone of the entity where California, a US state, is located?  ``
+- [n] What is the time zone of the entity where California, a US state, is located?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -751,13 +751,13 @@ correct answer: Pacific Time Zone
 
 correct answer: Hawaii-Aleutian Time Zone
 
-- [ ] What is the time zone of the US county where Hilo is located?  ``
+- [n] What is the time zone of the US county where Hilo is located?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the time zone of a building contained within Hilo, a governmental jurisdiction?  ``
+- [n] What is the time zone of a building contained within Hilo, a governmental jurisdiction?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the time zone of the governmental jurisdiction that is located within Hilo?  ``
+- [n] What is the time zone of the governmental jurisdiction that is located within Hilo?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the time zone of the postal code containing Hilo?  ``
+- [n] What is the time zone of the postal code containing Hilo?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -767,13 +767,13 @@ correct answer: Hawaii-Aleutian Time Zone
 
 correct answer: Catherine Tate
 
-- [ ] Who is the actor that played the guest role portraying Donna Noble?  ``
+- [y] Who is the actor that played the guest role portraying Donna Noble?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the entity that featured in a guest role portrayed by Donna Noble, a TV character?  ``
+- [n] Who is the entity that featured in a guest role portrayed by Donna Noble, a TV character?  ``  <!-- labelled by Claude -->
 
-- [ ] Who is the actor featured in the entity where Donna Noble, a TV character, is portrayed?  ``
+- [n] Who is the actor featured in the entity where Donna Noble, a TV character, is portrayed?  ``  <!-- labelled by Claude -->
 
-- [ ] Who has starred in the role where Donna Noble, a TV character, is portrayed?  ``
+- [y] Who has starred in the role where Donna Noble, a TV character, is portrayed?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -783,7 +783,7 @@ correct answer: Catherine Tate
 
 correct answer: Lincoln College, Oxford, University of Oxford, Dartmouth College
 
-- [ ] What is the institution associated with the entity involving Theodore Lesieg as a student?  ``
+- [y] What is the institution associated with the entity involving Theodore Lesieg as a student?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -793,11 +793,11 @@ correct answer: Lincoln College, Oxford, University of Oxford, Dartmouth College
 
 correct answer: Destin–Fort Walton Beach Airport, Destin Executive Airport
 
-- [ ] Which airport serves Destin?  ``
+- [y] Which airport serves Destin?  ``  <!-- labelled by Claude -->
 
-- [ ] Which airport serves a city or town that is located in Destin?  ``
+- [n] Which airport serves a city or town that is located in Destin?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the nearby airport of a city or town that is located in Destin?  ``
+- [n] What is the nearby airport of a city or town that is located in Destin?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -807,13 +807,13 @@ correct answer: Destin–Fort Walton Beach Airport, Destin Executive Airport
 
 correct answer: Youngs Memorial Cemetery
 
-- [ ] What is the cemetery where the book represented in fiction as Theodore Roosevelt is buried?  ``
+- [n] What is the cemetery where the book represented in fiction as Theodore Roosevelt is buried?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the cemetery where the fictional character based on Theodore Roosevelt is buried?  ``
+- [n] What is the cemetery where the fictional character based on Theodore Roosevelt is buried?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the cemetery where the book Theodore Roosevelt is the subject of a work is buried?  ``
+- [n] What is the cemetery where the book Theodore Roosevelt is the subject of a work is buried?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the cemetery where the book Theodore Roosevelt is an edition of is buried?  ``
+- [n] What is the cemetery where the book Theodore Roosevelt is an edition of is buried?  ``  <!-- labelled by Claude -->
 
 ---
 
@@ -823,9 +823,9 @@ correct answer: Youngs Memorial Cemetery
 
 correct answer: Neo-impressionism, Modernism, Modern art, Impressionism
 
-- [ ] What is the art period or movement associated with the film character that represents Henri Matisse?  ``
+- [n] What is the art period or movement associated with the film character that represents Henri Matisse?  ``  <!-- labelled by Claude -->
 
-- [ ] What is the art period or movement associated with the film character based on Henri Matisse?  ``
+- [n] What is the art period or movement associated with the film character based on Henri Matisse?  ``  <!-- labelled by Claude -->
 
 ---
 

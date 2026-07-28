@@ -16,10 +16,26 @@ the graph, not of any system.
 | of those, the annotated path | 89 |
 | **paths that reach the answer but are not the annotated one** | **74%** |
 
-**74% is a non-identifiability rate, not a spuriousness rate.** Some of those 250
-paths are legitimate alternative readings of the same question. How many are
-merely coincidental is not measured here; `spurious_labels_to_judge.md` exists to
-measure it.
+**74% is a non-identifiability rate.** The spuriousness rate is measured
+separately, by labelling all 151 deduplicated non-annotated answer-reaching paths
+in `spurious_labels_to_judge.md`:
+
+| label | count | share |
+|---|---:|---:|
+| valid alternative reading | 46 | 30% |
+| **coincidence — reaches the answer through unrelated reasoning** | **103** | **68%** |
+| question too vague to decide | 2 | 1% |
+
+Applying that rate to the 250 non-annotated paths, roughly **50% of everything
+"reaches the gold answer" admits is spurious**. Half the signal is not merely
+under-determined; it is wrong about the reasoning.
+
+These labels are Claude's, on a rubric agreed for the earlier faithfulness audit,
+and have not been independently audited beyond a random sample of 18. Borderline
+calls were resolved toward `y`, so 68% is a conservative floor. Cases where the
+path was semantically right but its entity gloss was wrong -- "What invention was
+created by Benjamin Franklin, a film character?" -- were labelled `y`, since the
+relation is the intended one and the gloss is a separate generator defect.
 
 Only **29%** of questions have a unique path to their answer; the rest admit
 several, median 2 and up to 30.
