@@ -16,8 +16,18 @@ the graph, not of any system.
 | of those, the annotated path | 89 |
 | **paths that reach the answer but are not the annotated one** | **74%** |
 
-Only **28%** of questions have a unique path to their answer. 71% admit several;
-the median is 4 and one question admits 30.
+**74% is a non-identifiability rate, not a spuriousness rate.** Some of those 250
+paths are legitimate alternative readings of the same question. How many are
+merely coincidental is not measured here; `spurious_labels_to_judge.md` exists to
+measure it.
+
+Only **29%** of questions have a unique path to their answer; the rest admit
+several, median 2 and up to 30.
+
+This is not an artifact of the retriever. Enumerating **every** path the supplied
+graph admits within two hops, rather than only SRTK's proposals, gives the same
+figure: 29% unique either way, mean 3.6 paths against SRTK's 3.9. It remains
+conditional on the two-hop budget and the pre-extracted neighborhood.
 
 ## What the alternatives look like
 
@@ -52,14 +62,23 @@ form**.
 ## Why it matters beyond this pipeline
 
 Any system supervised by "this path reached the answer" is trained on a signal
-that is wrong three times out of four in the sense that matters. It cannot learn
-to prefer the intended relation over a coincidental one, because the training
-signal does not distinguish them. That is a property of the supervision, not of
-any particular architecture, so it applies to every system trained this way.
+that does not identify the intended reasoning: it admits a median of two and up to
+thirty paths per question. Whether that is harmful depends on what fraction are
+coincidental rather than genuinely alternative, which is unmeasured.
 
-It also compounds with the separate hand-measured finding that **15 of 90
-annotated paths do not answer their own question**. The annotation is noisy in one
-direction and the answer-based expansion is noisy in the other.
+Exposure also differs by system and must be checked per method rather than
+assumed. RoG mines question-to-relation-path pairs and is plausibly exposed;
+PARoG trains a planner on SPARQL-derived sub-objectives, which is a different
+signal; DAMR learns an adaptive path scorer during search. No claim about any of
+their errors follows from this measurement -- it establishes that the supervision
+is ambiguous, not that the ambiguity causes any particular system to fail.
+
+It compounds with the separate hand-measured finding that **15 of 90 annotated
+paths do not answer their own question**. That figure is a semantic judgement made
+by reading question and path, not an execution failure: executing every annotated
+path over 1,155 questions returns the gold answers exactly 88% of the time,
+partially 6%, nothing 6%, and never a non-empty wrong set. So it is not a snapshot
+or executor artifact, though it does rest on 90 hand labels from two annotators.
 
 ## A caveat against our own method
 
@@ -78,6 +97,17 @@ supervision until the spurious ones are separated out.
 subset alone, and compare. If it matches or beats 0.74 with far fewer positives,
 the spurious ones are noise the model is absorbing. If it drops, they carry useful
 signal and the framing needs revising.
+
+## Prior work
+
+The phenomenon is established. Codex identifies Path Spuriousness-aware RL (EACL
+2023), which defines a spuriousness metric and modifies the RL reward, and PathISE
+(2026), which learns to distinguish informative paths from answer-level labels and
+distils that into a path generator. An earlier draft of this document claimed the
+observation was uncovered by prior work; that claim is withdrawn. Any contribution
+here has to be positioned against those, and would have to be about using inverse
+semantic reconstruction to separate intent-equivalent from denotation-equivalent
+paths at scale and across schemas.
 
 ## Status
 
