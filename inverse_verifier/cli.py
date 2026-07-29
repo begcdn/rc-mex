@@ -26,6 +26,7 @@ from .semantic_benchmark import (
 from .selection_experiment import (
     audit_view_runs,
     build_fixed_supervision_study,
+    compare_selection_runs,
     export_answer_equivalent_path_audit,
 )
 from .retrieval import SRTK_SCORER, run_retrieval_probe
@@ -188,6 +189,15 @@ def build_parser() -> argparse.ArgumentParser:
     supervision_study.add_argument("--random-negatives", type=int, default=4)
     supervision_study.add_argument("--dev-fraction", type=float, default=0.1)
     supervision_study.add_argument("--seed", type=int, default=17)
+
+    compare_selections = subparsers.add_parser(
+        "compare-selection-runs",
+        help="paired bootstrap and McNemar comparison on fixed candidate pools",
+    )
+    compare_selections.add_argument("--runs", type=Path, nargs="+", required=True)
+    compare_selections.add_argument("--output", type=Path, required=True)
+    compare_selections.add_argument("--bootstrap-samples", type=int, default=10_000)
+    compare_selections.add_argument("--seed", type=int, default=17)
 
     audit_views = subparsers.add_parser(
         "audit-views",
@@ -556,6 +566,15 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Wrote fixed supervision study to {args.output}")
+    elif args.command == "compare-selection-runs":
+        metrics = compare_selection_runs(
+            args.runs,
+            args.output,
+            bootstrap_samples=args.bootstrap_samples,
+            seed=args.seed,
+        )
+        print(json.dumps(metrics, indent=2))
+        print(f"Wrote paired selection comparison to {args.output}")
     elif args.command == "audit-views":
         metrics = audit_view_runs(
             args.predictions,

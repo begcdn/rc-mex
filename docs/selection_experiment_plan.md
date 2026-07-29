@@ -113,7 +113,98 @@ multiple seeds before retaining the result.
 
 ## Statistical Gate
 
-The current test has 100 questions. Report paired outcomes and uncertainty; do
-not interpret a small marginal difference as established. If a supervision arm
-looks promising, repeat seeds and evaluate a larger frozen question sample
-before changing the architecture.
+The 100-question result is a smoke test. The confirmatory in-KG comparison uses
+all WebQSP questions supported by the current simple-chain pipeline and reports
+coverage over the complete test set. Compare arms with paired bootstrap
+confidence intervals for EM/F1 and an exact McNemar test with Holm correction.
+Do not infer equality from a non-significant result.
+
+The generalization test is separate. Freeze each WebQSP-trained comparator and
+evaluate it without target tuning on the fixed KQA Pro candidate sets. KQA Pro
+uses a different KG and relation schema. This controlled test measures semantic
+path-ranking transfer, not end-to-end KQA retrieval.
+
+Interpret the two tests independently:
+
+- WebQSP full test: does the supervision rule change in-distribution selection?
+- WebQSP to KQA Pro: does the supervision rule learn semantics that transfer to
+  another KG?
+- Failure of every arm on KQA Pro indicates representation or generator
+  transfer failure; it does not isolate the supervision rule.
+- A target-KG advantage needs multiple training seeds before it becomes a
+  research result.
+
+## Confirmatory Execution
+
+Generate the full supported WebQSP test candidate pool once. A limit above the
+supported population means the run processes every eligible question while the
+run metrics retain total-test coverage:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 "$VENV/bin/python" -m inverse_verifier verify \
+  --questions data/webqsp_official/WebQSP/data/WebQSP.test.json \
+  --graphs data/webqsp/test.jsonl \
+  --model runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --retriever-model "$SRTK_MODEL" \
+  --output runs/inverse_verifier/selection_full_webqsp_candidates_v1 \
+  --limit 2000 \
+  --comparison-mode cross_encoder \
+  --comparator-model runs/inverse_verifier/deberta_comparator_question_generated_v1/model \
+  --device cuda
+```
+
+Rescore that frozen pool with each supervision arm, then run the paired
+comparison:
+
+```bash
+for ARM in annotated denotation annotated_or_denotation; do
+  CUDA_VISIBLE_DEVICES=2 "$VENV/bin/python" -m inverse_verifier rescore \
+    --predictions runs/inverse_verifier/selection_full_webqsp_candidates_v1/predictions.jsonl \
+    --comparator "runs/inverse_verifier/selection_supervision_${ARM}_seed17/model" \
+    --graphs data/webqsp/test.jsonl \
+    --output "runs/inverse_verifier/selection_full_webqsp_${ARM}_seed17" \
+    --batch-size 4 --device cuda
+done
+
+"$VENV/bin/python" -m inverse_verifier compare-selection-runs \
+  --runs \
+    runs/inverse_verifier/selection_full_webqsp_annotated_seed17 \
+    runs/inverse_verifier/selection_full_webqsp_denotation_seed17 \
+    runs/inverse_verifier/selection_full_webqsp_annotated_or_denotation_seed17 \
+  --output runs/inverse_verifier/selection_full_webqsp_comparison_seed17
+```
+
+For frozen cross-KG transfer, first materialize the same KQA Pro candidate sets
+with the existing inverse generator. The generator is shared and has seen both
+schemas, so this isolates transfer of the WebQSP-trained comparator rather than
+claiming zero-shot transfer of the complete architecture:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 "$VENV/bin/python" -m inverse_verifier evaluate \
+  --data runs/inverse_verifier/data \
+  --output runs/inverse_verifier/selection_kqa_candidates_v1 \
+  --trained-model runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --splits test_kqa_val \
+  --batch-size 16 --generation-examples 0 \
+  --skip-pretrained --device cuda
+
+"$VENV/bin/python" -m inverse_verifier prepare-comparator \
+  --data runs/inverse_verifier/selection_kqa_candidates_v1/predictions.jsonl \
+  --generator runs/inverse_verifier/faithful_inverse_qwen25_3b_lora_v1/model \
+  --output runs/inverse_verifier/selection_kqa_fixed_candidates_v1
+
+for ARM in annotated denotation annotated_or_denotation; do
+  CUDA_VISIBLE_DEVICES=2 "$VENV/bin/python" -m inverse_verifier evaluate-comparator \
+    --data runs/inverse_verifier/selection_kqa_fixed_candidates_v1 \
+    --model "runs/inverse_verifier/selection_supervision_${ARM}_seed17/model" \
+    --output "runs/inverse_verifier/selection_kqa_${ARM}_seed17" \
+    --split test_kqa_val --batch-size 4 --device cuda
+done
+
+"$VENV/bin/python" -m inverse_verifier compare-selection-runs \
+  --runs \
+    runs/inverse_verifier/selection_kqa_annotated_seed17 \
+    runs/inverse_verifier/selection_kqa_denotation_seed17 \
+    runs/inverse_verifier/selection_kqa_annotated_or_denotation_seed17 \
+  --output runs/inverse_verifier/selection_kqa_comparison_seed17
+```

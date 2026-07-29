@@ -93,6 +93,7 @@ from inverse_verifier.semantic_benchmark import (
 from inverse_verifier.selection_experiment import (
     audit_view_runs,
     build_fixed_supervision_study,
+    compare_selection_runs,
     export_answer_equivalent_path_audit,
 )
 
@@ -2501,6 +2502,178 @@ def test_fixed_supervision_study_changes_only_labels(tmp_path: Path) -> None:
             for candidate in rendered["annotated_or_denotation"][question_id]
             if candidate["is_positive"]
         } == {0, 1}
+
+
+def _write_selection_run(
+    directory: Path,
+    picks: list[dict],
+    relation_sequences: list[list[str]] | None = None,
+) -> None:
+    directory.mkdir()
+    (directory / "metrics.json").write_text(
+        json.dumps({"questions": len(picks)}), encoding="utf-8"
+    )
+    (directory / "picks.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in picks) + "\n", encoding="utf-8"
+    )
+    sequences = relation_sequences or [["relation.a::forward"], ["relation.b::forward"]]
+    score_rows = [
+        {
+            "question_id": row["question_id"],
+            "candidates": [
+                {
+                    "candidate_index": index,
+                    "relation_sequence": sequence,
+                    "score": float(index),
+                }
+                for index, sequence in enumerate(sequences)
+            ],
+        }
+        for row in picks
+    ]
+    (directory / "scores.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in score_rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_compare_selection_runs_uses_paired_statistics_and_fixed_pools(
+    tmp_path: Path,
+) -> None:
+    questions = [
+        ("q0", 1.0, 1.0),
+        ("q1", 1.0, 0.0),
+        ("q2", 0.0, 0.0),
+        ("q3", 0.0, 1.0),
+    ]
+
+    def picks(side: int) -> list[dict]:
+        return [
+            {
+                "question_id": question_id,
+                "question": f"Question {question_id}",
+                "candidate_index": side,
+                "relation_sequence": [f"relation.{side}::forward"],
+                "generated_question": "",
+                "cross_encoder_score": 1.0,
+                "matches_gold_path": exact[side] == 1.0,
+                "exact_match": exact[side],
+                "f1": exact[side],
+                "answers": ["answer"] if exact[side] else ["wrong"],
+            }
+            for question_id, *exact in questions
+        ]
+
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_selection_run(left, picks(0))
+    _write_selection_run(right, picks(1))
+    metrics = compare_selection_runs(
+        [left, right],
+        tmp_path / "comparison",
+        bootstrap_samples=200,
+        seed=3,
+    )
+
+    assert metrics["candidate_pool_identical"] is True
+    assert metrics["arms"]["left"]["answer_exact_match"] == 0.5
+    assert metrics["arms"]["right"]["answer_exact_match"] == 0.5
+    pair = metrics["pairs"][0]
+    assert pair["both_correct"] == 1
+    assert pair["left_only_correct"] == 1
+    assert pair["right_only_correct"] == 1
+    assert pair["neither_correct"] == 1
+    assert pair["mcnemar_exact_p"] == 1.0
+    assert (tmp_path / "comparison" / "report.md").is_file()
+    assert (tmp_path / "comparison" / "disagreements.jsonl").is_file()
+
+
+def test_compare_selection_runs_rejects_different_candidate_pools(
+    tmp_path: Path,
+) -> None:
+    pick = {
+        "question_id": "q0",
+        "question": "Question",
+        "candidate_index": 0,
+        "relation_sequence": ["relation.a::forward"],
+        "generated_question": "",
+        "cross_encoder_score": 1.0,
+        "matches_gold_path": True,
+        "exact_match": 1.0,
+        "f1": 1.0,
+        "answers": ["answer"],
+    }
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_selection_run(left, [pick])
+    _write_selection_run(
+        right,
+        [pick],
+        relation_sequences=[["different::forward"]],
+    )
+
+    with pytest.raises(ValueError, match="same candidate pools"):
+        compare_selection_runs(
+            [left, right],
+            tmp_path / "comparison",
+            bootstrap_samples=10,
+        )
+
+
+def test_compare_selection_runs_accepts_comparator_evaluations(
+    tmp_path: Path,
+) -> None:
+    path_a = {
+        "anchor": "A",
+        "hops": [{"relation": "r", "direction": "forward"}],
+    }
+    path_b = {
+        "anchor": "A",
+        "hops": [{"relation": "s", "direction": "forward"}],
+    }
+
+    def write_run(directory: Path, scores: tuple[float, float]) -> None:
+        directory.mkdir()
+        (directory / "metrics.json").write_text("{}", encoding="utf-8")
+        row = {
+            "example_id": "kqa:1",
+            "original_question": "Which answer?",
+            "candidates": [
+                {
+                    "path": path_a,
+                    "is_positive": True,
+                    "generated_question": "Question A?",
+                    "cross_encoder_score": scores[0],
+                },
+                {
+                    "path": path_b,
+                    "is_positive": False,
+                    "generated_question": "Question B?",
+                    "cross_encoder_score": scores[1],
+                },
+            ],
+        }
+        (directory / "predictions.jsonl").write_text(
+            json.dumps(row) + "\n", encoding="utf-8"
+        )
+
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    write_run(left, (2.0, 1.0))
+    write_run(right, (1.0, 2.0))
+    metrics = compare_selection_runs(
+        [left, right],
+        tmp_path / "comparison",
+        bootstrap_samples=10,
+    )
+
+    assert metrics["run_type"] == "candidate_ranking"
+    assert metrics["arms"]["left"]["answer_exact_match"] == 1.0
+    assert metrics["arms"]["right"]["answer_exact_match"] == 0.0
+    assert metrics["pairs"][0]["left_only_correct"] == 1
+    report = (tmp_path / "comparison" / "report.md").read_text()
+    assert "Paired Candidate-Ranking Comparison" in report
+    assert "Top-1 accuracy" in report
 
 
 def _write_score_run(

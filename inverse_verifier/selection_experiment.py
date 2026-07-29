@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import random
@@ -27,6 +28,7 @@ PATH_AUDIT_LABELS = (
 DEFAULT_HARD_NEGATIVES = 12
 DEFAULT_RANDOM_NEGATIVES = 4
 DEFAULT_DEV_FRACTION = 0.1
+DEFAULT_BOOTSTRAP_SAMPLES = 10_000
 
 
 def _candidate_pool_fingerprint(rows: list[dict[str, Any]]) -> str:
@@ -271,6 +273,397 @@ def build_fixed_supervision_study(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
     return manifest
+
+
+def _percentile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("cannot take a percentile of an empty sample")
+    position = probability * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _bootstrap_interval(
+    values: list[float],
+    rng: random.Random,
+    samples: int,
+) -> list[float]:
+    if not values:
+        raise ValueError("cannot bootstrap an empty sample")
+    size = len(values)
+    estimates = [
+        sum(values[rng.randrange(size)] for _ in range(size)) / size
+        for _ in range(samples)
+    ]
+    return [_percentile(estimates, 0.025), _percentile(estimates, 0.975)]
+
+
+def _paired_bootstrap_interval(
+    left: list[float],
+    right: list[float],
+    rng: random.Random,
+    samples: int,
+) -> list[float]:
+    if len(left) != len(right) or not left:
+        raise ValueError("paired bootstrap inputs must have equal nonzero length")
+    differences = [a - b for a, b in zip(left, right, strict=True)]
+    return _bootstrap_interval(differences, rng, samples)
+
+
+def _exact_mcnemar_p(left_only: int, right_only: int) -> float:
+    """Two-sided exact McNemar p-value under a 0.5 discordant-pair null."""
+    discordant = left_only + right_only
+    if not discordant:
+        return 1.0
+    tail = sum(
+        math.comb(discordant, index)
+        for index in range(min(left_only, right_only) + 1)
+    ) / (2**discordant)
+    return min(1.0, 2.0 * tail)
+
+
+def _holm_adjust(pairs: list[dict[str, Any]]) -> None:
+    ordered = sorted(enumerate(pairs), key=lambda item: item[1]["mcnemar_exact_p"])
+    running = 0.0
+    count = len(ordered)
+    for rank, (index, pair) in enumerate(ordered):
+        adjusted = min(1.0, pair["mcnemar_exact_p"] * (count - rank))
+        running = max(running, adjusted)
+        pairs[index]["mcnemar_holm_p"] = running
+
+
+def _selection_run(path: Path) -> dict[str, Any]:
+    metrics_path = path / "metrics.json"
+    picks_path = path / "picks.jsonl"
+    scores_path = path / "scores.jsonl"
+    predictions_path = path / "predictions.jsonl"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f"{path} must contain metrics.json")
+    if picks_path.is_file() and scores_path.is_file():
+        picks = read_jsonl(picks_path)
+        scores = read_jsonl(scores_path)
+        pool_projection = [
+            [
+                row["question_id"],
+                [
+                    [
+                        candidate["candidate_index"],
+                        candidate["relation_sequence"],
+                    ]
+                    for candidate in row["candidates"]
+                ],
+            ]
+            for row in scores
+        ]
+        run_type = "answer_selection"
+    elif predictions_path.is_file():
+        rows = read_jsonl(predictions_path)
+        picks = []
+        pool_projection = []
+        for row in rows:
+            candidates = row["candidates"]
+            best_index = max(
+                range(len(candidates)),
+                key=lambda index: candidates[index]["cross_encoder_score"],
+            )
+            best = candidates[best_index]
+            path_spec = best.get("path") or {}
+            sequence = [
+                f"{hop['relation']}::{hop['direction']}"
+                for hop in path_spec.get("hops", [])
+            ]
+            correct = float(best["is_positive"])
+            picks.append(
+                {
+                    "question_id": row["example_id"],
+                    "question": row["original_question"],
+                    "candidate_index": best_index,
+                    "relation_sequence": sequence,
+                    "generated_question": best.get("generated_question", ""),
+                    "cross_encoder_score": best["cross_encoder_score"],
+                    "matches_gold_path": bool(best["is_positive"]),
+                    "exact_match": correct,
+                    "f1": correct,
+                    "answers": [],
+                }
+            )
+            pool_projection.append(
+                [
+                    row["example_id"],
+                    [
+                        [
+                            index,
+                            candidate.get("path"),
+                            candidate.get("is_positive"),
+                        ]
+                        for index, candidate in enumerate(candidates)
+                    ],
+                ]
+            )
+        run_type = "candidate_ranking"
+    else:
+        raise FileNotFoundError(
+            f"{path} must contain picks.jsonl plus scores.jsonl, or "
+            "evaluate-comparator predictions.jsonl"
+        )
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            pool_projection, ensure_ascii=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    return {
+        "name": path.name,
+        "path": str(path),
+        "metrics": json.loads(metrics_path.read_text(encoding="utf-8")),
+        "picks": {row["question_id"]: row for row in picks},
+        "candidate_pool_fingerprint": fingerprint,
+        "run_type": run_type,
+    }
+
+
+def compare_selection_runs(
+    runs: list[Path],
+    output: Path,
+    bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    seed: int = 17,
+) -> dict[str, Any]:
+    """Compare selection runs on identical questions and candidate pools."""
+    if len(runs) < 2:
+        raise ValueError("at least two selection runs are required")
+    if bootstrap_samples < 1:
+        raise ValueError("bootstrap_samples must be positive")
+    loaded = [_selection_run(path) for path in runs]
+    run_types = {run["run_type"] for run in loaded}
+    if len(run_types) != 1:
+        raise ValueError("cannot mix answer-selection and candidate-ranking runs")
+    run_type = loaded[0]["run_type"]
+    question_ids = list(loaded[0]["picks"])
+    expected_ids = set(question_ids)
+    fingerprint = loaded[0]["candidate_pool_fingerprint"]
+    for run in loaded[1:]:
+        if set(run["picks"]) != expected_ids:
+            raise ValueError(
+                f"{run['name']} does not contain the same question ids as "
+                f"{loaded[0]['name']}"
+            )
+        if run["candidate_pool_fingerprint"] != fingerprint:
+            raise ValueError(
+                f"{run['name']} was not evaluated on the same candidate pools"
+            )
+
+    rng = random.Random(seed)
+    arm_metrics = {}
+    for run in loaded:
+        exact = [float(run["picks"][qid]["exact_match"]) for qid in question_ids]
+        f1 = [float(run["picks"][qid]["f1"]) for qid in question_ids]
+        gold_path = [
+            float(run["picks"][qid]["matches_gold_path"]) for qid in question_ids
+        ]
+        arm_metrics[run["name"]] = {
+            "path": run["path"],
+            "questions": len(question_ids),
+            "answer_exact_match": mean(exact),
+            "answer_exact_match_ci95": _bootstrap_interval(
+                exact, rng, bootstrap_samples
+            ),
+            "answer_f1": mean(f1),
+            "answer_f1_ci95": _bootstrap_interval(f1, rng, bootstrap_samples),
+            "selected_gold_path_accuracy": mean(gold_path),
+            "selected_gold_path_accuracy_ci95": _bootstrap_interval(
+                gold_path, rng, bootstrap_samples
+            ),
+        }
+        if run_type == "candidate_ranking":
+            arm_metrics[run["name"]]["top1_accuracy"] = mean(exact)
+            arm_metrics[run["name"]]["top1_accuracy_ci95"] = arm_metrics[
+                run["name"]
+            ]["answer_exact_match_ci95"]
+
+    pair_metrics = []
+    cases = []
+    for left, right in itertools.combinations(loaded, 2):
+        left_exact = [
+            float(left["picks"][qid]["exact_match"]) for qid in question_ids
+        ]
+        right_exact = [
+            float(right["picks"][qid]["exact_match"]) for qid in question_ids
+        ]
+        left_f1 = [float(left["picks"][qid]["f1"]) for qid in question_ids]
+        right_f1 = [float(right["picks"][qid]["f1"]) for qid in question_ids]
+        both = sum(a == 1.0 and b == 1.0 for a, b in zip(left_exact, right_exact))
+        left_only = sum(a == 1.0 and b == 0.0 for a, b in zip(left_exact, right_exact))
+        right_only = sum(a == 0.0 and b == 1.0 for a, b in zip(left_exact, right_exact))
+        neither = len(question_ids) - both - left_only - right_only
+        pair = {
+            "left": left["name"],
+            "right": right["name"],
+            "questions": len(question_ids),
+            "both_correct": both,
+            "left_only_correct": left_only,
+            "right_only_correct": right_only,
+            "neither_correct": neither,
+            "exact_match_difference": mean(left_exact) - mean(right_exact),
+            "exact_match_difference_ci95": _paired_bootstrap_interval(
+                left_exact, right_exact, rng, bootstrap_samples
+            ),
+            "f1_difference": mean(left_f1) - mean(right_f1),
+            "f1_difference_ci95": _paired_bootstrap_interval(
+                left_f1, right_f1, rng, bootstrap_samples
+            ),
+            "mcnemar_exact_p": _exact_mcnemar_p(left_only, right_only),
+            "same_answer_rate": mean(
+                answer_set_key(left["picks"][qid].get("answers", []))
+                == answer_set_key(right["picks"][qid].get("answers", []))
+                for qid in question_ids
+            ),
+        }
+        pair_metrics.append(pair)
+        if run_type == "candidate_ranking":
+            pair["top1_accuracy_difference"] = pair["exact_match_difference"]
+            pair["top1_accuracy_difference_ci95"] = pair[
+                "exact_match_difference_ci95"
+            ]
+        for qid in question_ids:
+            left_pick = left["picks"][qid]
+            right_pick = right["picks"][qid]
+            if (
+                left_pick["candidate_index"] == right_pick["candidate_index"]
+                and left_pick["exact_match"] == right_pick["exact_match"]
+            ):
+                continue
+            cases.append(
+                {
+                    "left": left["name"],
+                    "right": right["name"],
+                    "question_id": qid,
+                    "question": left_pick["question"],
+                    "left_pick": left_pick,
+                    "right_pick": right_pick,
+                }
+            )
+    _holm_adjust(pair_metrics)
+
+    metrics = {
+        "questions": len(question_ids),
+        "runs": [run["path"] for run in loaded],
+        "run_type": run_type,
+        "candidate_pool_fingerprint": fingerprint,
+        "candidate_pool_identical": True,
+        "bootstrap_samples": bootstrap_samples,
+        "seed": seed,
+        "arms": arm_metrics,
+        "pairs": pair_metrics,
+        "interpretation": (
+            "A supervision difference is supported only when its paired confidence "
+            "interval excludes zero and its Holm-adjusted McNemar p-value is below "
+            "the chosen significance threshold. Cross-KG transfer is a separate "
+            "test and must not be inferred from this in-KG comparison."
+        ),
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "metrics.json").write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8"
+    )
+    write_jsonl(output / "disagreements.jsonl", cases)
+    _write_selection_comparison_report(metrics, output / "report.md")
+    return metrics
+
+
+def _write_selection_comparison_report(
+    metrics: dict[str, Any],
+    path: Path,
+) -> None:
+    ranking = metrics["run_type"] == "candidate_ranking"
+    lines = [
+        "# Paired Candidate-Ranking Comparison"
+        if ranking
+        else "# Paired Selection Comparison",
+        "",
+        f"- Questions: {metrics['questions']}",
+        f"- Bootstrap samples: {metrics['bootstrap_samples']}",
+        "- Candidate pools identical: yes",
+        "",
+    ]
+    if ranking:
+        lines.extend(
+            [
+                "| Arm | Top-1 accuracy (95% CI) |",
+                "|---|---:|",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "| Arm | Answer EM (95% CI) | Answer F1 (95% CI) | "
+                "Gold path (95% CI) |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+    for name, values in metrics["arms"].items():
+        em_ci = values["answer_exact_match_ci95"]
+        if ranking:
+            lines.append(
+                f"| {name} | {values['top1_accuracy']:.3f} "
+                f"[{em_ci[0]:.3f}, {em_ci[1]:.3f}] |"
+            )
+            continue
+        f1_ci = values["answer_f1_ci95"]
+        path_ci = values["selected_gold_path_accuracy_ci95"]
+        lines.append(
+            f"| {name} | {values['answer_exact_match']:.3f} "
+            f"[{em_ci[0]:.3f}, {em_ci[1]:.3f}] | "
+            f"{values['answer_f1']:.3f} [{f1_ci[0]:.3f}, {f1_ci[1]:.3f}] | "
+            f"{values['selected_gold_path_accuracy']:.3f} "
+            f"[{path_ci[0]:.3f}, {path_ci[1]:.3f}] |"
+        )
+    lines.append("")
+    if ranking:
+        lines.extend(
+            [
+                "| Pair (left - right) | Top-1 difference (95% CI) | "
+                "Left-only / right-only | McNemar p | Holm p |",
+                "|---|---:|---:|---:|---:|",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "| Pair (left - right) | EM difference (95% CI) | "
+                "F1 difference (95% CI) | Left-only / right-only | "
+                "McNemar p | Holm p |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+    for pair in metrics["pairs"]:
+        em_ci = pair["exact_match_difference_ci95"]
+        if ranking:
+            lines.append(
+                f"| {pair['left']} - {pair['right']} | "
+                f"{pair['top1_accuracy_difference']:.3f} "
+                f"[{em_ci[0]:.3f}, {em_ci[1]:.3f}] | "
+                f"{pair['left_only_correct']} / {pair['right_only_correct']} | "
+                f"{pair['mcnemar_exact_p']:.4f} | "
+                f"{pair['mcnemar_holm_p']:.4f} |"
+            )
+            continue
+        f1_ci = pair["f1_difference_ci95"]
+        lines.append(
+            f"| {pair['left']} - {pair['right']} | "
+            f"{pair['exact_match_difference']:.3f} "
+            f"[{em_ci[0]:.3f}, {em_ci[1]:.3f}] | "
+            f"{pair['f1_difference']:.3f} "
+            f"[{f1_ci[0]:.3f}, {f1_ci[1]:.3f}] | "
+            f"{pair['left_only_correct']} / {pair['right_only_correct']} | "
+            f"{pair['mcnemar_exact_p']:.4f} | "
+            f"{pair['mcnemar_holm_p']:.4f} |"
+        )
+    lines.extend(["", "## Interpretation", "", metrics["interpretation"]])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def export_answer_equivalent_path_audit(
