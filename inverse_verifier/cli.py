@@ -13,6 +13,7 @@ from .comparator import (
     train_comparator,
 )
 from .data import prepare_dataset
+from .identity_audit import audit_predictions, format_report
 from .dataset_builder import build_naturalized_dataset
 from .evaluate import evaluate, evaluate_gold_generation
 from .generalization import evaluate_faithful_generalization
@@ -222,6 +223,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_path_audit.add_argument("--predictions", type=Path, required=True)
     export_path_audit.add_argument("--graphs", type=Path)
     export_path_audit.add_argument("--output", type=Path, required=True)
+
+    identity_audit_parser = subparsers.add_parser(
+        "identity-audit",
+        help="measure execution-level no-op hops by supervision label",
+    )
+    identity_audit_parser.add_argument("--predictions", type=Path, required=True)
+    identity_audit_parser.add_argument("--graphs", type=Path, required=True)
+    identity_audit_parser.add_argument("--output", type=Path)
 
     rescore = subparsers.add_parser(
         "rescore",
@@ -597,6 +606,12 @@ def main() -> None:
         )
         print(json.dumps(manifest, indent=2))
         print(f"Wrote raw path audit to {args.output}")
+    elif args.command == "identity-audit":
+        result = audit_predictions(args.predictions, args.graphs)
+        print(format_report(result))
+        if args.output:
+            args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(f"\nWrote {args.output}")
     elif args.command == "rescore":
         if bool(args.model) == bool(args.comparator):
             raise SystemExit("rescore needs exactly one of --model or --comparator")

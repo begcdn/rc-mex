@@ -2975,3 +2975,114 @@ def test_rescoring_selects_by_the_new_score_and_ignores_the_searcher(monkeypatch
 def test_rescoring_rejects_an_unknown_scorer_kind() -> None:
     with pytest.raises(ValueError, match="unknown scorer kind"):
         score_pairs([("a", "b")], "stub", "nonsense")
+
+
+# --- identity-hop audit -------------------------------------------------------
+
+
+def _identity_graph():
+    """Alice reaches Boston. `alias` is a self-loop on Alice; `lives_in` is real."""
+    from inverse_verifier.retrieval import LocalQuestionGraph
+
+    return LocalQuestionGraph(
+        [
+            ["Alice", "alias", "Alice"],
+            ["Alice", "lives_in", "Boston"],
+        ]
+    )
+
+
+def test_strict_reduce_drops_reflexive_hop():
+    from inverse_verifier.identity_audit import strict_reduce
+
+    graph = _identity_graph()
+    path = ("alias::forward", "lives_in::forward")
+    assert strict_reduce(graph, "Alice", path) == ("lives_in::forward",)
+
+
+def test_strict_reduce_keeps_real_hop():
+    from inverse_verifier.identity_audit import strict_reduce
+
+    graph = _identity_graph()
+    path = ("lives_in::forward",)
+    assert strict_reduce(graph, "Alice", path) == path
+
+
+def test_strict_reduce_leaves_unexecutable_path_alone():
+    from inverse_verifier.identity_audit import strict_reduce
+
+    graph = _identity_graph()
+    path = ("missing::forward",)
+    assert strict_reduce(graph, "Alice", path) == path
+
+
+def test_answer_scores_exact_and_partial():
+    from inverse_verifier.identity_audit import answer_scores
+
+    assert answer_scores(["a"], ["a"]) == (1.0, 1.0)
+    exact, f1 = answer_scores(["a", "b"], ["a"])
+    assert exact == 0.0
+    assert f1 == pytest.approx(2 / 3)
+    assert answer_scores([], ["a"]) == (0.0, 0.0)
+
+
+def test_audit_predictions_stratifies_by_label(tmp_path: Path):
+    """A no-op variant of the annotated path must land in denotation_only, not annotated."""
+    from inverse_verifier.identity_audit import audit_predictions
+
+    graphs = tmp_path / "graphs.jsonl"
+    graphs.write_text(
+        json.dumps(
+            {
+                "id": "q1",
+                "question": "where does alice live?",
+                "answer": ["Boston"],
+                "q_entity": ["Alice"],
+                "a_entity": ["Boston"],
+                "graph": [["Alice", "alias", "Alice"], ["Alice", "lives_in", "Boston"]],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "question_id": "q1",
+                "question": "where does alice live?",
+                "gold_answers": ["Boston"],
+                "gold_sequences": [["lives_in::forward"]],
+                "candidate_log": [
+                    {
+                        "relation_sequence": ["alias::forward", "lives_in::forward"],
+                        "answers": ["Boston"],
+                        "score": 9.0,
+                        "matches_gold_path": False,
+                    },
+                    {
+                        "relation_sequence": ["lives_in::forward"],
+                        "answers": ["Boston"],
+                        "score": 1.0,
+                        "matches_gold_path": True,
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = audit_predictions(predictions, graphs)
+    populations = result["populations"]
+    assert populations["all"]["n"] == 2
+    assert populations["all"]["reducible"] == 1
+    assert populations["annotated_positive"]["reducible"] == 0
+    assert populations["denotation_only_positive"]["n"] == 1
+    assert populations["denotation_only_positive"]["rate"] == 1.0
+
+    # the no-op variant outscores the clean path, so exact match misses and
+    # collapsed comparison recovers it
+    assert result["path_match"]["exact"] == 0.0
+    assert result["path_match"]["collapsed"] == 1.0
+    assert len(result["flips"]) == 1
