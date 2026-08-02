@@ -56,6 +56,7 @@ prepare_cpu_runtime() {
   "$CPU_VENV/bin/python" -m pip install --upgrade pip
   "$CPU_VENV/bin/python" -m pip install \
     "huggingface_hub>=0.25,<1" \
+    "hf_transfer>=0.1.8" \
     "transformers==4.46.3" \
     pytest
 }
