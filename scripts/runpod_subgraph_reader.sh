@@ -131,7 +131,7 @@ prepare_experiment() {
   "$CPU_VENV/bin/python" subgraph_reader_pilot.py prepare-structure \
     --source "$SOURCE_FILE" \
     --output "$OUT" \
-    --official-cwq data/pattern_alignment/transfer/cwq.json \
+    --official-cwq resources/complexwebquestions/cwq_test_structure.json \
     --tokenizer "$MODEL_DIR" \
     --per-type 200 \
     --seed 17
