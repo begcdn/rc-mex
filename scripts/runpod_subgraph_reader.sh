@@ -16,7 +16,8 @@ esac
 
 ROOT="${RUNPOD_ROOT:-/workspace}"
 REPO="$ROOT/rcmex"
-VENV="$ROOT/venvs/subgraph-reader"
+CPU_VENV="$ROOT/venvs/subgraph-reader-prep"
+GPU_VENV="$ROOT/venvs/subgraph-reader-gpu"
 MODEL_DIR="$ROOT/models/Meta-Llama-3.1-8B-Instruct"
 HF_HOME="${HF_HOME:-$ROOT/hf_cache}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-$ROOT/pip_cache}"
@@ -39,28 +40,60 @@ log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*"
 }
 
-prepare_runtime() {
+checkout_code() {
   if [[ ! -d "$REPO/.git" ]]; then
     git clone "$REPO_URL" "$REPO"
   fi
   git -C "$REPO" fetch origin "$CODE_REVISION"
   git -C "$REPO" checkout --detach FETCH_HEAD
+}
 
-  if [[ ! -x "$VENV/bin/python" ]]; then
-    python3 -m venv "$VENV"
+prepare_cpu_runtime() {
+  checkout_code
+  if [[ ! -x "$CPU_VENV/bin/python" ]]; then
+    python3 -m venv "$CPU_VENV"
   fi
-  "$VENV/bin/python" -m pip install --upgrade pip
-  if ! "$VENV/bin/python" -c 'from importlib.metadata import version; assert version("vllm") == "0.8.5.post1"' 2>/dev/null; then
-    "$VENV/bin/python" -m pip install "vllm==0.8.5.post1"
+  "$CPU_VENV/bin/python" -m pip install --upgrade pip
+  "$CPU_VENV/bin/python" -m pip install \
+    "huggingface_hub>=0.25,<1" \
+    "transformers==4.46.3" \
+    pytest
+}
+
+select_gpu_python() {
+  local candidate
+  for candidate in "${GPU_PYTHON:-}" python3.11 python3.10 python3.9 python3; do
+    [[ -n "$candidate" ]] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
+PY
+    then
+      GPU_PYTHON="$candidate"
+      return
+    fi
+  done
+  echo "GPU stage requires Python 3.9 or newer; use a current RunPod PyTorch template" >&2
+  exit 1
+}
+
+prepare_gpu_runtime() {
+  select_gpu_python
+  if [[ ! -x "$GPU_VENV/bin/python" ]]; then
+    "$GPU_PYTHON" -m venv "$GPU_VENV"
   fi
-  "$VENV/bin/python" -m pip install "huggingface_hub>=0.25,<1" pytest
+  "$GPU_VENV/bin/python" -m pip install --upgrade pip
+  if ! "$GPU_VENV/bin/python" -c 'from importlib.metadata import version; assert version("vllm") == "0.8.5.post1"' 2>/dev/null; then
+    "$GPU_VENV/bin/python" -m pip install "vllm==0.8.5.post1"
+  fi
 }
 
 download_inputs() {
-  if [[ ! -f "$MODEL_DIR/config.json" ]]; then
+  if [[ ! -f "$MODEL_DIR/model.safetensors.index.json" ]]; then
     : "${HF_TOKEN:?Set HF_TOKEN to a Hugging Face token with Meta-Llama-3.1-8B-Instruct access}"
     log "Downloading the exact Llama checkpoint"
-    MODEL_DIR="$MODEL_DIR" "$VENV/bin/python" - <<'PY'
+    MODEL_DIR="$MODEL_DIR" "$CPU_VENV/bin/python" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
@@ -74,7 +107,7 @@ PY
 
   if [[ ! -f "$SOURCE_FILE" ]]; then
     log "Downloading SubgraphRAG's published CWQ predictions"
-    SOURCE_DIR="$SOURCE_DIR" "$VENV/bin/python" - <<'PY'
+    SOURCE_DIR="$SOURCE_DIR" "$CPU_VENV/bin/python" - <<'PY'
 import os
 from huggingface_hub import hf_hub_download
 
@@ -90,8 +123,11 @@ PY
 prepare_experiment() {
   mkdir -p "$OUT"
   cd "$REPO"
-  "$VENV/bin/python" -m pytest -q
-  "$VENV/bin/python" subgraph_reader_pilot.py prepare-structure \
+  "$CPU_VENV/bin/python" -m pytest \
+    tests/test_subgraph_organizer.py \
+    tests/test_subgraph_reader_pilot.py \
+    -q
+  "$CPU_VENV/bin/python" subgraph_reader_pilot.py prepare-structure \
     --source "$SOURCE_FILE" \
     --output "$OUT" \
     --official-cwq data/pattern_alignment/transfer/cwq.json \
@@ -102,19 +138,19 @@ prepare_experiment() {
   {
     echo "git_commit=$(git rev-parse HEAD)"
     echo "created_at=$(date --iso-8601=seconds)"
-    "$VENV/bin/python" - <<'PY'
+    "$CPU_VENV/bin/python" - <<'PY'
 from importlib.metadata import version
 
-print(f"torch={version('torch')}")
-print(f"vllm={version('vllm')}")
+print(f"transformers={version('transformers')}")
+print(f"huggingface_hub={version('huggingface_hub')}")
 PY
   } > "$OUT/preparation_environment.txt"
   log "CPU preparation finished. Persistent data is ready at $OUT"
 }
 
 verify_gpu_stage() {
-  [[ -x "$VENV/bin/python" ]] || {
-    echo "Missing prepared environment at $VENV; run cpu-prepare first" >&2
+  [[ -x "$GPU_VENV/bin/python" ]] || {
+    echo "Missing GPU environment at $GPU_VENV" >&2
     exit 1
   }
   [[ -f "$MODEL_DIR/model.safetensors.index.json" ]] || {
@@ -129,7 +165,7 @@ verify_gpu_stage() {
   done
 
   cd "$REPO"
-  "$VENV/bin/python" - <<'PY'
+  "$GPU_VENV/bin/python" - <<'PY'
 import torch
 import vllm
 
@@ -148,7 +184,7 @@ PY
 run_smoke() {
   cd "$REPO"
   rm -rf "$OUT/smoke"
-  "$VENV/bin/python" subgraph_reader_pilot.py run-all-suite \
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py run-all-suite \
     --inputs "$OUT/inputs" \
     --output "$OUT/smoke" \
     --model "$MODEL_DIR" \
@@ -156,7 +192,7 @@ run_smoke() {
     --tensor-parallel-size 1 \
     --limit 2
 
-  OUT="$OUT" "$VENV/bin/python" - <<'PY'
+  OUT="$OUT" "$GPU_VENV/bin/python" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -172,14 +208,14 @@ PY
 
 run_full() {
   cd "$REPO"
-  "$VENV/bin/python" subgraph_reader_pilot.py run-all-suite \
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py run-all-suite \
     --inputs "$OUT/inputs" \
     --output "$OUT/runs" \
     --model "$MODEL_DIR" \
     --batch-size 8 \
     --tensor-parallel-size 1
 
-  "$VENV/bin/python" subgraph_reader_pilot.py evaluate-graph \
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py evaluate-graph \
     --runs "$OUT/runs" \
     --metadata "$OUT/inputs/graph_metadata.jsonl" \
     --output "$OUT/evaluation"
@@ -188,27 +224,31 @@ run_full() {
 
 case "$MODE" in
   cpu-prepare|prepare)
-    prepare_runtime
+    prepare_cpu_runtime
     download_inputs
     prepare_experiment
     ;;
   gpu-smoke|smoke)
+    prepare_gpu_runtime
     verify_gpu_stage
     run_smoke
     ;;
   gpu-full|full)
+    prepare_gpu_runtime
     verify_gpu_stage
     run_full
     ;;
   gpu-all)
+    prepare_gpu_runtime
     verify_gpu_stage
     run_smoke
     run_full
     ;;
   all)
-    prepare_runtime
+    prepare_cpu_runtime
     download_inputs
     prepare_experiment
+    prepare_gpu_runtime
     verify_gpu_stage
     run_smoke
     run_full
