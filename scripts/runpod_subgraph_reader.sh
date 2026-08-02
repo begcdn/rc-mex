@@ -19,6 +19,8 @@ REPO="$ROOT/rcmex"
 VENV="$ROOT/venvs/subgraph-reader"
 MODEL_DIR="$ROOT/models/Meta-Llama-3.1-8B-Instruct"
 HF_HOME="${HF_HOME:-$ROOT/hf_cache}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-$ROOT/pip_cache}"
+TMPDIR="${TMPDIR:-$ROOT/tmp}"
 OUT="$ROOT/runs/subgraph_reader_pilot/cwq_structure_400"
 SOURCE_DIR="$ROOT/data/subgraphrag_release"
 SOURCE_FILE="$SOURCE_DIR/results/KGQA/cwq/SubgraphRAG/Meta-Llama-3.1-8B-Instruct/scored_100-sys_icl_dc-0-thres_0.0-test-predictions.jsonl"
@@ -26,8 +28,12 @@ REPO_URL="${REPO_URL:-https://github.com/begcdn/rc-mex.git}"
 CODE_REVISION="${CODE_REVISION:-main}"
 
 export HF_HOME
+export PIP_CACHE_DIR
+export TMPDIR
 export PYTHONNOUSERSITE=1
 export TOKENIZERS_PARALLELISM=false
+
+mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*"
