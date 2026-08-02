@@ -88,6 +88,9 @@ prepare_gpu_runtime() {
   if ! "$GPU_VENV/bin/python" -c 'from importlib.metadata import version; assert version("vllm") == "0.8.5.post1"' 2>/dev/null; then
     "$GPU_VENV/bin/python" -m pip install "vllm==0.8.5.post1"
   fi
+  "$GPU_VENV/bin/python" -m pip install \
+    "transformers==4.51.3" \
+    "tokenizers==0.21.1"
 }
 
 download_inputs() {
