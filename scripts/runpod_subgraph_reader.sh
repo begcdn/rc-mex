@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Disposable RunPod runner for the controlled CWQ graph-interface experiment.
-# Use a 48 GB GPU and a RunPod PyTorch template with at least 60 GB of disk.
+# Two-stage RunPod runner for the controlled CWQ graph-interface experiment.
+# Prepare a persistent /workspace volume on a CPU Pod, then attach the same
+# volume to a 48 GB GPU Pod for inference.
 
-MODE="${1:-all}"
+MODE="${1:-gpu-all}"
 case "$MODE" in
-  prepare|smoke|full|all) ;;
-  *) echo "usage: $0 [prepare|smoke|full|all]" >&2; exit 2 ;;
+  cpu-prepare|gpu-smoke|gpu-full|gpu-all|all|prepare|smoke|full) ;;
+  *)
+    echo "usage: $0 [cpu-prepare|gpu-smoke|gpu-full|gpu-all|all]" >&2
+    exit 2
+    ;;
 esac
 
 ROOT="${RUNPOD_ROOT:-/workspace}"
@@ -40,7 +44,7 @@ prepare_runtime() {
     python3 -m venv "$VENV"
   fi
   "$VENV/bin/python" -m pip install --upgrade pip
-  if ! "$VENV/bin/python" -c 'import vllm; assert vllm.__version__ == "0.8.5.post1"' 2>/dev/null; then
+  if ! "$VENV/bin/python" -c 'from importlib.metadata import version; assert version("vllm") == "0.8.5.post1"' 2>/dev/null; then
     "$VENV/bin/python" -m pip install "vllm==0.8.5.post1"
   fi
   "$VENV/bin/python" -m pip install "huggingface_hub>=0.25,<1" pytest
@@ -92,9 +96,47 @@ prepare_experiment() {
   {
     echo "git_commit=$(git rev-parse HEAD)"
     echo "created_at=$(date --iso-8601=seconds)"
-    "$VENV/bin/python" -c 'import torch, vllm; print(f"torch={torch.__version__}"); print(f"vllm={vllm.__version__}")'
+    "$VENV/bin/python" - <<'PY'
+from importlib.metadata import version
+
+print(f"torch={version('torch')}")
+print(f"vllm={version('vllm')}")
+PY
+  } > "$OUT/preparation_environment.txt"
+  log "CPU preparation finished. Persistent data is ready at $OUT"
+}
+
+verify_gpu_stage() {
+  [[ -x "$VENV/bin/python" ]] || {
+    echo "Missing prepared environment at $VENV; run cpu-prepare first" >&2
+    exit 1
+  }
+  [[ -f "$MODEL_DIR/model.safetensors.index.json" ]] || {
+    echo "Missing complete model at $MODEL_DIR; run cpu-prepare first" >&2
+    exit 1
+  }
+  for arm in original reorder structured adjacency_flat adjacency_graph; do
+    [[ -f "$OUT/inputs/$arm.jsonl" ]] || {
+      echo "Missing prepared arm $arm; run cpu-prepare first" >&2
+      exit 1
+    }
+  done
+
+  cd "$REPO"
+  "$VENV/bin/python" - <<'PY'
+import torch
+import vllm
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available in the prepared environment")
+print(f"torch={torch.__version__}")
+print(f"vllm={vllm.__version__}")
+print(f"gpu={torch.cuda.get_device_name(0)}")
+PY
+  {
+    echo "gpu_started_at=$(date --iso-8601=seconds)"
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-  } > "$OUT/environment.txt"
+  } > "$OUT/gpu_environment.txt"
 }
 
 run_smoke() {
@@ -138,12 +180,31 @@ run_full() {
   log "Finished. Results: $OUT/evaluation/metrics.json"
 }
 
-prepare_runtime
-download_inputs
-
 case "$MODE" in
-  prepare) prepare_experiment ;;
-  smoke) prepare_experiment; run_smoke ;;
-  full) prepare_experiment; run_full ;;
-  all) prepare_experiment; run_smoke; run_full ;;
+  cpu-prepare|prepare)
+    prepare_runtime
+    download_inputs
+    prepare_experiment
+    ;;
+  gpu-smoke|smoke)
+    verify_gpu_stage
+    run_smoke
+    ;;
+  gpu-full|full)
+    verify_gpu_stage
+    run_full
+    ;;
+  gpu-all)
+    verify_gpu_stage
+    run_smoke
+    run_full
+    ;;
+  all)
+    prepare_runtime
+    download_inputs
+    prepare_experiment
+    verify_gpu_stage
+    run_smoke
+    run_full
+    ;;
 esac
