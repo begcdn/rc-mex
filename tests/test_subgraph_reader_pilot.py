@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import subgraph_reader_pilot as pilot
 from subgraph_reader_pilot import (
@@ -317,3 +318,166 @@ def test_structure_pilot_balances_types_without_putting_sparql_in_prompts(tmp_pa
         ]
         assert len(rows) == 2
         assert all("SELECT ?x" not in row["user_query"] for row in rows)
+
+
+def test_oracle_operation_arms_add_only_abstract_guidance(tmp_path: Path):
+    source_rows = [_row("composition-0", 1), _row("conjunction-0", 1)]
+    source = tmp_path / "source.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in source_rows))
+    official = tmp_path / "official.json"
+    official.write_text(
+        json.dumps(
+            [
+                {
+                    "ID": "composition-0",
+                    "compositionality_type": "composition",
+                    "sparql": "SELECT ?x WHERE { ?c ns:relation.answer ?x . }",
+                },
+                {
+                    "ID": "conjunction-0",
+                    "compositionality_type": "conjunction",
+                    "sparql": "SELECT ?x WHERE { ?c ns:relation.answer ?x . }",
+                },
+            ]
+        )
+    )
+
+    manifest = prepare_structure_pilot(
+        source, tmp_path / "pilot", official, None, per_type=1, seed=11
+    )
+    assert manifest["arms"][-2:] == ["original_operation", "reorder_operation"]
+
+    prepared = {}
+    for arm in pilot.OPERATION_COMPARISON_ARM_NAMES:
+        prepared[arm] = {
+            row["id"]: row
+            for row in map(
+                json.loads,
+                (tmp_path / "pilot" / "inputs" / f"{arm}.jsonl").read_text().splitlines(),
+            )
+        }
+    for question_id in prepared["original"]:
+        kind = question_id.split("-", 1)[0]
+        original = prepared["original"][question_id]
+        guided = prepared["original_operation"][question_id]
+        assert guided["oracle_operation"] == kind
+        assert "Required logical operation:" in guided["user_query"]
+        assert "SELECT ?x" not in guided["user_query"]
+        assert pilot._triple_multiset(guided) == pilot._triple_multiset(original)
+        assert guided["question"] == original["question"]
+        assert guided["ground_truth"] == original["ground_truth"]
+
+
+def test_operation_suite_loads_model_once_for_four_arms(monkeypatch, tmp_path: Path):
+    loads = []
+    runs = []
+    monkeypatch.setattr(
+        pilot,
+        "_load_vllm",
+        lambda model, tensor_parallel_size: (
+            loads.append((model, tensor_parallel_size)) or "engine",
+            "params",
+            "test-vllm",
+        ),
+    )
+    monkeypatch.setattr(
+        pilot,
+        "_run_with_engine",
+        lambda input_path, output_path, llm, params, batch_size, limit: (
+            runs.append(input_path.name) or {"rows": 2}
+        ),
+    )
+
+    pilot.run_operation_suite(
+        tmp_path / "inputs",
+        tmp_path / "outputs",
+        Path("model"),
+        batch_size=4,
+        tensor_parallel_size=1,
+        limit=2,
+    )
+    assert loads == [(Path("model"), 1)]
+    assert runs == [f"{arm}.jsonl" for arm in pilot.OPERATION_COMPARISON_ARM_NAMES]
+
+
+def test_inference_records_actual_generation_tokens_including_retry(tmp_path: Path):
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(_row(identifier, 1)) + "\n" for identifier in ("a", "b"))
+    )
+
+    class FakeEngine:
+        def chat(self, messages, sampling_params, use_tqdm):
+            if len(messages[0]) == 4:
+                texts = (("ans: Answer", [1, 2]), ("No formatted answer", [1, 2, 3]))
+            else:
+                texts = (("ans: Answer", [4, 5]),)
+            return [
+                SimpleNamespace(outputs=[SimpleNamespace(text=text, token_ids=token_ids)])
+                for text, token_ids in texts
+            ]
+
+    manifest = pilot._run_with_engine(
+        input_path,
+        tmp_path / "output.jsonl",
+        FakeEngine(),
+        object(),
+        batch_size=2,
+        limit=None,
+    )
+    rows = list(map(json.loads, (tmp_path / "output.jsonl").read_text().splitlines()))
+    assert rows[0]["final_generation_tokens"] == 2
+    assert rows[0]["total_generation_tokens"] == 2
+    assert rows[0]["follow_up_used"] is False
+    assert rows[1]["final_generation_tokens"] == 2
+    assert rows[1]["total_generation_tokens"] == 5
+    assert rows[1]["follow_up_used"] is True
+    assert manifest["generated_tokens"] == 7
+
+
+def test_operation_evaluation_reports_both_main_effects_and_interaction(tmp_path: Path):
+    run_dir = tmp_path / "runs"
+    run_dir.mkdir()
+    rows = [_row("composition-0", 1), _row("conjunction-0", 1)]
+    predictions = {
+        "original": ["ans: Wrong", "ans: Wrong"],
+        "reorder": ["ans: Answer", "ans: Wrong"],
+        "original_operation": ["ans: Wrong", "ans: Answer"],
+        "reorder_operation": ["ans: Answer", "ans: Answer"],
+    }
+    for arm, arm_predictions in predictions.items():
+        output_rows = []
+        for row, prediction in zip(rows, arm_predictions):
+            item = dict(row)
+            item["pilot_bucket"] = f"cwq_{row['id'].split('-', 1)[0]}"
+            item["answer_evidence_rank"] = 1
+            item["prediction"] = prediction
+            output_rows.append(item)
+        (run_dir / f"{arm}.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in output_rows)
+        )
+
+    metadata = tmp_path / "metadata.jsonl"
+    metadata.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": row["id"],
+                    "cwq_type": row["id"].split("-", 1)[0],
+                    "prompt_tokens": {arm: 100 for arm in pilot.OPERATION_COMPARISON_ARM_NAMES},
+                }
+            )
+            + "\n"
+            for row in rows
+        )
+    )
+
+    metrics = pilot.evaluate_operation_runs(
+        run_dir, metadata, tmp_path / "evaluation", bootstrap_samples=100, seed=5
+    )
+    overall = metrics["slices"]["overall"]
+    assert overall["arms"]["reorder_operation"]["hit_at_1"] == 1.0
+    assert overall["paired_differences"]["operation_on_original"]["f1"]["delta"] == 0.5
+    assert overall["paired_differences"]["operation_on_reorder"]["f1"]["delta"] == 0.5
+    assert overall["interaction"]["f1"]["delta"] == 0.0
+    assert metrics["slices"]["cwq_conjunction"]["questions"] == 1

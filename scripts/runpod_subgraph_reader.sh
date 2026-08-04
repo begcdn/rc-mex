@@ -7,9 +7,9 @@ set -euo pipefail
 
 MODE="${1:-gpu-all}"
 case "$MODE" in
-  cpu-prepare|gpu-smoke|gpu-full|gpu-all|all|prepare|smoke|full) ;;
+  cpu-prepare|gpu-smoke|gpu-full|gpu-all|gpu-operation|all|prepare|smoke|full) ;;
   *)
-    echo "usage: $0 [cpu-prepare|gpu-smoke|gpu-full|gpu-all|all]" >&2
+    echo "usage: $0 [cpu-prepare|gpu-smoke|gpu-full|gpu-all|gpu-operation|all]" >&2
     exit 2
     ;;
 esac
@@ -226,6 +226,38 @@ run_full() {
   log "Finished. Results: $OUT/evaluation/metrics.json"
 }
 
+run_operation() {
+  cd "$REPO"
+  for arm in original reorder original_operation reorder_operation; do
+    [[ -f "$OUT/inputs/$arm.jsonl" ]] || {
+      echo "Missing prepared operation arm $arm; run cpu-prepare with the current code first" >&2
+      exit 1
+    }
+  done
+
+  rm -rf "$OUT/operation_smoke"
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py run-operation-suite \
+    --inputs "$OUT/inputs" \
+    --output "$OUT/operation_smoke" \
+    --model "$MODEL_DIR" \
+    --batch-size 2 \
+    --tensor-parallel-size 1 \
+    --limit 2
+
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py run-operation-suite \
+    --inputs "$OUT/inputs" \
+    --output "$OUT/operation_runs" \
+    --model "$MODEL_DIR" \
+    --batch-size 8 \
+    --tensor-parallel-size 1
+
+  "$GPU_VENV/bin/python" subgraph_reader_pilot.py evaluate-operation \
+    --runs "$OUT/operation_runs" \
+    --metadata "$OUT/inputs/graph_metadata.jsonl" \
+    --output "$OUT/operation_evaluation"
+  log "Operation experiment finished. Results: $OUT/operation_evaluation/metrics.json"
+}
+
 case "$MODE" in
   cpu-prepare|prepare)
     prepare_cpu_runtime
@@ -247,6 +279,11 @@ case "$MODE" in
     verify_gpu_stage
     run_smoke
     run_full
+    ;;
+  gpu-operation)
+    prepare_gpu_runtime
+    verify_gpu_stage
+    run_operation
     ;;
   all)
     prepare_cpu_runtime

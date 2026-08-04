@@ -81,6 +81,24 @@ ans: 2010 (2010 World Series)"""
 ARM_NAMES = ("original", "reorder", "structured")
 GRAPH_ARM_NAMES = ("adjacency_flat", "adjacency_graph")
 ALL_ARM_NAMES = ARM_NAMES + GRAPH_ARM_NAMES
+ORACLE_OPERATION_ARM_NAMES = ("original_operation", "reorder_operation")
+OPERATION_COMPARISON_ARM_NAMES = (
+    "original",
+    "reorder",
+    *ORACLE_OPERATION_ARM_NAMES,
+)
+
+OPERATION_GUIDANCE = {
+    "composition": (
+        "Required logical operation: SEQUENTIAL COMPOSITION.\n"
+        "Combine the required facts in sequence and do not stop at an intermediate result."
+    ),
+    "conjunction": (
+        "Required logical operation: CONJUNCTION / INTERSECTION.\n"
+        "Return only candidates that satisfy every condition or branch in the question; "
+        "a candidate satisfying only one branch is not an answer."
+    ),
+}
 
 
 def _prompt_evidence_lines(prompt: str) -> list[str]:
@@ -239,6 +257,25 @@ def _prompt_tokens(tokenizer, prompt: str) -> int | None:
     return len(tokenizer.encode(prompt, add_special_tokens=False))
 
 
+def add_oracle_operation_guidance(row: dict, operation: str) -> dict:
+    """Add only a gold abstract-operation cue; never add KG or answer structure."""
+    try:
+        guidance = OPERATION_GUIDANCE[operation]
+    except KeyError as exc:
+        raise ValueError(f"unsupported oracle operation: {operation}") from exc
+
+    transformed = dict(row)
+    for field in ("user_query", "all_query"):
+        prompt = transformed[field]
+        marker = "Triplets:\n"
+        if marker not in prompt:
+            raise ValueError(f"{field} has no Triplets section")
+        transformed[field] = prompt.replace(marker, f"{guidance}\n\n{marker}", 1)
+    transformed["oracle_operation"] = operation
+    transformed["oracle_operation_source"] = "gold_cwq_compositionality_type"
+    return transformed
+
+
 def _adjacency_row(row: dict, *, organize_groups: bool) -> dict:
     raw_lines = extract_triple_lines(row["user_query"])
     adjacency_lines = adjacency_graph_lines(
@@ -353,7 +390,8 @@ def prepare_structure_pilot(
         selected.extend(rng.sample(rows, per_type))
     selected.sort(key=lambda item: item[0]["id"])
 
-    arms: dict[str, list[dict]] = {arm: [] for arm in ALL_ARM_NAMES}
+    prepared_arm_names = ALL_ARM_NAMES + ORACLE_OPERATION_ARM_NAMES
+    arms: dict[str, list[dict]] = {arm: [] for arm in prepared_arm_names}
     metadata_rows = []
     for source, info in selected:
         original = dict(source)
@@ -363,15 +401,31 @@ def prepare_structure_pilot(
         reorder = transform_row(original, structured=False)
         structured = transform_row(original, structured=True)
         adjacency_flat, adjacency_graph = _graph_variants(original)
+        original_operation = add_oracle_operation_guidance(
+            original, info["cwq_type"]
+        )
+        reorder_operation = add_oracle_operation_guidance(
+            reorder, info["cwq_type"]
+        )
 
         raw = _triple_multiset(original)
-        if _triple_multiset(reorder) != raw or _triple_multiset(structured) != raw:
+        if any(
+            _triple_multiset(candidate) != raw
+            for candidate in (
+                reorder,
+                structured,
+                original_operation,
+                reorder_operation,
+            )
+        ):
             raise AssertionError(f"triple preservation failed for {original['id']}")
         arms["original"].append(original)
         arms["reorder"].append(reorder)
         arms["structured"].append(structured)
         arms["adjacency_flat"].append(adjacency_flat)
         arms["adjacency_graph"].append(adjacency_graph)
+        arms["original_operation"].append(original_operation)
+        arms["reorder_operation"].append(reorder_operation)
 
         metadata_rows.append(
             {
@@ -379,8 +433,15 @@ def prepare_structure_pilot(
                 **info,
                 "prompt_tokens": {
                     "original": _prompt_tokens(tokenizer, original["user_query"]),
+                    "reorder": _prompt_tokens(tokenizer, reorder["user_query"]),
                     "adjacency_flat": _prompt_tokens(tokenizer, adjacency_flat["user_query"]),
                     "adjacency_graph": _prompt_tokens(tokenizer, adjacency_graph["user_query"]),
+                    "original_operation": _prompt_tokens(
+                        tokenizer, original_operation["user_query"]
+                    ),
+                    "reorder_operation": _prompt_tokens(
+                        tokenizer, reorder_operation["user_query"]
+                    ),
                 },
             }
         )
@@ -396,12 +457,15 @@ def prepare_structure_pilot(
         "seed": seed,
         "requested_per_type": per_type,
         "rows": len(selected),
-        "arms": list(ALL_ARM_NAMES),
+        "arms": list(prepared_arm_names),
         "available_evidence_proxy_complete": {
             kind: len(rows) for kind, rows in eligible.items()
         },
         "selected_type_counts": dict(Counter(info["cwq_type"] for _, info in selected)),
-        "gold_usage": "offline sample selection and structural evaluation only",
+        "gold_usage": (
+            "offline sample selection and structural evaluation; the two explicitly named "
+            "oracle operation arms receive only the gold abstract compositionality type"
+        ),
         "evidence_proxy_warning": "relation coverage plus answer endpoint; not proof of a connected gold derivation",
     }
     output.mkdir(parents=True, exist_ok=True)
@@ -469,6 +533,8 @@ def _run_with_engine(
     if not completed.issubset(input_ids):
         raise ValueError("output checkpoint contains ids absent from the input")
     pending = [row for row in rows if row["id"] not in completed]
+    started = time.perf_counter()
+    generated_tokens = 0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("a", encoding="utf-8") as output:
@@ -477,6 +543,9 @@ def _run_with_engine(
             conversations = [build_conversation(row) for row in batch]
             results = llm.chat(messages=conversations, sampling_params=params, use_tqdm=False)
             predictions = [result.outputs[0].text for result in results]
+            final_token_counts = [len(result.outputs[0].token_ids) for result in results]
+            total_token_counts = list(final_token_counts)
+            follow_up_used = [False] * len(batch)
 
             retry_indices = [index for index, text in enumerate(predictions) if needs_follow_up(text)]
             if retry_indices:
@@ -490,16 +559,39 @@ def _run_with_engine(
                 )
                 for index, result in zip(retry_indices, retries):
                     predictions[index] = result.outputs[0].text
+                    retry_tokens = len(result.outputs[0].token_ids)
+                    total_token_counts[index] += retry_tokens
+                    final_token_counts[index] = retry_tokens
+                    follow_up_used[index] = True
 
-            for row, prediction in zip(batch, predictions):
+            for row, prediction, final_tokens, total_tokens, retried in zip(
+                batch,
+                predictions,
+                final_token_counts,
+                total_token_counts,
+                follow_up_used,
+            ):
                 result_row = dict(row)
                 result_row["prediction"] = prediction
+                result_row["final_generation_tokens"] = final_tokens
+                result_row["total_generation_tokens"] = total_tokens
+                result_row["follow_up_used"] = retried
                 output.write(json.dumps(result_row, ensure_ascii=False) + "\n")
+                generated_tokens += total_tokens
             output.flush()
             done = len(completed) + min(start + len(batch), len(pending))
             print(f"{input_path.stem}: {done}/{len(rows)}", flush=True)
 
-    return {"input": str(input_path), "output": str(output_path), "rows": len(rows)}
+    elapsed = time.perf_counter() - started
+    return {
+        "input": str(input_path),
+        "output": str(output_path),
+        "rows": len(rows),
+        "new_rows": len(pending),
+        "elapsed_seconds": elapsed,
+        "generated_tokens": generated_tokens,
+        "generated_tokens_per_second": generated_tokens / elapsed if elapsed else 0.0,
+    }
 
 
 def run_inference(
@@ -607,6 +699,26 @@ def run_all_suite(
         tensor_parallel_size,
         limit,
         ALL_ARM_NAMES,
+    )
+
+
+def run_operation_suite(
+    inputs: Path,
+    output: Path,
+    model_path: Path,
+    batch_size: int,
+    tensor_parallel_size: int,
+    limit: int | None,
+) -> dict:
+    """Run the matched 2x2 order-by-oracle-operation experiment."""
+    return _run_named_suite(
+        inputs,
+        output,
+        model_path,
+        batch_size,
+        tensor_parallel_size,
+        limit,
+        OPERATION_COMPARISON_ARM_NAMES,
     )
 
 
@@ -953,6 +1065,145 @@ def evaluate_graph_runs(
     return metrics
 
 
+def evaluate_operation_runs(
+    run_dir: Path,
+    metadata_path: Path,
+    output: Path,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict:
+    """Evaluate whether gold abstract-operation information helps the reader."""
+    arm_rows = {
+        arm: {row["id"]: row for row in read_jsonl(run_dir / f"{arm}.jsonl")}
+        for arm in OPERATION_COMPARISON_ARM_NAMES
+    }
+    ids = list(arm_rows["original"])
+    if any(set(rows) != set(ids) for rows in arm_rows.values()):
+        raise ValueError("the operation inference arms do not contain identical question ids")
+    metadata = {row["id"]: row for row in read_jsonl(metadata_path)}
+    if set(metadata) != set(ids):
+        raise ValueError("operation metadata and inference outputs contain different ids")
+
+    scored_rows = []
+    for question_id in ids:
+        info = metadata[question_id]
+        scores = {
+            arm: score_prediction(
+                arm_rows[arm][question_id], arm_rows[arm][question_id]["prediction"]
+            )
+            for arm in OPERATION_COMPARISON_ARM_NAMES
+        }
+        scored_rows.append(
+            {
+                "id": question_id,
+                "bucket": arm_rows["original"][question_id]["pilot_bucket"],
+                "answer_evidence_rank": arm_rows["original"][question_id][
+                    "answer_evidence_rank"
+                ],
+                **info,
+                "scores": scores,
+            }
+        )
+
+    slices: dict[str, list[dict]] = {"overall": scored_rows}
+    for operation in sorted({row["cwq_type"] for row in scored_rows}):
+        slices[f"cwq_{operation}"] = [
+            row for row in scored_rows if row["cwq_type"] == operation
+        ]
+
+    comparisons = (
+        ("operation_on_original", "original_operation", "original"),
+        ("operation_on_reorder", "reorder_operation", "reorder"),
+        ("reorder_without_operation", "reorder", "original"),
+        ("reorder_with_operation", "reorder_operation", "original_operation"),
+        ("combined_minus_original", "reorder_operation", "original"),
+    )
+    metrics: dict = {
+        "questions": len(scored_rows),
+        "bootstrap_samples": bootstrap_samples,
+        "experiment": "2x2 evidence order by oracle abstract operation guidance",
+        "oracle_warning": (
+            "operation labels come from gold CWQ compositionality metadata; this measures "
+            "information value, not deployable operation prediction"
+        ),
+        "slices": {},
+    }
+    for slice_name, rows in slices.items():
+        result: dict = {
+            "questions": len(rows),
+            "arms": {},
+            "paired_differences": {},
+            "interaction": {},
+        }
+        for arm in OPERATION_COMPARISON_ARM_NAMES:
+            arm_result = {
+                metric: _mean([row["scores"][arm][metric] for row in rows])
+                for metric in ("hit_at_1", "f1", "no_answer")
+            }
+            arm_outputs = [arm_rows[arm][row["id"]] for row in rows]
+            arm_result["mean_output_words"] = _mean(
+                [len(item["prediction"].split()) for item in arm_outputs]
+            )
+            if all("total_generation_tokens" in item for item in arm_outputs):
+                arm_result.update(
+                    {
+                        "mean_final_generation_tokens": _mean(
+                            [item["final_generation_tokens"] for item in arm_outputs]
+                        ),
+                        "mean_total_generation_tokens": _mean(
+                            [item["total_generation_tokens"] for item in arm_outputs]
+                        ),
+                        "follow_up_rate": _mean(
+                            [float(item["follow_up_used"]) for item in arm_outputs]
+                        ),
+                    }
+                )
+            result["arms"][arm] = arm_result
+        for label, left, right in comparisons:
+            result["paired_differences"][label] = {
+                metric: _bootstrap_delta(
+                    [row["scores"][left][metric] for row in rows],
+                    [row["scores"][right][metric] for row in rows],
+                    seed,
+                    bootstrap_samples,
+                )
+                for metric in ("hit_at_1", "f1")
+            }
+        for metric in ("hit_at_1", "f1"):
+            operation_on_reorder = [
+                row["scores"]["reorder_operation"][metric]
+                - row["scores"]["reorder"][metric]
+                for row in rows
+            ]
+            operation_on_original = [
+                row["scores"]["original_operation"][metric]
+                - row["scores"]["original"][metric]
+                for row in rows
+            ]
+            result["interaction"][metric] = _bootstrap_delta(
+                operation_on_reorder,
+                operation_on_original,
+                seed,
+                bootstrap_samples,
+            )
+        token_rows = [
+            row["prompt_tokens"]
+            for row in rows
+            if all(row["prompt_tokens"].get(arm) is not None for arm in OPERATION_COMPARISON_ARM_NAMES)
+        ]
+        if token_rows:
+            result["mean_prompt_tokens"] = {
+                arm: _mean([tokens[arm] for tokens in token_rows])
+                for arm in OPERATION_COMPARISON_ARM_NAMES
+            }
+        metrics["slices"][slice_name] = result
+
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    write_jsonl(output / "paired_diagnostics.jsonl", scored_rows)
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1009,6 +1260,14 @@ def main() -> None:
     all_suite.add_argument("--tensor-parallel-size", type=int, default=1)
     all_suite.add_argument("--limit", type=int)
 
+    operation_suite = commands.add_parser("run-operation-suite")
+    operation_suite.add_argument("--inputs", type=Path, required=True)
+    operation_suite.add_argument("--output", type=Path, required=True)
+    operation_suite.add_argument("--model", type=Path, required=True)
+    operation_suite.add_argument("--batch-size", type=int, default=8)
+    operation_suite.add_argument("--tensor-parallel-size", type=int, default=1)
+    operation_suite.add_argument("--limit", type=int)
+
     queued = commands.add_parser("wait-suite")
     queued.add_argument("--inputs", type=Path, required=True)
     queued.add_argument("--output", type=Path, required=True)
@@ -1051,6 +1310,13 @@ def main() -> None:
     evaluate_graph.add_argument("--output", type=Path, required=True)
     evaluate_graph.add_argument("--bootstrap-samples", type=int, default=10_000)
     evaluate_graph.add_argument("--seed", type=int, default=17)
+
+    evaluate_operation = commands.add_parser("evaluate-operation")
+    evaluate_operation.add_argument("--runs", type=Path, required=True)
+    evaluate_operation.add_argument("--metadata", type=Path, required=True)
+    evaluate_operation.add_argument("--output", type=Path, required=True)
+    evaluate_operation.add_argument("--bootstrap-samples", type=int, default=10_000)
+    evaluate_operation.add_argument("--seed", type=int, default=17)
 
     args = parser.parse_args()
     if args.command == "prepare":
@@ -1107,6 +1373,15 @@ def main() -> None:
             args.tensor_parallel_size,
             args.limit,
         )
+    elif args.command == "run-operation-suite":
+        result = run_operation_suite(
+            args.inputs,
+            args.output,
+            args.model,
+            args.batch_size,
+            args.tensor_parallel_size,
+            args.limit,
+        )
     elif args.command == "wait-suite":
         result = wait_and_run_suite(
             args.inputs,
@@ -1142,8 +1417,16 @@ def main() -> None:
         )
     elif args.command == "evaluate":
         result = evaluate_runs(args.runs, args.output, args.bootstrap_samples, args.seed)
-    else:
+    elif args.command == "evaluate-graph":
         result = evaluate_graph_runs(
+            args.runs,
+            args.metadata,
+            args.output,
+            args.bootstrap_samples,
+            args.seed,
+        )
+    else:
+        result = evaluate_operation_runs(
             args.runs,
             args.metadata,
             args.output,
