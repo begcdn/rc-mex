@@ -35,6 +35,32 @@ Proceed with two matched, lossless arms on the same 400 questions:
 
 The primary comparison is against the existing reordered 3B arm, with paired bootstrap intervals. Report overall, conjunction, and conjunction-with-two-roots slices. The 8B original score is a secondary compute reference, not the statistical baseline.
 
+## Pilot Result
+
+The 400-question Llama 3.2 3B run gives a positive but inconclusive signal for branch grouping and no support for explicitly listing junction candidates.
+
+| Slice | Arm | Hit@1 | F1 |
+|---|---|---:|---:|
+| Overall (400) | Reordered | 0.750 | 0.660 |
+| Overall (400) | Branch grouped | 0.765 | 0.677 |
+| Overall (400) | Junction surfaced | 0.750 | 0.674 |
+| Conjunction (200) | Reordered | 0.655 | 0.599 |
+| Conjunction (200) | Branch grouped | 0.675 | 0.634 |
+| Conjunction (200) | Junction surfaced | 0.645 | 0.623 |
+| Branchable conjunction (138) | Reordered | 0.638 | 0.587 |
+| Branchable conjunction (138) | Branch grouped | 0.667 | 0.640 |
+| Branchable conjunction (138) | Junction surfaced | 0.623 | 0.620 |
+
+For branchable conjunctions, branch grouping changes F1 by `+0.0535`, with paired bootstrap 95% CI `[-0.0101, +0.1179]`. The direction is encouraging, but the interval crosses zero. It does not meet the proposed scale gate: overall 3B branch-grouped F1 is `0.677`, below the matched 8B original-evidence F1 of `0.699`.
+
+The targeted diagnostic behaves as predicted: among the 28 previously identified conjunction cases missed by reordered 3B but solved by reordered 8B, branch grouping fixes 11 at Hit@1 and junction surfacing fixes 13. Across all conjunction questions, however, branch grouping produces 15 positive and 11 negative Hit@1 flips. The mechanism fixes real failures but also destabilizes already-correct answers.
+
+Junction surfacing should not advance in its current form. On the 108 conjunction rows where a junction header is actually added, it changes Hit@1 by `-0.0463` and F1 by `-0.0328` relative to branch grouping; both intervals cross zero, but there is no positive aggregate signal and the no-answer rate rises.
+
+As a reproducibility control, 208 non-branchable rows have byte-identical prompts in all three arms. Three nevertheless change Hit@1 across repeated vLLM generation, establishing a small inference nondeterminism floor. The branch-grouping trend is larger than this floor but remains unconfirmed.
+
+**Decision:** retain reordering as the established result; retain branch grouping as a candidate requiring a better-powered conjunction test or cleaner upstream topic IDs; reject junction surfacing as currently formulated. Do not claim that 3B has matched 8B, and do not launch a full-population campaign from this pilot alone.
+
 ## Limits
 
 - Released pilot rows do not retain upstream topic-entity IDs. Exact question/surface matching is therefore a proxy and can select generic nodes such as `Currency` or `Military Conflict`.
