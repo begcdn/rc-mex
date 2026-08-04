@@ -7,6 +7,7 @@ VENV="${VENV:-/data3/ziad/venvs/inverse-verifier}"
 PY="$VENV/bin/python"
 MODEL="${MODEL:-/data3/ziad/models/Llama-3.2-3B-Instruct}"
 GPU="${GPU:-1}"
+OPENAI_WORKERS="${OPENAI_WORKERS:-3}"
 ROOT="${ROOT:-runs/subgraph_reader_pilot/cwq_full_scale_campaign_v1}"
 RELEASE="${RELEASE:-data/subgraphrag_release}"
 OFFICIAL="${OFFICIAL:-data/pattern_alignment/transfer/cwq.json}"
@@ -45,10 +46,11 @@ mkdir -p "$ROOT/logs"
 (
   "$PY" reader_scale_campaign.py run-openai \
     --inputs "$ROOT/inputs" \
-    --output "$ROOT/gpt4o_mini"
+    --output "$ROOT/gpt4o_mini" \
+    --workers "$OPENAI_WORKERS"
 ) >"$ROOT/logs/openai.log" 2>&1 &
 OPENAI_PID=$!
-echo "OpenAI Batch runner PID: $OPENAI_PID"
+echo "OpenAI API runner PID: $OPENAI_PID (workers=$OPENAI_WORKERS)"
 
 set -o pipefail
 CUDA_VISIBLE_DEVICES="$GPU" "$PY" reader_scale_campaign.py run-local \
@@ -59,7 +61,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PY" reader_scale_campaign.py run-local \
   --tensor-parallel-size 1 \
   2>&1 | tee "$ROOT/logs/llama32_3b.log"
 
-echo "Local model complete; waiting for OpenAI Batch runner"
+echo "Local model complete; waiting for OpenAI API runner"
 wait "$OPENAI_PID"
 
 "$PY" reader_scale_campaign.py evaluate \

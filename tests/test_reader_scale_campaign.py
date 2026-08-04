@@ -61,6 +61,22 @@ def test_request_keys_are_short_stable_and_arm_specific():
     assert len(first) < 40
 
 
+def test_openai_cli_defaults_to_bounded_regular_api_concurrency(monkeypatch):
+    captured = {}
+
+    def fake_run(inputs, output, workers):
+        captured.update(inputs=inputs, output=output, workers=workers)
+        return {"ok": True}
+
+    monkeypatch.setattr(campaign, "run_openai_campaign", fake_run)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["reader_scale_campaign.py", "run-openai", "--inputs", "in", "--output", "out"],
+    )
+    campaign.main()
+    assert captured["workers"] == 3
+
+
 def test_full_evaluation_reports_scale_interaction(tmp_path: Path):
     metadata = tmp_path / "metadata.jsonl"
     metadata.write_text(

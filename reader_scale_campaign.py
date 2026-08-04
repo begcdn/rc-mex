@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
-from inverse_verifier.openai_naturalize import OpenAIBatchClient, run_batch_records
+from inverse_verifier.openai_naturalize import OpenAIBatchClient, run_chat_records_sync
 from subgraph_organizer import branch_assembly_lines, extract_triple_lines, replace_triples
 from subgraph_reader_pilot import (
     _bootstrap_delta,
@@ -178,7 +178,7 @@ def _batch_predictions(paths: Iterable[Path]) -> dict[str, dict]:
     return predictions
 
 
-def run_openai_campaign(inputs: Path, output: Path) -> dict:
+def run_openai_campaign(inputs: Path, output: Path, workers: int) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
@@ -188,11 +188,13 @@ def run_openai_campaign(inputs: Path, output: Path) -> dict:
     for arm in OPENAI_ARMS:
         rows = read_jsonl(inputs / f"{arm}.jsonl")
         primary_records = [_batch_record(row, arm, False) for row in rows]
-        primary_files = run_batch_records(
+        primary_files = run_chat_records_sync(
             primary_records,
-            output / ".batch" / arm / "primary",
+            output / ".api" / arm / "primary",
             client,
             f"full CWQ {arm} primary",
+            workers=workers,
+            retries=50,
         )
         primary = _batch_predictions(primary_files)
         retry_rows = [
@@ -202,11 +204,13 @@ def run_openai_campaign(inputs: Path, output: Path) -> dict:
         ]
         retry = {}
         if retry_rows:
-            retry_files = run_batch_records(
+            retry_files = run_chat_records_sync(
                 [_batch_record(row, arm, True) for row in retry_rows],
-                output / ".batch" / arm / "retry",
+                output / ".api" / arm / "retry",
                 client,
                 f"full CWQ {arm} formatting retry",
+                workers=workers,
+                retries=50,
             )
             retry = _batch_predictions(retry_files)
 
@@ -364,6 +368,7 @@ def main() -> None:
     openai = commands.add_parser("run-openai")
     openai.add_argument("--inputs", type=Path, required=True)
     openai.add_argument("--output", type=Path, required=True)
+    openai.add_argument("--workers", type=int, default=3)
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--local-runs", type=Path, required=True)
     evaluate.add_argument("--gpt-runs", type=Path, required=True)
@@ -378,7 +383,7 @@ def main() -> None:
     elif args.command == "run-local":
         result = run_local_campaign(args.inputs, args.output, args.model, args.batch_size, args.tensor_parallel_size)
     elif args.command == "run-openai":
-        result = run_openai_campaign(args.inputs, args.output)
+        result = run_openai_campaign(args.inputs, args.output, args.workers)
     else:
         result = evaluate_full_campaign(
             args.local_runs,
