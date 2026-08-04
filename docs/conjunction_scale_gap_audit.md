@@ -51,7 +51,17 @@ The 400-question Llama 3.2 3B run gives a positive but inconclusive signal for b
 | Branchable conjunction (138) | Branch grouped | 0.667 | 0.640 |
 | Branchable conjunction (138) | Junction surfaced | 0.623 | 0.620 |
 
-For branchable conjunctions, branch grouping changes F1 by `+0.0535`, with paired bootstrap 95% CI `[-0.0101, +0.1179]`. The direction is encouraging, but the interval crosses zero. It does not meet the proposed scale gate: overall 3B branch-grouped F1 is `0.677`, below the matched 8B original-evidence F1 of `0.699`.
+For branchable conjunctions, branch grouping changes F1 by `+0.0535`, with paired bootstrap 95% CI `[-0.0101, +0.1179]`. The direction is encouraging, but the interval crosses zero.
+
+The earlier plan incorrectly treated Llama 3.1 8B as the scale reference. The research question is whether evidence organization lets a small local model approach a substantially stronger reader, so the correct reference is SubgraphRAG's released GPT-4o-mini output on the same 400 questions. Under the same local evaluator:
+
+| Slice | 3B original F1 | 3B reordered F1 | 3B branch F1 | GPT-4o-mini original F1 |
+|---|---:|---:|---:|---:|
+| Overall | 0.615 | 0.660 | 0.677 | 0.752 |
+| Conjunction | 0.547 | 0.599 | 0.634 | 0.730 |
+| Branchable conjunction | 0.516 | 0.586 | 0.640 | 0.697 |
+
+Organization closes about 45% of the original overall F1 gap to GPT-4o-mini and about 68% of the gap on branchable conjunctions. These are descriptive comparisons, not matched scale-interaction tests: GPT-4o-mini has only been evaluated on original evidence. It must also read the reordered and branch-grouped prompts before claiming that organization disproportionately helps the smaller model.
 
 The targeted diagnostic behaves as predicted: among the 28 previously identified conjunction cases missed by reordered 3B but solved by reordered 8B, branch grouping fixes 11 at Hit@1 and junction surfacing fixes 13. Across all conjunction questions, however, branch grouping produces 15 positive and 11 negative Hit@1 flips. The mechanism fixes real failures but also destabilizes already-correct answers.
 
@@ -59,7 +69,7 @@ Junction surfacing should not advance in its current form. On the 108 conjunctio
 
 As a reproducibility control, 208 non-branchable rows have byte-identical prompts in all three arms. Three nevertheless change Hit@1 across repeated vLLM generation, establishing a small inference nondeterminism floor. The branch-grouping trend is larger than this floor but remains unconfirmed.
 
-**Decision:** retain reordering as the established result; retain branch grouping as a candidate requiring a better-powered conjunction test or cleaner upstream topic IDs; reject junction surfacing as currently formulated. Do not claim that 3B has matched 8B, and do not launch a full-population campaign from this pilot alone.
+**Decision:** retain reordering as the established result; retain branch grouping as a candidate requiring a better-powered conjunction test or cleaner upstream topic IDs; reject junction surfacing as currently formulated. Do not claim that 3B has matched GPT-4o-mini. Before scaling the dataset, run GPT-4o-mini on the reordered and branch-grouped arms to measure the model-size-by-organization interaction directly.
 
 ## Limits
 
