@@ -571,6 +571,7 @@ def _load_vllm(model_path: Path, tensor_parallel_size: int):
     llm = LLM(
         model=str(model_path),
         tensor_parallel_size=tensor_parallel_size,
+        max_model_len=32_768,
         max_seq_len_to_capture=16_384,
     )
     params = SamplingParams(temperature=0, max_tokens=4_000, frequency_penalty=0.16)

@@ -52,6 +52,15 @@ mkdir -p "$ROOT/logs"
 OPENAI_PID=$!
 echo "OpenAI API runner PID: $OPENAI_PID (workers=$OPENAI_WORKERS)"
 
+cleanup_openai() {
+  if kill -0 "$OPENAI_PID" 2>/dev/null; then
+    echo "Stopping OpenAI API runner after an interrupted or failed campaign"
+    kill "$OPENAI_PID"
+    wait "$OPENAI_PID" || true
+  fi
+}
+trap cleanup_openai EXIT INT TERM
+
 set -o pipefail
 CUDA_VISIBLE_DEVICES="$GPU" "$PY" reader_scale_campaign.py run-local \
   --inputs "$ROOT/inputs" \
@@ -63,6 +72,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PY" reader_scale_campaign.py run-local \
 
 echo "Local model complete; waiting for OpenAI API runner"
 wait "$OPENAI_PID"
+trap - EXIT INT TERM
 
 "$PY" reader_scale_campaign.py evaluate \
   --local-runs "$ROOT/llama32_3b/runs" \
