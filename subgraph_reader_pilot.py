@@ -17,6 +17,7 @@ from typing import Iterable, Sequence
 from subgraph_organizer import (
     _parse_triple,
     adjacency_graph_lines,
+    branch_assembly_lines,
     decode_adjacency_graph,
     extract_triple_lines,
     replace_triples,
@@ -87,6 +88,7 @@ OPERATION_COMPARISON_ARM_NAMES = (
     "reorder",
     *ORACLE_OPERATION_ARM_NAMES,
 )
+BRANCH_ARM_NAMES = ("reorder", "branch_grouped", "junction_surfaced")
 
 OPERATION_GUIDANCE = {
     "composition": (
@@ -285,6 +287,69 @@ def _adjacency_row(row: dict, *, organize_groups: bool) -> dict:
     transformed["user_query"] = replace_triples(row["user_query"], adjacency_lines)
     transformed["all_query"] = replace_triples(row["all_query"], adjacency_lines)
     return transformed
+
+
+def _branch_row(row: dict, *, surface_junctions: bool) -> tuple[dict, dict]:
+    raw_lines = extract_triple_lines(row["user_query"])
+    assembled, metadata = branch_assembly_lines(
+        row["question"], raw_lines, surface_junctions=surface_junctions
+    )
+    transformed = dict(row)
+    transformed["user_query"] = replace_triples(row["user_query"], assembled)
+    transformed["all_query"] = replace_triples(row["all_query"], assembled)
+    return transformed, metadata
+
+
+def prepare_branch_arms(
+    original_path: Path,
+    output: Path,
+    tokenizer_path: Path | None,
+) -> dict:
+    """Prepare matched reorder, branch-grouped, and junction-surfaced arms."""
+    tokenizer = _load_tokenizer(tokenizer_path)
+    arm_rows: dict[str, list[dict]] = {name: [] for name in BRANCH_ARM_NAMES}
+    metadata_rows = []
+    branchable = 0
+    for source in read_jsonl(original_path):
+        reorder = transform_row(source, structured=False)
+        branch_grouped, branch_info = _branch_row(source, surface_junctions=False)
+        junction_surfaced, junction_info = _branch_row(source, surface_junctions=True)
+        raw = _triple_multiset(source)
+        if any(_triple_multiset(candidate) != raw for candidate in (reorder, branch_grouped, junction_surfaced)):
+            raise AssertionError(f"triple preservation failed for {source['id']}")
+        if branch_info != junction_info:
+            raise AssertionError(f"branch metadata differs between arms for {source['id']}")
+        branchable += int(branch_info["branchable"])
+        arm_rows["reorder"].append(reorder)
+        arm_rows["branch_grouped"].append(branch_grouped)
+        arm_rows["junction_surfaced"].append(junction_surfaced)
+        metadata_rows.append(
+            {
+                "id": source["id"],
+                **branch_info,
+                "prompt_tokens": {
+                    "reorder": _prompt_tokens(tokenizer, reorder["user_query"]),
+                    "branch_grouped": _prompt_tokens(tokenizer, branch_grouped["user_query"]),
+                    "junction_surfaced": _prompt_tokens(tokenizer, junction_surfaced["user_query"]),
+                },
+            }
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    for arm, rows in arm_rows.items():
+        write_jsonl(output / f"{arm}.jsonl", rows)
+    write_jsonl(output / "branch_metadata.jsonl", metadata_rows)
+    manifest = {
+        "source": str(original_path),
+        "tokenizer": str(tokenizer_path) if tokenizer_path else None,
+        "rows": len(metadata_rows),
+        "branchable_rows": branchable,
+        "arms": list(BRANCH_ARM_NAMES),
+        "root_source": "exact surface-form matches between the question and retrieved KG entities",
+        "gold_usage": "none in branch construction",
+    }
+    (output / "branch_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
 
 
 def _graph_variants(source: dict) -> tuple[dict, dict]:
@@ -719,6 +784,25 @@ def run_operation_suite(
         tensor_parallel_size,
         limit,
         OPERATION_COMPARISON_ARM_NAMES,
+    )
+
+
+def run_branch_suite(
+    inputs: Path,
+    output: Path,
+    model_path: Path,
+    batch_size: int,
+    tensor_parallel_size: int,
+    limit: int | None,
+) -> dict:
+    return _run_named_suite(
+        inputs,
+        output,
+        model_path,
+        batch_size,
+        tensor_parallel_size,
+        limit,
+        BRANCH_ARM_NAMES,
     )
 
 
@@ -1204,6 +1288,108 @@ def evaluate_operation_runs(
     return metrics
 
 
+def evaluate_branch_runs(
+    run_dir: Path,
+    metadata_path: Path,
+    output: Path,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict:
+    """Evaluate deterministic branch grouping and junction surfacing."""
+    arm_rows = {
+        arm: {row["id"]: row for row in read_jsonl(run_dir / f"{arm}.jsonl")}
+        for arm in BRANCH_ARM_NAMES
+    }
+    ids = list(arm_rows["reorder"])
+    if any(set(rows) != set(ids) for rows in arm_rows.values()):
+        raise ValueError("the branch inference arms do not contain identical question ids")
+    metadata = {row["id"]: row for row in read_jsonl(metadata_path)}
+    if set(metadata) != set(ids):
+        raise ValueError("branch metadata and inference outputs contain different ids")
+
+    scored_rows = []
+    for question_id in ids:
+        reference = arm_rows["reorder"][question_id]
+        scored_rows.append(
+            {
+                "id": question_id,
+                "bucket": reference["pilot_bucket"],
+                "answer_evidence_rank": reference["answer_evidence_rank"],
+                **metadata[question_id],
+                "scores": {
+                    arm: score_prediction(
+                        arm_rows[arm][question_id],
+                        arm_rows[arm][question_id]["prediction"],
+                    )
+                    for arm in BRANCH_ARM_NAMES
+                },
+            }
+        )
+
+    slices = {
+        "overall": scored_rows,
+        "cwq_composition": [row for row in scored_rows if row["bucket"] == "cwq_composition"],
+        "cwq_conjunction": [row for row in scored_rows if row["bucket"] == "cwq_conjunction"],
+        "branchable": [row for row in scored_rows if row["branchable"]],
+        "not_branchable": [row for row in scored_rows if not row["branchable"]],
+        "conjunction_branchable": [
+            row
+            for row in scored_rows
+            if row["bucket"] == "cwq_conjunction" and row["branchable"]
+        ],
+    }
+    comparisons = (
+        ("branch_grouped_minus_reorder", "branch_grouped", "reorder"),
+        ("junction_surfaced_minus_reorder", "junction_surfaced", "reorder"),
+        ("junction_surfaced_minus_branch_grouped", "junction_surfaced", "branch_grouped"),
+    )
+    metrics = {
+        "questions": len(scored_rows),
+        "bootstrap_samples": bootstrap_samples,
+        "experiment": "lossless question-root branch grouping and structural junction surfacing",
+        "deployment_warning": (
+            "released rows omit upstream topic-entity ids; this pilot uses exact question-to-KG "
+            "surface matches as an answer-blind proxy"
+        ),
+        "slices": {},
+    }
+    for slice_name, rows in slices.items():
+        if not rows:
+            continue
+        result = {"questions": len(rows), "arms": {}, "paired_differences": {}}
+        for arm in BRANCH_ARM_NAMES:
+            result["arms"][arm] = {
+                metric: _mean([row["scores"][arm][metric] for row in rows])
+                for metric in ("hit_at_1", "f1", "no_answer")
+            }
+        for label, left, right in comparisons:
+            result["paired_differences"][label] = {
+                metric: _bootstrap_delta(
+                    [row["scores"][left][metric] for row in rows],
+                    [row["scores"][right][metric] for row in rows],
+                    seed,
+                    bootstrap_samples,
+                )
+                for metric in ("hit_at_1", "f1")
+            }
+        token_rows = [
+            row["prompt_tokens"]
+            for row in rows
+            if row["prompt_tokens"].get("reorder") is not None
+        ]
+        if token_rows:
+            result["mean_prompt_tokens"] = {
+                arm: _mean([tokens[arm] for tokens in token_rows])
+                for arm in BRANCH_ARM_NAMES
+            }
+        metrics["slices"][slice_name] = result
+
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    write_jsonl(output / "paired_diagnostics.jsonl", scored_rows)
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1227,6 +1413,11 @@ def main() -> None:
     prepare_structure.add_argument("--tokenizer", type=Path)
     prepare_structure.add_argument("--per-type", type=int, default=200)
     prepare_structure.add_argument("--seed", type=int, default=17)
+
+    prepare_branch = commands.add_parser("prepare-branch")
+    prepare_branch.add_argument("--original", type=Path, required=True)
+    prepare_branch.add_argument("--output", type=Path, required=True)
+    prepare_branch.add_argument("--tokenizer", type=Path)
 
     run = commands.add_parser("run")
     run.add_argument("--input", type=Path, required=True)
@@ -1267,6 +1458,14 @@ def main() -> None:
     operation_suite.add_argument("--batch-size", type=int, default=8)
     operation_suite.add_argument("--tensor-parallel-size", type=int, default=1)
     operation_suite.add_argument("--limit", type=int)
+
+    branch_suite = commands.add_parser("run-branch-suite")
+    branch_suite.add_argument("--inputs", type=Path, required=True)
+    branch_suite.add_argument("--output", type=Path, required=True)
+    branch_suite.add_argument("--model", type=Path, required=True)
+    branch_suite.add_argument("--batch-size", type=int, default=8)
+    branch_suite.add_argument("--tensor-parallel-size", type=int, default=1)
+    branch_suite.add_argument("--limit", type=int)
 
     queued = commands.add_parser("wait-suite")
     queued.add_argument("--inputs", type=Path, required=True)
@@ -1318,6 +1517,13 @@ def main() -> None:
     evaluate_operation.add_argument("--bootstrap-samples", type=int, default=10_000)
     evaluate_operation.add_argument("--seed", type=int, default=17)
 
+    evaluate_branch = commands.add_parser("evaluate-branch")
+    evaluate_branch.add_argument("--runs", type=Path, required=True)
+    evaluate_branch.add_argument("--metadata", type=Path, required=True)
+    evaluate_branch.add_argument("--output", type=Path, required=True)
+    evaluate_branch.add_argument("--bootstrap-samples", type=int, default=10_000)
+    evaluate_branch.add_argument("--seed", type=int, default=17)
+
     args = parser.parse_args()
     if args.command == "prepare":
         result = prepare_pilot(args.source, args.output, args.per_slice, args.seed)
@@ -1337,6 +1543,8 @@ def main() -> None:
             args.per_type,
             args.seed,
         )
+    elif args.command == "prepare-branch":
+        result = prepare_branch_arms(args.original, args.output, args.tokenizer)
     elif args.command == "run":
         result = run_inference(
             args.input,
@@ -1375,6 +1583,15 @@ def main() -> None:
         )
     elif args.command == "run-operation-suite":
         result = run_operation_suite(
+            args.inputs,
+            args.output,
+            args.model,
+            args.batch_size,
+            args.tensor_parallel_size,
+            args.limit,
+        )
+    elif args.command == "run-branch-suite":
+        result = run_branch_suite(
             args.inputs,
             args.output,
             args.model,
@@ -1425,8 +1642,16 @@ def main() -> None:
             args.bootstrap_samples,
             args.seed,
         )
-    else:
+    elif args.command == "evaluate-operation":
         result = evaluate_operation_runs(
+            args.runs,
+            args.metadata,
+            args.output,
+            args.bootstrap_samples,
+            args.seed,
+        )
+    else:
+        result = evaluate_branch_runs(
             args.runs,
             args.metadata,
             args.output,

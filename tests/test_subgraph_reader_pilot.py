@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -481,3 +482,86 @@ def test_operation_evaluation_reports_both_main_effects_and_interaction(tmp_path
     assert overall["paired_differences"]["operation_on_reorder"]["f1"]["delta"] == 0.5
     assert overall["interaction"]["f1"]["delta"] == 0.0
     assert metrics["slices"]["cwq_conjunction"]["questions"] == 1
+
+
+def test_branch_assembly_is_lossless_and_surfaces_structural_meeting():
+    lines = [
+        "(Barbara Gordon,character.performance,m.performance)",
+        "(m.performance,performance.actor,Hannah Gunn)",
+        "(Hannah Gunn,person.place_of_birth,England)",
+        "(Unrelated,relation.value,Noise)",
+    ]
+    grouped, grouped_info = pilot.branch_assembly_lines(
+        "Who played Barbara Gordon and was born in England?",
+        lines,
+        surface_junctions=False,
+    )
+    surfaced, surfaced_info = pilot.branch_assembly_lines(
+        "Who played Barbara Gordon and was born in England?",
+        lines,
+        surface_junctions=True,
+    )
+    assert grouped_info == surfaced_info
+    assert grouped_info["roots"] == ["Barbara Gordon", "England"]
+    assert grouped_info["branchable"] is True
+    assert "Hannah Gunn" in grouped_info["junction_candidates"]
+    assert Counter(line for line in grouped if line.startswith("(")) == Counter(lines)
+    assert Counter(line for line in surfaced if line.startswith("(")) == Counter(lines)
+    assert not any("Structural meeting candidates" in line for line in grouped)
+    assert any("Hannah Gunn" in line for line in surfaced if line.startswith("["))
+
+
+def test_branch_assembly_falls_back_without_two_question_entities():
+    lines = ["(Mozart,music.artist.genre,Opera)", "(Opera,film.subject,Everybody Does It)"]
+    output, metadata = pilot.branch_assembly_lines(
+        "What did Mozart compose?", lines, surface_junctions=True
+    )
+    assert metadata["branchable"] is False
+    assert metadata["roots"] == ["Mozart"]
+    assert Counter(line for line in output if line.startswith("(")) == Counter(lines)
+
+
+def test_branch_evaluation_uses_reorder_as_primary_baseline(tmp_path: Path):
+    run_dir = tmp_path / "runs"
+    run_dir.mkdir()
+    base_rows = [_row("composition-0", 1), _row("conjunction-0", 1)]
+    predictions = {
+        "reorder": ["ans: Wrong", "ans: Wrong"],
+        "branch_grouped": ["ans: Wrong", "ans: Answer"],
+        "junction_surfaced": ["ans: Answer", "ans: Answer"],
+    }
+    for arm, arm_predictions in predictions.items():
+        rows = []
+        for base, prediction in zip(base_rows, arm_predictions):
+            row = dict(base)
+            row["prediction"] = prediction
+            row["pilot_bucket"] = f"cwq_{row['id'].split('-', 1)[0]}"
+            row["answer_evidence_rank"] = 1
+            rows.append(row)
+        (run_dir / f"{arm}.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+    metadata = tmp_path / "metadata.jsonl"
+    metadata.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": row["id"],
+                    "branchable": True,
+                    "roots": ["A", "B"],
+                    "junction_candidates": ["Answer"],
+                    "group_sizes": {},
+                    "prompt_tokens": {arm: 100 for arm in pilot.BRANCH_ARM_NAMES},
+                }
+            )
+            + "\n"
+            for row in base_rows
+        )
+    )
+    metrics = pilot.evaluate_branch_runs(
+        run_dir, metadata, tmp_path / "evaluation", bootstrap_samples=100, seed=4
+    )
+    overall = metrics["slices"]["overall"]
+    assert overall["paired_differences"]["branch_grouped_minus_reorder"]["f1"]["delta"] == 0.5
+    assert overall["paired_differences"]["junction_surfaced_minus_reorder"]["f1"]["delta"] == 1.0
+    assert metrics["slices"]["conjunction_branchable"]["questions"] == 1

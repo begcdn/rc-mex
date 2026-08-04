@@ -10,7 +10,7 @@ import argparse
 import json
 import re
 import unicodedata
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -255,6 +255,150 @@ def adjacency_graph_lines(
             f"> {triple.relation} > {triple.tail}" for triple in groups[head]
         )
     return output
+
+
+def _question_roots(question: str, entities: Iterable[str]) -> list[str]:
+    """Find non-overlapping KG entity names explicitly mentioned in the question."""
+    matches = []
+    for entity in set(entities):
+        tokens = _normalised_tokens(entity)
+        for start in _question_positions(question, entity):
+            matches.append((start, start + len(tokens), entity))
+    matches.sort(
+        key=lambda item: (item[0], -(item[1] - item[0]), -len(item[2]), item[2])
+    )
+
+    selected: list[tuple[int, int, str]] = []
+    for candidate in matches:
+        start, end, _ = candidate
+        if any(
+            start < chosen_end and chosen_start < end
+            for chosen_start, chosen_end, _ in selected
+        ):
+            continue
+        selected.append(candidate)
+    return [entity for _, _, entity in sorted(selected)]
+
+
+def _distances(
+    root: str,
+    adjacency: dict[str, list[int]],
+    by_index: dict[int, ParsedTriple],
+) -> dict[str, int]:
+    distances = {root: 0}
+    queue = deque([root])
+    while queue:
+        entity = queue.popleft()
+        for edge_index in adjacency[entity]:
+            triple = by_index[edge_index]
+            other = triple.tail if triple.head == entity else triple.head
+            if other not in distances:
+                distances[other] = distances[entity] + 1
+                queue.append(other)
+    return distances
+
+
+def branch_assembly_lines(
+    question: str,
+    lines: Iterable[str],
+    *,
+    surface_junctions: bool,
+) -> tuple[list[str], dict]:
+    """Losslessly partition triples around question-mentioned entity roots.
+
+    Each edge is assigned to the closest root. Equal-distance boundary edges
+    form the connecting-evidence group. This performs graph bookkeeping only:
+    roots come from exact question/surface-form matches and no answer or gold
+    query information is accepted by the function.
+    """
+    raw_lines = list(lines)
+    triples = [_parse_triple(line, index) for index, line in enumerate(raw_lines)]
+    by_index = {triple.index: triple for triple in triples}
+    adjacency: dict[str, list[int]] = defaultdict(list)
+    entities: set[str] = set()
+    for triple in triples:
+        entities.update((triple.head, triple.tail))
+        adjacency[triple.head].append(triple.index)
+        adjacency[triple.tail].append(triple.index)
+
+    roots = _question_roots(question, entities)
+    if len(roots) < 2:
+        # Make non-branchable rows byte-for-byte equivalent to the existing
+        # reorder arm so their scores cannot create a false branch effect.
+        fallback = organize_triples(question, raw_lines, structured=False)
+        return fallback, {
+            "roots": roots,
+            "branchable": False,
+            "junction_candidates": [],
+            "group_sizes": {"fallback": len(raw_lines)},
+        }
+
+    distances = {root: _distances(root, adjacency, by_index) for root in roots}
+    branch_edges: dict[str, list[int]] = {root: [] for root in roots}
+    connecting_edges: list[int] = []
+    other_edges: list[int] = []
+    junction_entities: set[str] = set()
+
+    for triple in triples:
+        root_distance = {
+            root: min(
+                distances[root].get(triple.head, 10**9),
+                distances[root].get(triple.tail, 10**9),
+            )
+            for root in roots
+        }
+        closest = min(root_distance.values())
+        if closest == 10**9:
+            other_edges.append(triple.index)
+            continue
+        owners = [root for root in roots if root_distance[root] == closest]
+        if len(owners) == 1:
+            branch_edges[owners[0]].append(triple.index)
+        else:
+            connecting_edges.append(triple.index)
+            junction_entities.update((triple.head, triple.tail))
+
+    # Stable, surface-readable candidates only. Opaque MIDs remain in the
+    # evidence itself but add no value in a compact junction header.
+    readable_junctions = sorted(
+        (
+            entity
+            for entity in junction_entities
+            if entity not in roots and not re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", entity)
+        ),
+        key=lambda entity: (-len(adjacency[entity]), entity),
+    )
+
+    output: list[str] = []
+    for root in roots:
+        indices = branch_edges[root]
+        if indices:
+            output.append(f"[Branch from question entity: {root}]")
+            output.extend(by_index[index].raw for index in indices)
+    if connecting_edges:
+        output.append("[Evidence connecting question-entity branches]")
+        if surface_junctions and readable_junctions:
+            output.append(
+                "[Structural meeting candidates: " + " | ".join(readable_junctions[:20]) + "]"
+            )
+        output.extend(by_index[index].raw for index in connecting_edges)
+    if other_edges:
+        output.append("[Other retrieved evidence]")
+        output.extend(by_index[index].raw for index in other_edges)
+
+    emitted = [line for line in output if line.startswith("(") and line.endswith(")")]
+    if Counter(emitted) != Counter(raw_lines):
+        raise AssertionError("branch assembly did not preserve the triple multiset")
+    return output, {
+        "roots": roots,
+        "branchable": True,
+        "junction_candidates": readable_junctions[:20],
+        "group_sizes": {
+            **{f"branch:{root}": len(indices) for root, indices in branch_edges.items()},
+            "connecting": len(connecting_edges),
+            "other": len(other_edges),
+        },
+    }
 
 
 def decode_adjacency_graph(lines: Iterable[str]) -> list[tuple[str, str, str]]:
